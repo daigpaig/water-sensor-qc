@@ -1,0 +1,29 @@
+# Secrets — MUST be ignored before the first commit (CLAUDE.md golden rule)
+.env
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Raw downloaded data (USGS/ECCC) and API logs are gitignored
+# (ignore contents but allow the .gitkeep below to be re-included)
+data/raw/*
+logs/*
+
+# Keep the gitignored directories in the tree
+!data/raw/.gitkeep
+!logs/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

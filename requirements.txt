@@ -1,0 +1,23 @@
+# Core QC engine — PINNED to 2.8 per CLAUDE.md golden rules. Do not change.
+saqc==2.8
+
+# LLM reasoning engine (Anthropic Messages API, model claude-sonnet-4-6)
+anthropic
+
+# Data handling
+pandas
+numpy
+scikit-learn
+
+# Real data retrieval (USGS NWIS)
+dataretrieval
+
+# UI + plotting
+streamlit
+plotly
+
+# Config / secrets
+python-dotenv
+
+# Testing
+pytest
