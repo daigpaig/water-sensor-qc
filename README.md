@@ -55,6 +55,58 @@ brew install python-tk@3.13     # match your Homebrew Python's minor version
 
 Non-Homebrew Python builds (python.org installer, conda) already bundle Tk.
 
+**Prefer Python 3.11 or 3.12** (not 3.14). On 3.14, `pip install -r requirements.txt`
+may fail building `scipy` (pulled in by `saqc`). For pull + inspect only you can install
+a smaller set instead:
+
+```bash
+pip install pandas numpy dataretrieval pytest
+```
+
+---
+
+## Pull raw USGS data
+
+No Anthropic API key needed. Downloads turbidity (`63680`) for the default 3 gauges into
+`data/raw/` (gitignored):
+
+```bash
+python -m src.pull_usgs --dry-run    # show what would be downloaded
+python -m src.pull_usgs              # write CSVs under data/raw/
+```
+
+Each raw CSV has: `datetime`, `value` (turbidity, FNU), `qualifier` (e.g. `A` = approved;
+approved ≠ clean).
+
+---
+
+## Inspect + validate CSVs
+
+`src/inspect_data.py` loads a series, enforces the `datetime` / `value` contract
+(CLAUDE.md §5), and prints a summary (rows, time range, frequency, NaN count/%,
+min/max/mean/std).
+
+```bash
+# Check the series contract (datetime + value; extras like qualifier are kept)
+PYTHONPATH=. python -m src.inspect_data validate data/raw/02336000_turbidity_63680.csv
+
+# Print a human-readable summary
+PYTHONPATH=. python -m src.inspect_data summarise data/raw/02336000_turbidity_63680.csv
+
+# Same summary as JSON; --reindex turns missing timestamps into NaN rows
+PYTHONPATH=. python -m src.inspect_data summarise data/raw/02336000_turbidity_63680.csv --json
+PYTHONPATH=. python -m src.inspect_data summarise data/raw/02336000_turbidity_63680.csv --reindex
+
+# Validate an injected labels file (when those exist)
+PYTHONPATH=. python -m src.inspect_data validate-labels data/injected/<name>_labels.csv
+```
+
+Run the unit tests:
+
+```bash
+PYTHONPATH=. pytest tests/test_inspect_data.py -v
+```
+
 ---
 
 ## Project layout
@@ -71,7 +123,8 @@ Non-Homebrew Python builds (python.org installer, conda) already bundle Tk.
 │   ├── clean/             # inspected clean segments used for injection
 │   └── injected/          # synthetic datasets + label files
 ├── src/
-│   ├── inspect_data.py    # load + summarise a series
+│   ├── pull_usgs.py       # download continuous turbidity from USGS NWIS
+│   ├── inspect_data.py    # load, validate contracts, summarise a series
 │   ├── inject.py          # synthetic anomaly injection (5 types, 3 levels, seeded)
 │   ├── evaluate.py        # metrics, fixed-pipeline baseline, ablation
 │   ├── agent.py           # ReAct loop + API logger
@@ -81,6 +134,7 @@ Non-Homebrew Python builds (python.org installer, conda) already bundle Tk.
 ├── app/
 │   └── streamlit_app.py   # Streamlit UI
 ├── tests/
+│   ├── test_inspect_data.py
 │   └── test_tools.py
 └── logs/                  # JSONL API logs (gitignored)
 ```
