@@ -15,6 +15,9 @@ logs/*
 !data/raw/.gitkeep
 !logs/.gitkeep
 
+# Generated review artifacts (regenerate via `python -m src.tools.visualize`)
+figures/
+
 # Python
 __pycache__/
 *.py[cod]
