@@ -1,0 +1,44 @@
+{
+  "name": "06818000_l1",
+  "seed": 42,
+  "level": 1,
+  "level_name": "low",
+  "n_rows": 24286,
+  "maintenance_interval_days": 200.0,
+  "target_point_pct": 3.0,
+  "actual_point_pct": 2.886,
+  "point_budget_met": true,
+  "types_missing": [],
+  "scoreable": true,
+  "total_anomalous_rows": 6639,
+  "total_anomalous_pct": 27.337,
+  "natural_gap_rows": 3482,
+  "natural_gap_pct": 14.337,
+  "by_type": {
+    "spike": {
+      "n_events": 77,
+      "n_rows": 146,
+      "pct_rows": 0.601
+    },
+    "plateau": {
+      "n_events": 11,
+      "n_rows": 263,
+      "pct_rows": 1.083
+    },
+    "level_shift": {
+      "n_events": 1,
+      "n_rows": 154,
+      "pct_rows": 0.634
+    },
+    "gap": {
+      "n_events": 28,
+      "n_rows": 3774,
+      "pct_rows": 15.54
+    },
+    "drift": {
+      "n_events": 1,
+      "n_rows": 2302,
+      "pct_rows": 9.479
+    }
+  }
+}

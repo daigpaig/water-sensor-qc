@@ -1,0 +1,44 @@
+{
+  "name": "03447687_l3",
+  "seed": 42,
+  "level": 3,
+  "level_name": "high",
+  "n_rows": 49278,
+  "maintenance_interval_days": 55.0,
+  "target_point_pct": 12.0,
+  "actual_point_pct": 11.944,
+  "point_budget_met": true,
+  "types_missing": [],
+  "scoreable": true,
+  "total_anomalous_rows": 25905,
+  "total_anomalous_pct": 52.569,
+  "natural_gap_rows": 1223,
+  "natural_gap_pct": 2.482,
+  "by_type": {
+    "spike": {
+      "n_events": 612,
+      "n_rows": 1183,
+      "pct_rows": 2.401
+    },
+    "plateau": {
+      "n_events": 81,
+      "n_rows": 2338,
+      "pct_rows": 4.745
+    },
+    "level_shift": {
+      "n_events": 3,
+      "n_rows": 577,
+      "pct_rows": 1.171
+    },
+    "gap": {
+      "n_events": 196,
+      "n_rows": 3588,
+      "pct_rows": 7.281
+    },
+    "drift": {
+      "n_events": 9,
+      "n_rows": 18219,
+      "pct_rows": 36.972
+    }
+  }
+}
