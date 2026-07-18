@@ -1,0 +1,44 @@
+{
+  "name": "06818000_l2",
+  "seed": 42,
+  "level": 2,
+  "level_name": "medium",
+  "n_rows": 24286,
+  "maintenance_interval_days": 100.0,
+  "target_point_pct": 7.0,
+  "actual_point_pct": 6.72,
+  "point_budget_met": true,
+  "types_missing": [],
+  "scoreable": true,
+  "total_anomalous_rows": 11072,
+  "total_anomalous_pct": 45.59,
+  "natural_gap_rows": 3482,
+  "natural_gap_pct": 14.337,
+  "by_type": {
+    "spike": {
+      "n_events": 171,
+      "n_rows": 340,
+      "pct_rows": 1.4
+    },
+    "plateau": {
+      "n_events": 20,
+      "n_rows": 612,
+      "pct_rows": 2.52
+    },
+    "level_shift": {
+      "n_events": 2,
+      "n_rows": 306,
+      "pct_rows": 1.26
+    },
+    "gap": {
+      "n_events": 69,
+      "n_rows": 4162,
+      "pct_rows": 17.137
+    },
+    "drift": {
+      "n_events": 3,
+      "n_rows": 5652,
+      "pct_rows": 23.273
+    }
+  }
+}
