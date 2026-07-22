@@ -109,6 +109,15 @@ PYTHONPATH=. pytest tests/test_inspect_data.py -v
 
 ---
 
+## Phase 2: Tools
+
+In Phase 2, we build the "toolkit" for our smart robot (the LLM) using the SaQC library.
+
+-  Testing the tools: We wrote automated tests (in `tests/test_tools.py`) to double-check that the SaQC tools work on our data without crashing.
+- Translators ("Wrappers"): Our robot cannot use the SaQC tools directly, so we built "wrappers" around them (in `src/tools/wrappers.py`). A wrapper is like a translator: the robot says "find a spike", the wrapper tells SaQC to do the math, and then the wrapper hands the robot back a simple report card (a JSON dictionary) of what happened.
+
+---
+
 ## Project layout
 
 ```
@@ -129,7 +138,6 @@ PYTHONPATH=. pytest tests/test_inspect_data.py -v
 │   ├── evaluate.py        # metrics, fixed-pipeline baseline, ablation
 │   ├── agent.py           # ReAct loop + API logger
 │   └── tools/
-│       ├── schemas.py     # JSON tool schemas for the Messages API
 │       └── wrappers.py    # SaQC-wrapping tool functions
 ├── app/
 │   └── streamlit_app.py   # Streamlit UI
