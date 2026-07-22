@@ -74,7 +74,8 @@ deployment, Docker, CI beyond a basic test run).
 ├── data/
 │   ├── raw/              # downloaded USGS/ECCC (gitignored)
 │   ├── clean/            # inspected clean segments used for injection
-│   └── injected/         # synthetic datasets + label files
+│   ├── injected/         # synthetic datasets + label files
+│   └── review/           # candidate proposals (gitignored) + reviewed labels (§9.1)
 ├── src/
 │   ├── inspect_data.py   # load + summarise a series
 │   ├── inject.py         # synthetic anomaly injection (5 types, 3 levels, seeded)
@@ -82,14 +83,21 @@ deployment, Docker, CI beyond a basic test run).
 │   ├── agent.py          # ReAct loop + API logger
 │   └── tools/
 │       ├── schemas.py    # JSON tool schemas for the Messages API
-│       └── wrappers.py   # SaQC-wrapping tool functions
+│       ├── wrappers.py   # SaQC-wrapping tool functions
+│       ├── visualize.py  # series/overview plots
+│       ├── param_sweep.py # sweep one param, score vs labels, plot (§7.2)
+│       ├── candidates.py # propose anomalies in a "clean" series for review (§9.1)
+│       └── review.py     # keyboard-driven labelling page + merge back to labels (§9.1)
 ├── app/
 │   └── streamlit_app.py  # UI
 ├── tests/
 │   └── test_tools.py
 ├── scratchpad/
 │   ├── probe_saqc.py          # signature + toy-call probe for every §7 method
-│   └── probe_saqc_behavior.py # reproduces the §7.1 constraints
+│   ├── probe_saqc_behavior.py # reproduces the §7.1 constraints
+│   ├── probe_plateau_cost.py  # flagPlateau's crash + multiprocessing trap (§7.1)
+│   ├── tune_candidates.py     # picks the §9.1 proposal thresholds
+│   └── tune_zscore.py         # flagZScore min_residuals on quantised data (§7.1)
 └── logs/                 # JSONL API logs (gitignored)
 ```
 
@@ -112,7 +120,8 @@ deployment, Docker, CI beyond a basic test run).
   a known `true_value`, so **imputation RMSE/MAE (§10) is scored on injected gaps only**,
   while both count for detection precision/recall.
 
-**Maintenance schedule** (`data/injected/<name>_maintenance.csv`)
+**Maintenance schedule** (`data/injected/<name>_maintenance.csv`) — **still emitted, but
+consumed by nothing while drift is shelved (§9.2).**
 
 - `start`, `end` — one row per maintenance visit. Drift accrues between visits and resets
   at each one, so this is the ground truth for the drift episodes _and_ the support-point
@@ -159,14 +168,16 @@ as NaN or removed per config), plus a `flag` column naming the action, if any.
 | Plateau / stuck    | identical value repeated for a long window | `flagConstants` (+ `flagPlateau` if offset) | delete or flag                             |
 | Level shift / jump | permanent step to a new level              | `flagJumps`                          | flag; keep unless clearly erroneous (agent judges) |
 | Gap (missing)      | NaN run                                    | `flagNAN`                            | impute (short gaps only)                           |
-| Drift              | slow creep from truth over weeks           | **no detector in 2.8** — §7.1        | correct (`correctDrift`, from the schedule)        |
+| Drift              | slow creep from truth over weeks           | **no detector in 2.8** — §7.1        | **SHELVED — §9.2** (was: correct via `correctDrift`) |
 
 The agent reasons about each flagged segment and picks the action; these are defaults, not
 hard rules. Genuine extreme events must be **kept**, not "corrected" away.
 
 Drift is the odd one out: SaQC 2.8 has no univariate drift detector (§7.1), so the agent
-cannot *find* drift the way it finds the other four. It applies `correctDrift` using the
-maintenance schedule's support points instead.
+cannot *find* drift the way it finds the other four. It would apply `correctDrift` using the
+maintenance schedule's support points instead — **but the whole drift track is shelved as of
+2026-07-22; see §9.2 before doing any drift work.** Treat this project as covering **four**
+failure types until that decision is revisited.
 
 ---
 
@@ -246,6 +257,26 @@ action applied to it. See §10 for what this means for scoring.
 - `flagConstants`' `thresh` must be **much smaller than the signal's noise sd**, or it
   swallows the series: on noise with sd 0.05, `thresh=0.5` flagged 2999 of 3000 rows.
 
+**`flagPlateau` is the one method that can crash or appear to hang. Wrap every call.**
+Probed via `scratchpad/probe_plateau_cost.py` on real turbidity:
+
+- It **raises `ValueError: attempt to get argmin of an empty sequence`** from
+  `saqc/funcs/pattern.py::_getAnomalyCenter` on some inputs — data-dependent, not
+  length-monotonic: on 11501000 it succeeded at n=3000 and n=21151 but raised at n=4000 and
+  n=8000. A caller must catch this per-method and carry on, not let one detector sink a run.
+- It is the only §7 method that uses **multiprocessing**, and its workers re-import
+  `__main__`. Called from a `python -` / heredoc script, `__main__` is stdin, the re-import
+  fails, the pool respawns forever, and it looks exactly like a hang — that cost an hour.
+  **Run anything that touches `flagPlateau` from a real file or `python -m`.** From a file it
+  is fast: 3.35 s on 21k rows.
+
+**`flagZScore(method='modified')` needs `min_residuals` on quantised data.** In a window
+where the MAD is ~0, any wiggle scores an enormous modified z, so `thresh` stops doing
+anything. On 11501000 (turbidity quantised to 0.1 NTU) it flagged ~195 segments at
+`thresh=30` just as at `thresh=6`. `min_residuals` sets a floor in **data units** and fixes
+it: at 3 robust step-sigmas the same series drops to 7 segments while the other two gauges
+barely move. Scale it to the series, never hard-code it (`scratchpad/tune_zscore.py`).
+
 **`interpolateByRolling` will half-fill a gap.** It fills only where the rolling window finds
 context, so a window narrower than the gap leaves the gap **partly** filled rather than
 skipping it — probed, a 40-sample gap: `window='3h'` filled 11 of 40, `window='12h'` filled
@@ -292,6 +323,7 @@ we run the tool → we return tool_result → loop).
   ECCC (secondary — may be a manual download). Target ~2 years, 15-min/hourly, 2–3 gauges
   per variable. Start with **one variable** (turbidity or specific conductance).
 - **Clean segments:** visually inspect before use — real data may already contain anomalies.
+  Audit them with the candidate-proposal + review tool in §9.1 rather than trusting the eye.
 - **Synthetic injection:** inject all five types at recorded locations into clean segments;
   save the labels (§5). Build **three contamination levels** with a **fixed random seed**
   for reproducibility.
@@ -305,7 +337,8 @@ we run the tool → we return tool_result → loop).
   fouling that accrues until the sensor is serviced and then resets — so the level sets
   days-between-visits (200 / 100 / 55) and the episode count follows from the base's
   length. A fixed _count_ would make level 3 mean 37% drift on a 220-day base but 16% on a
-  513-day one, leaving the levels non-comparable across datasets.
+  513-day one, leaving the levels non-comparable across datasets. **This knob is unresolved
+  and the drift track is shelved — see §9.2.**
 - **Level shift is injected as a bounded window**, not a literal permanent step: a
   permanent step would either label every subsequent row anomalous (one mid-series shift
   ≈ 50% contamination) or leave post-step rows with `true_value != value` while marked
@@ -322,6 +355,104 @@ we run the tool → we return tool_result → loop).
   If a base genuinely cannot host its budget, injection reports `point_budget_met: false`
   and `types_missing` rather than silently under-filling.
 
+### 9.1 Auditing the "clean" bases (candidate proposal + human review)
+
+The `data/clean/` segments were chosen **by eye**, so they may still hold real anomalies —
+which would silently become false positives when scoring detection against injected labels
+(§10), because the base is assumed anomaly-free everywhere the label file says nothing.
+`src/tools/candidates.py` + `src/tools/review.py` exist to check that assumption:
+
+```
+python -m src.tools.review detect data/clean/<gauge>.csv      # propose + open the page
+python -m src.tools.review merge  data/clean/<gauge>.csv <decisions.csv>
+```
+
+- **Proposal is tuned for recall, not precision.** Detectors run at deliberately sensitive
+  settings; false positives are expected and are what the review step removes. Every
+  threshold in data units is derived from the series' own robust (MAD) scale, so the
+  defaults transfer across gauges spanning 0–40 and 0–1000 NTU. Defaults were picked in
+  `scratchpad/tune_candidates.py` to land in the tens of segments per type, because a
+  detector that proposes 800 segments cannot be reviewed by a human at all.
+- **Drift is proposed by a local heuristic, not by SaQC** (baseline daily-median moving one
+  direction for ≥14 days). §7.1 is why: 2.8 has no univariate drift detector. It is the
+  weakest proposer here and seasonal turbidity swells look just like fouling, so expect to
+  reject most of them.
+- **The review page is a single self-contained HTML file** — plotly.js inlined, no server,
+  no Streamlit, works offline. One candidate at a time, `A`/`N`/`U` to judge, auto-advance,
+  `Z` to undo, progress mirrored to `localStorage` so closing the tab loses nothing.
+- **`merge` writes the §5 labels contract** with `source=natural` and an empty `true_value`:
+  these anomalies were already in the record, so no uncontaminated value exists for them
+  and they are scoreable for detection but not for imputation (§5, §10). It **refuses**
+  decisions whose `candidate_id`s do not match the current proposal run, since ids come
+  from the detector settings and a silent mismatch would drop verdicts.
+- Reviewed labels are **hand-made ground truth — commit them**. The `*_candidates.csv`
+  proposals are regenerable and gitignored.
+
+### 9.2 Drift is SHELVED (decision, 2026-07-22)
+
+**The drift track — injection, `correctDrift`, and drift scoring — is parked. Do not spend
+time on it. Scope the project to the four remaining types (spike, plateau, level_shift,
+gap) until this is explicitly revisited.**
+
+Nothing has been deleted: `inject.py` still emits drift episodes and `*_maintenance.csv`,
+§7.1's `correctDrift` constraints still stand, and the existing datasets are unchanged.
+This is a decision to stop *investing*, not a code change. If drift is picked back up,
+everything below is what we already know.
+
+**Why it was shelved.** Drift kept costing more than the other four types combined, for
+reasons that are structural rather than incidental:
+
+- **No detector exists.** SaQC 2.8 has no univariate drift detector (§7.1), so drift can
+  never be *found* the way the other four are — it has to be handed to the tool out of band
+  via the maintenance schedule. That makes it a poor fit for a project whose thesis is an
+  agent adaptively *selecting* detectors.
+- **`correctDrift` is the sharpest edge in the library** (§7.1): it silently NaNs out the
+  final interval, corrects only `N-2` of `N-1` intervals, and needs a dict-constructed
+  standalone maintenance variable. It needs a defensive wrapper before it can be trusted.
+- **The contamination knob was never resolved.** Levels currently set the maintenance
+  interval (200/100/55 days), but drift row-share ≈ `DRIFT_DURATION_DAYS / interval`, so a
+  *shorter* interval yields *more* drift. Measured on the three bases: 21 d → 93–95% drift
+  rows, 28 d → 76–79%, vs today's 200 d → 8–13%. Two consequences we hit head-on:
+  - Real USGS cadence is 2–4 weeks (below), so any realistic interval floods the series
+    with drift, and the honest fix is to move the severity knob from *interval* to drift
+    *rate* (magnitude = rate × episode duration) — a redesign that regenerates all nine
+    datasets and invalidates tuning done against them (§9.1 thresholds, §7.1 z-score work).
+  - Mapping level 1 → 14 days **raises `ValueError`** on 03447687 and 11501000:
+    `_place_drift_episodes` needs each equal block to hold a ≥14-day episode plus its
+    maintenance window, which a 14-day block cannot.
+
+**What we learned about real maintenance dates (keep — it was expensive to establish).**
+USGS gives you **no** sensor service record. `nwis.get_iv` returns `datetime, value,
+qualifier`, and `qualifier` is approval status only (`A`/`P`/`A, >`) — none of the three
+gauges carries a `Mnt`/`Eqp`/`Ice` code. Two public proxies exist, both partial:
+
+- `waterdata.get_field_measurements(monitoring_location_id='USGS-<site>')` — hydrographer
+  site visits via `field_visit_id`. In our clean windows: 11 visits (03447687), 23
+  (06818000), 8 (11501000). But these are discharge/gage-height trips (params `00060`,
+  `00065`), so station-level, not turbidity-sensor-level. Note `nwis.get_discharge_
+  measurements` now raises and redirects here; it returns a **tuple**.
+- `waterdata.get_samples(...)` — discrete WQ samples, which usually accompany WQ sensor
+  servicing. Inconsistent across gauges: **03447687 has none at all**, 06818000 has 2
+  turbidity dates in-window (both on field-visit dates), and 11501000 has 16 on a clean
+  ~14-day cadence, 4 of which fall exactly on its field-visit dates.
+
+So real cadence is **2–4 weeks** where observable, but no source proves *service*. The only
+route to certainty is emailing the Water Science Center for field notes (SIMS/Aquarius).
+Irrelevant while shelved; recorded so it is not re-derived.
+
+**Also relevant: approved data is already drift-corrected.** Per USGS TM 1-D3 (Wagner et
+al. 2006), record processing applies fouling and calibration-drift corrections, prorated
+between field visits, before publication — so `A`-qualified series are a *poor* place to
+look for real drift. Residual drift survives only where fouling was non-linear, below
+threshold, or between sparse visits. 11501000's clean segment is **provisional** (`P`,
+20,717 of 20,853 rows), i.e. not yet through final processing, making it the one plausible
+place to observe real uncorrected drift if this is ever resumed.
+
+**To unshelve**, in order: (1) pick the severity knob — drift rate, not interval; (2) make
+`DRIFT_DURATION_DAYS` a fraction of the inter-visit block so the §9 guard cannot trip at
+realistic cadence; (3) write the `correctDrift` guard §7.1 demands; (4) regenerate all nine
+datasets and re-check §9.1 tuning; (5) restore the §10 and §11 drift criteria.
+
 ---
 
 ## 10. Evaluation
@@ -330,10 +461,12 @@ we run the tool → we return tool_result → loop).
   injected labels. **Drift is excluded from the detection metrics** — SaQC 2.8 ships no
   univariate drift detector (§7.1), so drift episodes are supplied by the maintenance
   schedule rather than discovered. Report macro-F1 over the **four** detectable types
-  (spike, plateau, level_shift, gap), say so explicitly next to the number, and score drift
-  under correction quality instead: RMSE of the corrected series vs `true_value` over drift
-  rows, against the uncorrected series as the baseline. The §11 macro-F1 ≥ 0.70 target
-  therefore refers to those four types.
+  (spike, plateau, level_shift, gap), say so explicitly next to the number. The §11
+  macro-F1 ≥ 0.70 target therefore refers to those four types. Drift was to be scored under
+  correction quality instead (RMSE of the corrected series vs `true_value` over drift rows,
+  against the uncorrected series as baseline) — **that metric is shelved with the rest of
+  the drift track (§9.2) and is not required.** The four-type macro-F1 is unaffected: drift
+  was already excluded from it, so shelving changes nothing about the headline number.
 - **Imputation:** RMSE / MAE on filled values vs true values, compared to a
   linear-interpolation baseline.
 - **Decision quality:** for each flagged segment, does the chosen action match the known
@@ -351,8 +484,9 @@ we run the tool → we return tool_result → loop).
 - Macro-F1 ≥ 0.70 across the **four detectable** types on held-out test data (drift is
   scored as correction quality, not detection — §10).
 - Imputation RMSE beats linear interpolation on ≥ 2 of 3 datasets.
-- Drift correction beats the uncorrected series on drift rows, on datasets with ≥ 3
-  maintenance visits (§5).
+- ~~Drift correction beats the uncorrected series on drift rows, on datasets with ≥ 3
+  maintenance visits (§5).~~ **Dropped — drift is shelved (§9.2).** Restore this criterion
+  only if the drift track is resumed.
 - Decision action reported and compared to the correct action for every flagged segment.
 - A non-programmer can upload → run → view flags → download in < 5 minutes.
 - Every API call logged; a run is reproducible from the log.
