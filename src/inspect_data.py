@@ -9,7 +9,7 @@ Also enforces the CSV column contracts used across Phase 1:
 
   - series  (raw / clean / injected): ``datetime``, ``value``  (+ optional extras)
   - labels  (injected ``*_labels.csv``): ``datetime``, ``is_anomaly``,
-    ``anomaly_type``, ``true_value``
+    ``anomaly_type``, ``true_value``, ``source``
 
 CLI
 ---
@@ -47,10 +47,15 @@ LABELS_REQUIRED_COLS: tuple[str, ...] = (
     "is_anomaly",
     "anomaly_type",
     "true_value",
+    "source",
 )
 ANOMALY_TYPES: frozenset[str] = frozenset(
-    {"spike", "plateau", "level_shift", "gap", "drift", ""}
+    {"spike", "plateau", "level_shift", "gap", ""}
 )
+# Where an anomaly came from. Natural gaps exist in the "clean" base already and
+# have no recorded true_value, so they count for detection but cannot be scored
+# for imputation error; injected anomalies can be scored for both (see inject.py).
+ANOMALY_SOURCES: frozenset[str] = frozenset({"natural", "injected", ""})
 
 
 class ContractError(ValueError):
@@ -190,8 +195,9 @@ def validate_series_frame(df: pd.DataFrame, *, value_col: str = VALUE_COL) -> pd
 def validate_labels_frame(df: pd.DataFrame) -> pd.DataFrame:
     """Validate / normalise an injected labels frame (CLAUDE.md §5).
 
-    Required columns: ``datetime``, ``is_anomaly``, ``anomaly_type``, ``true_value``.
-    ``anomaly_type`` must be one of the five failure types, or empty.
+    Required columns: ``datetime``, ``is_anomaly``, ``anomaly_type``, ``true_value``,
+    ``source``. ``anomaly_type`` must be one of the five failure types, or empty;
+    ``source`` must be ``natural``/``injected``, or empty on non-anomalous rows.
     """
     if df.empty:
         raise ContractError("labels CSV has zero rows.")
@@ -212,6 +218,15 @@ def validate_labels_frame(df: pd.DataFrame) -> pd.DataFrame:
         )
     out["anomaly_type"] = types
     out["true_value"] = pd.to_numeric(out["true_value"], errors="coerce")
+
+    sources = out["source"].fillna("").astype(str).str.strip()
+    bad_src = sorted({s for s in sources.unique() if s not in ANOMALY_SOURCES})
+    if bad_src:
+        raise ContractError(
+            f"source has unknown value(s) {bad_src}; "
+            f"allowed={sorted(ANOMALY_SOURCES - {''})} or empty."
+        )
+    out["source"] = sources
 
     if not out[DATETIME_COL].is_monotonic_increasing:
         out = out.sort_values(DATETIME_COL)

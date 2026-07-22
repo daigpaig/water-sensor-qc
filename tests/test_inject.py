@@ -15,7 +15,6 @@ import pandas as pd
 import pytest
 
 from src.inject import (
-    DRIFT,
     GAP,
     LEVEL_SHIFT,
     LEVELS,
@@ -23,7 +22,6 @@ from src.inject import (
     SOURCE_INJECTED,
     SOURCE_NATURAL,
     SPIKE,
-    inject_drift,
     inject_gap,
     inject_level_shift,
     inject_plateau,
@@ -39,8 +37,8 @@ STEP = pd.Timedelta(minutes=15)
 def make_base(days: float = 240.0, *, seed: int = 0, gaps: bool = True) -> pd.DataFrame:
     """A synthetic clean base: smooth seasonal signal + noise, on a 15-min grid.
 
-    Long enough to fit the drift episodes every level asks for. ``gaps`` punches
-    two natural NaN runs, mimicking the small dropouts the real clean bases carry.
+    ``gaps`` punches two natural NaN runs, mimicking the small dropouts the real
+    clean bases carry.
     """
     n = int(days * 24 * 4)
     idx = pd.date_range("2024-01-01", periods=n, freq=STEP)
@@ -115,40 +113,12 @@ def test_gap_blanks_only_its_window() -> None:
     assert np.isfinite(out[:10]).all() and np.isfinite(out[15:]).all()
 
 
-def test_drift_ramps_from_zero_to_full_offset() -> None:
-    values = np.full(100, 10.0)
-    out, seg = inject_drift(values, 0, length=100, magnitude=8.0, model="linear")
-
-    assert seg.anomaly_type == DRIFT
-    assert out[0] == pytest.approx(10.0)   # no offset at the start of the episode
-    assert out[-1] == pytest.approx(18.0)  # full offset where maintenance lands
-    # A linear ramp is monotone in between.
-    assert np.all(np.diff(out) > 0)
-
-
-def test_exponential_drift_lags_the_linear_ramp_early() -> None:
-    values = np.full(100, 10.0)
-    lin, _ = inject_drift(values, 0, length=100, magnitude=8.0, model="linear")
-    exp, _ = inject_drift(values, 0, length=100, magnitude=8.0, model="exponential")
-
-    # Fouling creeps slowly then accelerates, so it sits below linear mid-episode
-    # but reaches the same offset at the maintenance reset.
-    assert exp[50] < lin[50]
-    assert exp[-1] == pytest.approx(lin[-1])
-
-
-def test_drift_rejects_unknown_model() -> None:
-    with pytest.raises(ValueError, match="linear|exponential"):
-        inject_drift(np.full(10, 1.0), 0, length=10, magnitude=1.0, model="quadratic")
-
-
 @pytest.mark.parametrize(
     "call",
     [
         lambda v: inject_spike(v, 95, magnitude=1.0, length=10),
         lambda v: inject_plateau(v, 95, length=10),
         lambda v: inject_gap(v, 98, length=5),
-        lambda v: inject_drift(v, 0, length=200, magnitude=1.0),
     ],
 )
 def test_injectors_reject_windows_that_run_off_the_end(call) -> None:
@@ -161,7 +131,6 @@ def test_injectors_reject_windows_that_run_off_the_end(call) -> None:
     [
         lambda v: inject_spike(v, 5, magnitude=0.0),
         lambda v: inject_level_shift(v, 5, length=2, magnitude=0.0),
-        lambda v: inject_drift(v, 5, length=2, magnitude=0.0),
     ],
 )
 def test_injectors_reject_zero_magnitude(call) -> None:
@@ -189,9 +158,8 @@ def test_true_value_restores_the_clean_base_exactly(base: pd.DataFrame, level: i
 def test_every_modified_row_is_labelled(base: pd.DataFrame, level: int) -> None:
     """No silent contamination: anything we changed carries a label.
 
-    The converse does not hold and should not be asserted — a drift episode's
-    first row has zero offset, and a plateau's first row is the value it stuck
-    on, so some labelled rows legitimately equal the base.
+    The converse does not hold and should not be asserted — a plateau's first row
+    is the value it stuck on, so some labelled rows legitimately equal the base.
     """
     result = inject_series(base, level=level, seed=1, name="t")
 
@@ -203,13 +171,13 @@ def test_every_modified_row_is_labelled(base: pd.DataFrame, level: int) -> None:
     assert result.labels["is_anomaly"].to_numpy()[changed].all()
 
 
-def test_all_five_types_appear_at_every_level(base: pd.DataFrame) -> None:
+def test_all_four_types_appear_at_every_level(base: pd.DataFrame) -> None:
     # Per-type recall (§10) is undefined for a type with no positives, so every
     # level must produce every type on a usable base.
     for level in sorted(LEVELS):
         result = inject_series(base, level=level, seed=3, name="t")
         present = set(result.labels.loc[result.labels["is_anomaly"], "anomaly_type"])
-        assert present == {SPIKE, PLATEAU, LEVEL_SHIFT, GAP, DRIFT}
+        assert present == {SPIKE, PLATEAU, LEVEL_SHIFT, GAP}
         assert not result.manifest["types_missing"]
         assert result.manifest["scoreable"]
 
@@ -303,7 +271,7 @@ def test_segment_anomalies_may_span_isolated_dropouts() -> None:
     spanning = [
         s
         for s in result.segments
-        if s.anomaly_type in (PLATEAU, LEVEL_SHIFT, DRIFT)
+        if s.anomaly_type in (PLATEAU, LEVEL_SHIFT)
         and not np.isfinite(df["value"].to_numpy()[s.start_idx : s.end_idx]).all()
     ]
     assert spanning, "segment anomalies should be able to span isolated dropouts"
@@ -335,7 +303,6 @@ def test_same_seed_reproduces_identical_output(base: pd.DataFrame) -> None:
     b = inject_series(base, level=2, seed=42, name="t")
     pd.testing.assert_frame_equal(a.data, b.data)
     pd.testing.assert_frame_equal(a.labels, b.labels)
-    pd.testing.assert_frame_equal(a.maintenance, b.maintenance)
 
 
 def test_different_seed_gives_different_placement(base: pd.DataFrame) -> None:
@@ -409,25 +376,6 @@ def test_contamination_increases_with_level(base: pd.DataFrame) -> None:
     assert pcts == sorted(pcts)
 
 
-def test_drift_share_is_comparable_across_bases_of_different_length() -> None:
-    """The reason drift is driven by maintenance *interval* and not by count.
-
-    A fixed episode count would make level 3 mean ~37% drift on a short base but
-    ~16% on a long one, and the levels would not be comparable across datasets.
-    """
-    short = inject_series(make_base(days=240), level=3, seed=1, name="short")
-    long = inject_series(make_base(days=560), level=3, seed=1, name="long")
-
-    short_pct = short.manifest["by_type"][DRIFT]["pct_rows"]
-    long_pct = long.manifest["by_type"][DRIFT]["pct_rows"]
-    assert short_pct == pytest.approx(long_pct, abs=8.0)
-    # The longer record simply contains more maintenance cycles.
-    assert (
-        long.manifest["by_type"][DRIFT]["n_events"]
-        > short.manifest["by_type"][DRIFT]["n_events"]
-    )
-
-
 def test_magnitudes_stay_physical_on_a_flashy_storm_driven_series() -> None:
     """Storms must not size the anomalies.
 
@@ -489,51 +437,19 @@ def test_unknown_level_is_rejected(base: pd.DataFrame) -> None:
         inject_series(base, level=9, seed=1, name="t")
 
 
-def test_base_too_short_for_realistic_drift_is_rejected() -> None:
-    # Rather than silently shrinking drift into something that is not "creep over
-    # weeks" any more, injection refuses (§13: fail loudly on nonsensical input).
-    tiny = make_base(days=5, gaps=False)
-    with pytest.raises(ValueError, match="too short"):
-        inject_series(tiny, level=3, seed=1, name="tiny")
-
-
 def test_missing_value_column_is_rejected(base: pd.DataFrame) -> None:
     with pytest.raises(ContractError, match="value column"):
         inject_series(base.rename(columns={"value": "turbidity"}), level=1, seed=1, name="t")
 
 
 # ---------------------------------------------------------------------------
-# Maintenance schedule (the support points correctDrift needs)
-# ---------------------------------------------------------------------------
-def test_maintenance_event_follows_each_drift_episode(base: pd.DataFrame) -> None:
-    result = inject_series(base, level=3, seed=1, name="t")
-    drifts = [s for s in result.segments if s.anomaly_type == DRIFT]
-
-    assert len(result.maintenance) == len(drifts)
-    # correctDrift reads the index as the start of a maintenance event and the
-    # value as its end, so start must precede end.
-    assert (result.maintenance["end"] > result.maintenance["start"]).all()
-
-    times = pd.DatetimeIndex(base[DATETIME_COL])
-    for seg, (_, event) in zip(drifts, result.maintenance.iterrows()):
-        assert event["start"] == times[seg.end_idx]
-
-
-def test_maintenance_schedule_is_ordered_and_disjoint(base: pd.DataFrame) -> None:
-    result = inject_series(base, level=3, seed=1, name="t")
-    m = result.maintenance
-    assert (m["start"].diff().dropna() > pd.Timedelta(0)).all()
-    assert (m["start"].to_numpy()[1:] > m["end"].to_numpy()[:-1]).all()
-
-
-# ---------------------------------------------------------------------------
 # Writing
 # ---------------------------------------------------------------------------
-def test_write_result_emits_the_full_quartet(base: pd.DataFrame, tmp_path) -> None:
+def test_write_result_emits_the_full_triple(base: pd.DataFrame, tmp_path) -> None:
     result = inject_series(base, level=1, seed=1, name="site_l1")
     paths = write_result(result, tmp_path)
 
-    for key in ("data", "labels", "maintenance", "manifest"):
+    for key in ("data", "labels", "manifest"):
         assert paths[key].is_file(), key
 
     # Round-trips through CSV and still satisfies the contract.

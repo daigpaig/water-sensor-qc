@@ -1,30 +1,21 @@
 """Synthetic anomaly injection into clean segments.
 
-Injects the five failure types (spike, plateau, level_shift, gap, drift) into a
-clean base series, records ground-truth labels, and writes the maintenance
-schedule that drift correction needs. Everything is driven by a fixed seed, so a
-given (base, level, seed) always reproduces byte-identical output.
+Injects the four failure types (spike, plateau, level_shift, gap) into a clean
+base series and records ground-truth labels. Everything is driven by a fixed
+seed, so a given (base, level, seed) always reproduces byte-identical output.
+
+Drift is **not** injected: the drift track is shelved (CLAUDE.md §9.2). SaQC 2.8
+ships no univariate drift detector, so drift could only ever be handed in out of
+band via a maintenance schedule, and the contamination knob for it was never
+resolved. The maintenance schedule this module used to emit is gone with it.
 
 Design decisions worth knowing before reading the code
 ------------------------------------------------------
-**Drift recurs; it is not a once-per-series event.** Drift is fouling and
-calibration wander, which accumulates until someone cleans or recalibrates the
-sensor and then starts over. So a series carries one drift episode per
-maintenance cycle, each ramping from 0 to its full offset and resetting to 0 at
-the maintenance event that ends it. SaQC 2.8's ``correctDrift`` assumes exactly
-this: its ``maintenance_field`` is a series whose index is the start of each
-maintenance event and whose values are that event's end, and it corrects drift
-*between* consecutive events. We emit that schedule (§5) so ``correct_drift``
-has the support points it requires.
-
 **The contamination level scales the point-like types only.** ``level`` sets the
 share of rows occupied by spike / plateau / gap, where "percent of rows" is a
-natural unit. Drift is driven by *maintenance interval* instead — a shorter
-interval means a less-maintained sensor, which is the story the three levels
-tell — and episodes keep physically realistic durations (weeks, per §6). Their
-row-share is therefore a consequence, reported in the manifest rather than
-targeted, and it is large: level 3 lands near 50% total anomalous. The headline
-``point_pct`` understates the total by design; ``evaluate.py`` must read per-type
+natural unit. Level shift is driven by episode count instead, so its row-share is
+a consequence, reported in the manifest rather than targeted. The headline
+``point_pct`` therefore understates the total; ``evaluate.py`` must read per-type
 counts from the labels, never infer them from the headline number.
 
 **Magnitudes are sized by a robust local scale, capped.** See ``_local_scale``: a
@@ -37,8 +28,7 @@ metrics.
 permanent step would either label every subsequent row anomalous (one mid-series
 shift = ~50% contamination) or leave post-step rows with ``true_value != value``
 while marked not-anomalous, which the §5 label contract cannot express. So the
-offset applies over a finite window and the series returns to its true level,
-consistent with how drift is handled.
+offset applies over a finite window and the series returns to its true level.
 
 **Natural gaps are labelled too.** The clean bases were selected for long
 unbroken stretches but still contain small natural gaps (the pull filter allows
@@ -49,8 +39,8 @@ pretending the base is pristine. The ``source`` column separates them: only
 scored on those alone, while both count for detection precision/recall.
 
 **Segment anomalies may span isolated dropouts; point anomalies may not.** Real
-records carry many single-sample dropouts, and a stuck sensor or a drifting one
-spans them without difficulty — so plateau, level_shift and drift place across
+records carry many single-sample dropouts, and a stuck sensor spans them without
+difficulty — so plateau and level_shift place across
 runs of up to ``SPANNABLE_DROPOUT_ROWS`` missing samples, leaving those rows
 missing (and labelled ``gap``/``natural``). Spikes and injected gaps need real
 readings in every row they touch: a spike displaces a value, and an injected gap
@@ -77,7 +67,6 @@ Usage from Python
     result = inject_series(base, level=2, seed=42, name="11501000_l2")
     result.data      # datetime/value frame with anomalies
     result.labels    # datetime/is_anomaly/anomaly_type/true_value/source
-    result.maintenance  # start/end frame for correctDrift
 """
 from __future__ import annotations
 
@@ -114,7 +103,6 @@ SPIKE = "spike"
 PLATEAU = "plateau"
 LEVEL_SHIFT = "level_shift"
 GAP = "gap"
-DRIFT = "drift"
 
 # Turbidity is a physical non-negative quantity; injected offsets clamp here.
 VALUE_FLOOR = 0.0
@@ -146,12 +134,6 @@ GAP_DURATION_HOURS = (0.5, 6.0)
 # Level shift: a bounded offset window (see the module docstring).
 LEVEL_SHIFT_DURATION_HOURS = (6.0, 72.0)
 LEVEL_SHIFT_MAGNITUDE_SCALE = (2.0, 5.0)
-
-# Drift: slow creep over weeks, ending at a maintenance reset (§6).
-DRIFT_DURATION_DAYS = (14.0, 28.0)
-DRIFT_MAGNITUDE_SCALE = (1.0, 3.0)
-DRIFT_UPWARD_PROB = 0.85  # fouling makes the reading creep up, not down
-MAINTENANCE_DURATION_HOURS = (1.0, 4.0)
 
 # How the point budget splits across the point-like types, by row count.
 POINT_BUDGET_WEIGHTS: dict[str, float] = {SPIKE: 0.2, PLATEAU: 0.4, GAP: 0.4}
@@ -193,35 +175,20 @@ LOCAL_SCALE_CAP_K = 3.0
 class ContaminationLevel:
     """One of the three contamination levels (CLAUDE.md §9).
 
-    ``point_pct`` is the share of rows given to spike/plateau/gap. Drift is set by
-    ``maintenance_interval_days`` — how often the sensor gets serviced — and
-    level_shift by count. See the module docstring.
-
-    Drift is deliberately parameterised by *interval* rather than by a count of
-    episodes. Maintenance is periodic, so a longer record simply contains more
-    cycles; fixing the count instead would make "level 3" mean 37% drift on a
-    220-day base but 16% on a 513-day one, and the levels would not be comparable
-    across datasets. With an interval, drift's row-share is roughly
-    ``DRIFT_DURATION_DAYS / maintenance_interval_days`` on any base.
+    ``point_pct`` is the share of rows given to spike/plateau/gap; level_shift is
+    set by count. See the module docstring.
     """
 
     level: int
     name: str
     point_pct: float
-    maintenance_interval_days: float
     n_level_shifts: int
 
 
 LEVELS: dict[int, ContaminationLevel] = {
-    1: ContaminationLevel(
-        1, "low", point_pct=3.0, maintenance_interval_days=200.0, n_level_shifts=1
-    ),
-    2: ContaminationLevel(
-        2, "medium", point_pct=7.0, maintenance_interval_days=100.0, n_level_shifts=2
-    ),
-    3: ContaminationLevel(
-        3, "high", point_pct=12.0, maintenance_interval_days=55.0, n_level_shifts=3
-    ),
+    1: ContaminationLevel(1, "low", point_pct=3.0, n_level_shifts=1),
+    2: ContaminationLevel(2, "medium", point_pct=7.0, n_level_shifts=2),
+    3: ContaminationLevel(3, "high", point_pct=12.0, n_level_shifts=3),
 }
 
 
@@ -239,14 +206,6 @@ class Segment:
         return self.end_idx - self.start_idx
 
 
-@dataclass(frozen=True)
-class MaintenanceEvent:
-    """A maintenance visit, as a half-open row range. Ends a drift episode."""
-
-    start_idx: int
-    end_idx: int
-
-
 @dataclass
 class InjectionResult:
     """Everything one (base, level, seed) injection produces."""
@@ -256,13 +215,12 @@ class InjectionResult:
     seed: int
     data: pd.DataFrame
     labels: pd.DataFrame
-    maintenance: pd.DataFrame
     segments: list[Segment]
     manifest: dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
-# The five injectors
+# The four injectors
 #
 # Each takes a values array and an explicit geometry, returns a new array plus
 # the Segment describing what it did, and never consults a random number
@@ -376,47 +334,6 @@ def inject_gap(
     stop = start + length
     out[start:stop] = np.nan
     return out, Segment(GAP, start, stop, {})
-
-
-def inject_drift(
-    values: np.ndarray,
-    start: int,
-    *,
-    length: int,
-    magnitude: float,
-    model: str = "linear",
-) -> tuple[np.ndarray, Segment]:
-    """Ramp a growing offset across a window, reaching ``magnitude`` at the end.
-
-    The offset starts at 0 and grows to ``magnitude`` on the final row, which is
-    where the maintenance reset lands — so the series is unaffected before the
-    episode and back to truth after it. ``model`` selects a ``linear`` ramp or an
-    ``exponential`` one (fouling that accelerates); both are shapes SaQC 2.8's
-    ``correctDrift`` can model.
-    """
-    _validate_window(values, start, length, "inject_drift")
-    if magnitude == 0:
-        raise ValueError("inject_drift: magnitude must be non-zero.")
-    if model not in {"linear", "exponential"}:
-        raise ValueError(f"inject_drift: model must be linear|exponential (got {model!r}).")
-
-    # A 1-row drift has no ramp to speak of; treat it as reaching full offset.
-    if length == 1:
-        ramp = np.array([1.0])
-    else:
-        t = np.linspace(0.0, 1.0, length)
-        if model == "linear":
-            ramp = t
-        else:
-            k = 3.0  # curvature; fouling creeps slowly then accelerates
-            ramp = (np.expm1(k * t)) / np.expm1(k)
-
-    out = values.astype(float).copy()
-    stop = start + length
-    out[start:stop] = np.maximum(out[start:stop] + ramp * magnitude, VALUE_FLOOR)
-    return out, Segment(
-        DRIFT, start, stop, {"magnitude": float(magnitude), "model": model}
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -578,102 +495,6 @@ def _median_step(df: pd.DataFrame) -> pd.Timedelta:
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
-def _n_drift_episodes(n_rows: int, step: pd.Timedelta, interval_days: float) -> int:
-    """How many maintenance cycles fit in this base, at this level's interval.
-
-    At least one: a base too short for even a single cycle still gets one episode,
-    so every dataset has drift positives to score (§10 needs per-type recall, which
-    is undefined for a type with no positives). ``_place_drift_episodes`` raises if
-    the base cannot fit even that.
-    """
-    span_days = n_rows * step / pd.Timedelta(days=1)
-    return max(1, int(round(span_days / interval_days)))
-
-
-def _place_drift_episodes(
-    rng: np.random.Generator,
-    n_rows: int,
-    step: pd.Timedelta,
-    n_episodes: int,
-) -> list[tuple[int, int, int]]:
-    """Lay out drift episodes as (start, length, maintenance_length) row triples.
-
-    Episodes are spread one per equal block of the series rather than placed at
-    random, because maintenance is roughly periodic in practice — a sensor gets
-    visited on a schedule, and drift is what accrues between visits.
-    """
-    if n_episodes < 1:
-        return []
-
-    min_len = _rows_per(pd.Timedelta(days=DRIFT_DURATION_DAYS[0]), step)
-    max_maint = _rows_per(pd.Timedelta(hours=MAINTENANCE_DURATION_HOURS[1]), step)
-    block = n_rows // n_episodes
-
-    # Refuse rather than silently shrink drift into something unrealistic: a base
-    # too short for this level's drift budget is nonsensical input (§13).
-    if block < min_len + max_maint + 2 * PLACEMENT_MARGIN_ROWS:
-        span_days = n_rows * step / pd.Timedelta(days=1)
-        raise ValueError(
-            f"base is too short for {n_episodes} drift episode(s): {span_days:.0f} days "
-            f"leaves {block * step / pd.Timedelta(days=1):.0f} days per episode, but a "
-            f"realistic episode needs >= {DRIFT_DURATION_DAYS[0]:.0f} days plus a "
-            f"maintenance window. Use a longer base or a lower level."
-        )
-
-    episodes: list[tuple[int, int, int]] = []
-    for i in range(n_episodes):
-        block_start = i * block
-        block_end = block_start + block
-        maint_len = _rows_per(
-            pd.Timedelta(hours=_uniform(rng, MAINTENANCE_DURATION_HOURS)), step
-        )
-        # Longest episode that still leaves room for its maintenance window.
-        room = block_end - block_start - maint_len - PLACEMENT_MARGIN_ROWS
-        want = _rows_per(pd.Timedelta(days=_uniform(rng, DRIFT_DURATION_DAYS)), step)
-        length = max(min_len, min(want, room))
-        slack = room - length
-        start = block_start + (int(rng.integers(0, slack)) if slack > 0 else 0)
-        episodes.append((start, length, maint_len))
-    return episodes
-
-
-def _inject_drift_and_maintenance(
-    rng: np.random.Generator,
-    values: np.ndarray,
-    occupied: np.ndarray,
-    scale: np.ndarray,
-    step: pd.Timedelta,
-    interval_days: float,
-) -> tuple[np.ndarray, list[Segment], list[MaintenanceEvent]]:
-    segments: list[Segment] = []
-    events: list[MaintenanceEvent] = []
-
-    n_episodes = _n_drift_episodes(len(values), step, interval_days)
-    for start, length, maint_len in _place_drift_episodes(rng, len(values), step, n_episodes):
-        local = float(np.median(scale[start : start + length]))
-        magnitude = _signed(
-            rng, _uniform(rng, DRIFT_MAGNITUDE_SCALE) * local, DRIFT_UPWARD_PROB
-        )
-        model = "linear" if rng.random() < 0.5 else "exponential"
-        values, seg = inject_drift(
-            values, start, length=length, magnitude=magnitude, model=model
-        )
-        segments.append(seg)
-        _mark(occupied, start, length)
-
-        # The maintenance visit sits immediately after the episode: the drift is
-        # reset here, which is what correctDrift calibrates against. We leave the
-        # data itself untouched across the visit so cal_range has clean readings
-        # on both sides.
-        maint_start = seg.end_idx
-        maint_stop = min(len(values), maint_start + maint_len)
-        if maint_stop > maint_start:
-            events.append(MaintenanceEvent(maint_start, maint_stop))
-            _mark(occupied, maint_start, maint_stop - maint_start)
-
-    return values, segments, events
-
-
 def _inject_level_shifts(
     rng: np.random.Generator,
     values: np.ndarray,
@@ -787,8 +608,8 @@ def _blocking_gap_mask(natural_gaps: np.ndarray, max_span: int) -> np.ndarray:
     """Natural gaps that genuinely block placement: the runs longer than ``max_span``.
 
     Isolated short dropouts are left unblocked so segment anomalies (plateau,
-    level_shift, drift) can span them, exactly as they span them in reality. Only
-    real outages stop a segment from being placed.
+    level_shift) can span them, exactly as they span them in reality. Only real
+    outages stop a segment from being placed.
     """
     blocking = natural_gaps.copy()
     starts, stops = _runs(natural_gaps)
@@ -843,7 +664,7 @@ def _build_manifest(
 ) -> dict[str, Any]:
     """Per-type accounting, so evaluation never has to infer counts from the level."""
     by_type: dict[str, Any] = {}
-    for kind in (SPIKE, PLATEAU, LEVEL_SHIFT, GAP, DRIFT):
+    for kind in (SPIKE, PLATEAU, LEVEL_SHIFT, GAP):
         rows = int((labels["anomaly_type"] == kind).sum())
         events = sum(1 for s in segments if s.anomaly_type == kind)
         by_type[kind] = {
@@ -874,7 +695,6 @@ def _build_manifest(
         "level": level.level,
         "level_name": level.name,
         "n_rows": n_rows,
-        "maintenance_interval_days": level.maintenance_interval_days,
         "target_point_pct": level.point_pct,
         "actual_point_pct": actual_point_pct,
         "point_budget_met": budget_met,
@@ -896,14 +716,14 @@ def inject_series(
     name: str = "series",
     value_col: str = VALUE_COL,
 ) -> InjectionResult:
-    """Inject all five anomaly types into one clean base at one contamination level.
+    """Inject all four anomaly types into one clean base at one contamination level.
 
     ``df`` must already sit on a regular grid (use :func:`load_base`), so that
     natural gaps are explicit NaN rows and labels stay row-aligned by datetime.
 
-    Injection order runs largest-footprint first — drift, then level shifts, then
-    the point types — because each claims its rows before the next one places, and
-    the small types have far more freedom to find a home in what is left.
+    Injection order runs largest-footprint first — level shifts, then the point
+    types — because each claims its rows before the next one places, and the small
+    types have far more freedom to find a home in what is left.
     """
     if level not in LEVELS:
         raise ValueError(f"level must be one of {sorted(LEVELS)} (got {level}).")
@@ -926,9 +746,6 @@ def inject_series(
     # rules in `_inject_point_anomalies` handle what each type actually needs.
     occupied = _blocking_gap_mask(natural_gaps, SPANNABLE_DROPOUT_ROWS)
 
-    values, drift_segs, maint_events = _inject_drift_and_maintenance(
-        rng, values, occupied, scale, step, cfg.maintenance_interval_days
-    )
     values, shift_segs = _inject_level_shifts(
         rng, values, occupied, scale, step, cfg.n_level_shifts
     )
@@ -937,22 +754,12 @@ def inject_series(
         rng, values, base, occupied, scale, step, budget_rows
     )
 
-    segments = sorted(
-        drift_segs + shift_segs + point_segs, key=lambda s: s.start_idx
-    )
+    segments = sorted(shift_segs + point_segs, key=lambda s: s.start_idx)
 
     data = pd.DataFrame(
         {DATETIME_COL: df[DATETIME_COL].to_numpy(), VALUE_COL: values}
     )
     labels = _build_labels(df, base, segments, natural_gaps)
-
-    times = pd.DatetimeIndex(df[DATETIME_COL])
-    maintenance = pd.DataFrame(
-        {
-            "start": [times[e.start_idx] for e in maint_events],
-            "end": [times[min(e.end_idx, len(times) - 1)] for e in maint_events],
-        }
-    )
 
     manifest = _build_manifest(name, cfg, seed, labels, segments, len(base))
     return InjectionResult(
@@ -961,7 +768,6 @@ def inject_series(
         seed=seed,
         data=data,
         labels=labels,
-        maintenance=maintenance,
         segments=segments,
         manifest=manifest,
     )
@@ -971,17 +777,15 @@ def inject_series(
 # Writing + CLI
 # ---------------------------------------------------------------------------
 def write_result(result: InjectionResult, outdir: Path) -> dict[str, Path]:
-    """Write the §5 quartet: series, labels, maintenance schedule, manifest."""
+    """Write the §5 triple: series, labels, manifest."""
     outdir.mkdir(parents=True, exist_ok=True)
     paths = {
         "data": outdir / f"{result.name}.csv",
         "labels": outdir / f"{result.name}_labels.csv",
-        "maintenance": outdir / f"{result.name}_maintenance.csv",
         "manifest": outdir / f"{result.name}_manifest.json",
     }
     result.data.to_csv(paths["data"], index=False)
     result.labels.to_csv(paths["labels"], index=False)
-    result.maintenance.to_csv(paths["maintenance"], index=False)
     paths["manifest"].write_text(json.dumps(result.manifest, indent=2))
     return paths
 
@@ -1000,7 +804,7 @@ def format_manifest(manifest: dict[str, Any]) -> str:
         f"  point budget      : {manifest['target_point_pct']:.1f}% target -> "
         f"{manifest['actual_point_pct']:.2f}% actual (spike/plateau/gap, injected only)",
         f"  total anomalous   : {manifest['total_anomalous_rows']:,} rows "
-        f"({manifest['total_anomalous_pct']:.2f}%, incl. drift/level_shift/natural gaps)",
+        f"({manifest['total_anomalous_pct']:.2f}%, incl. level_shift/natural gaps)",
         f"  natural gap rows  : {manifest['natural_gap_rows']:,} "
         f"({manifest['natural_gap_pct']:.2f}%)",
         "  by type:",
@@ -1029,8 +833,8 @@ def format_manifest(manifest: dict[str, Any]) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Inject the five synthetic anomaly types into clean base segments, "
-            "with ground-truth labels and a maintenance schedule."
+            "Inject the four synthetic anomaly types into clean base segments, "
+            "with ground-truth labels."
         ),
     )
     parser.add_argument(
@@ -1084,7 +888,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Would inject seed={args.seed} levels={args.levels} -> {args.outdir}")
         for path in inputs:
             for level in args.levels:
-                print(f"  {path.name} -> {_base_name(path, level)}.csv (+ labels, maintenance)")
+                print(f"  {path.name} -> {_base_name(path, level)}.csv (+ labels, manifest)")
         return 0
 
     for path in inputs:

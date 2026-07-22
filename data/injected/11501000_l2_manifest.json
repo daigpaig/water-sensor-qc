@@ -4,41 +4,35 @@
   "level": 2,
   "level_name": "medium",
   "n_rows": 21151,
-  "maintenance_interval_days": 100.0,
   "target_point_pct": 7.0,
-  "actual_point_pct": 6.983,
+  "actual_point_pct": 6.974,
   "point_budget_met": true,
   "types_missing": [],
   "scoreable": true,
-  "total_anomalous_rows": 7039,
-  "total_anomalous_pct": 33.28,
+  "total_anomalous_rows": 2194,
+  "total_anomalous_pct": 10.373,
   "natural_gap_rows": 434,
   "natural_gap_pct": 2.052,
   "by_type": {
     "spike": {
-      "n_events": 139,
+      "n_events": 145,
       "n_rows": 296,
       "pct_rows": 1.399
     },
     "plateau": {
-      "n_events": 23,
-      "n_rows": 589,
-      "pct_rows": 2.785
+      "n_events": 21,
+      "n_rows": 587,
+      "pct_rows": 2.775
     },
     "level_shift": {
       "n_events": 2,
-      "n_rows": 348,
-      "pct_rows": 1.645
+      "n_rows": 285,
+      "pct_rows": 1.347
     },
     "gap": {
-      "n_events": 50,
+      "n_events": 52,
       "n_rows": 1026,
       "pct_rows": 4.851
-    },
-    "drift": {
-      "n_events": 2,
-      "n_rows": 4780,
-      "pct_rows": 22.599
     }
   }
 }
