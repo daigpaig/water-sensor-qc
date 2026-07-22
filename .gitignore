@@ -18,6 +18,10 @@ logs/*
 # Generated review artifacts (regenerate via `python -m src.tools.visualize`)
 figures/
 
+# Proposed candidates are regenerable from the series (`src.tools.review detect`).
+# The reviewed *labels* are hand-made ground truth — those stay in the repo.
+data/review/*_candidates.csv
+
 # Python
 __pycache__/
 *.py[cod]
