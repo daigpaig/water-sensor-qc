@@ -312,16 +312,15 @@ we run the tool → we return tool_result → loop).
 - **Synthetic injection:** inject all four types at recorded locations into the approved
   bases; save the labels (§5). Build **three contamination levels** with a **fixed random
   seed** for reproducibility.
-- **What the level scales.** The `~2% / 5% / 9%` knob applies to the **point-like types
+- **What the level scales.** The `0.8% / 2% / 3.5%` knob applies to the **point-like types
   only** (spike, plateau, gap), where "percent of rows" is a natural unit. `level_shift` is
   driven by episode count instead (1 / 2 / 3), and its row-share is a reported consequence
   rather than a target — so a dataset's **total** anomalous share exceeds its headline level,
-  partly via *natural* gaps carried in from the base. Level 3 now lands at 14.2 / 11.0 / 10.5%
-  on 03447687 / 02198840 / 08041770 — close to the headline 9% now that the bases are ≥95%
-  complete (natural-gap share is only 0.6–4.6%, versus up to 35% with the old gappy
-  bases). (These per-type rates were toned down from an earlier `3 / 7 / 12` to look more
-  like real records.) Read per-type counts from the manifest/labels; never infer them from
-  the level number.
+  partly via *natural* gaps carried in from the base. Level 3 now lands at 8.7 / 5.5 / 5.0%
+  on 03447687 / 02198840 / 08041770 (natural-gap share is only 0.6–4.6%). (These per-type
+  rates were deliberately toned down in stages — from `3 / 7 / 12` to `2 / 5 / 9` to the
+  current `0.8 / 2 / 3.5` — to look like real, sparsely-anomalous records.) Read per-type
+  counts from the manifest/labels; never infer them from the level number.
 - **Level shift is injected as a bounded window**, not a literal permanent step: a
   permanent step would either label every subsequent row anomalous (one mid-series shift
   ≈ 50% contamination) or leave post-step rows with `true_value != value` while marked

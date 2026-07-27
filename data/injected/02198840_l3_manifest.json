@@ -4,25 +4,25 @@
   "level": 3,
   "level_name": "high",
   "n_rows": 70272,
-  "target_point_pct": 9.0,
-  "actual_point_pct": 8.977,
+  "target_point_pct": 3.5,
+  "actual_point_pct": 3.482,
   "point_budget_met": true,
   "types_missing": [],
   "scoreable": true,
-  "total_anomalous_rows": 7749,
-  "total_anomalous_pct": 11.027,
+  "total_anomalous_rows": 3888,
+  "total_anomalous_pct": 5.533,
   "natural_gap_rows": 975,
   "natural_gap_pct": 1.387,
   "by_type": {
     "spike": {
-      "n_events": 648,
-      "n_rows": 1265,
-      "pct_rows": 1.8
+      "n_events": 246,
+      "n_rows": 492,
+      "pct_rows": 0.7
     },
     "plateau": {
-      "n_events": 87,
-      "n_rows": 2513,
-      "pct_rows": 3.576
+      "n_events": 33,
+      "n_rows": 971,
+      "pct_rows": 1.382
     },
     "level_shift": {
       "n_events": 3,
@@ -30,9 +30,9 @@
       "pct_rows": 0.663
     },
     "gap": {
-      "n_events": 196,
-      "n_rows": 3505,
-      "pct_rows": 4.988
+      "n_events": 85,
+      "n_rows": 1959,
+      "pct_rows": 2.788
     }
   }
 }

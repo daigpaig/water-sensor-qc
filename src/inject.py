@@ -192,9 +192,9 @@ class ContaminationLevel:
 
 
 LEVELS: dict[int, ContaminationLevel] = {
-    1: ContaminationLevel(1, "low", point_pct=2.0, n_level_shifts=1),
-    2: ContaminationLevel(2, "medium", point_pct=5.0, n_level_shifts=2),
-    3: ContaminationLevel(3, "high", point_pct=9.0, n_level_shifts=3),
+    1: ContaminationLevel(1, "low", point_pct=0.8, n_level_shifts=1),
+    2: ContaminationLevel(2, "medium", point_pct=2.0, n_level_shifts=2),
+    3: ContaminationLevel(3, "high", point_pct=3.5, n_level_shifts=3),
 }
 
 
