@@ -261,6 +261,31 @@ accepted by every method we use, including offset-string windows. Note that SaQC
 accepts two things we should reject ourselves in `inspect_dataset`: a non-datetime
 `RangeIndex`, and **duplicate timestamps**.
 
+### 7.2 Practical parameter ranges (measured via `param_sweep`)
+
+Swept against the injected labels with `src/tools/param_sweep.py` across all three gauges
+(median 8 / 13 / 28 FNU) and levels 1–3. Ranges are wide because the optimum shifts with
+**turbidity scale** and **anomaly density**. These are starting ranges + directional rules
+for the agent (§8), not hard bounds — re-run the sweep if the data changes. Overriding
+principle: **raise a sensitivity threshold when the base is spiky/variable or anomalies are
+sparse (favor precision); lower it when anomalies are dense or the base is calm (favor
+recall).**
+
+| Tool · param | range (default) | increase (↑) when | decrease (↓) when |
+| --- | --- | --- | --- |
+| `flag_spike_unilof` · `thresh` (`n≈20`) | **1.2–2.0** (1.5) | many false positives; sparse anomalies (low level); base naturally spiky | missing spikes; dense spikes (high level); calm base. *LOF ratio → same range every gauge.* |
+| `flag_zscore` · `thresh` (`modified`, `window≈12h`) | **6–12** (8) | spikier/more-variable base (French Broad → 12); too many FP | calm base; missing spikes. *Backup to UniLOF, which usually wins.* |
+| `flag_range` · `min`/`max` | `min=0`, `max` **1000–2000** | raise `max` if it clips real extremes | lower `max` only to catch a known over-range fault. *Physical gate, not a sensitivity knob.* |
+| `flag_constants` · `thresh` (`window` 3–12h) | **≤0.05** (0.01) | only if the noise sd is unusually large | keep small — `>0.5` swallows the series (§7.1). *≤0.05 robust on every gauge.* |
+| `flag_plateau` · `min_length` | **1–3h** (1h) | — | — *Crash-prone/data-dependent (§7.1); finds little. Wrap it; rely on `flag_constants`.* |
+| `flag_jumps` · `thresh` | **1–5** (2) | to cut false positives (precision stays ~1–5% regardless) | to catch all episodes at low thresh. *"Look here" aid only — can't be tuned reliably (~3 level_shift episodes/dataset; fires on storm limbs, §9.1).* |
+| `impute_rolling` · `window` (`func='median'`) | **1–6h** (3h) | to fill longer gaps (↑coverage but ↑RMSE) | for accuracy on short gaps. *Beats linear only on the calmest gauge at 3h — open issue (§11).* |
+
+Data-unit thresholds (`flag_zscore`, `flag_constants`, `flag_jumps`) don't transfer between
+gauges of different scale — rescale by the series' robust (MAD) spread when moving to a new
+gauge (§7.1). Measured across 3 gauges × 3 levels, but level_shift and imputation remain
+under-powered, so treat those two rows as guidance-to-flag, not tuned optima.
+
 ---
 
 ## 8. The agent loop (ReAct)
