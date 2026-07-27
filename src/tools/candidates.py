@@ -16,10 +16,23 @@ Per-type notes
   higher via its score, but either alone is enough to propose it.
 - **plateau** — ``flagConstants`` (stuck at any level) + ``flagPlateau``
   (offset segment). These find different failures, so both run (CLAUDE.md §7.1).
-- **level_shift** — ``flagJumps``. It marks the *transition*, not the shifted
-  window, so a candidate's span is the transition ± context.
-- **gap** — ``flagNAN`` on the re-gridded series, then runs shorter than
-  ``min_gap`` are dropped: isolated dropouts are not gaps (§9).
+- **level_shift** — ``flagJumps``, then a **sharpness filter**. ``flagJumps``
+  flags any change of ``thresh`` within its window, which on storm-driven
+  turbidity means every rising and falling limb — gradual slopes that are normal
+  water behaviour, not sensor faults. A genuine level shift (recalibration,
+  sensor swap) moves most of its magnitude in a single sample; a storm spreads it
+  over hours. So a candidate is kept only if its sharpest one-sample move is a
+  large fraction of the net step (:attr:`DetectConfig.shift_min_sharpness`).
+  **Known limit:** this cannot reject a flash-flood onset, which is also sharp and
+  sustained. No univariate test separates the two — a real sensor step and a
+  sudden storm look identical in one series. Across the three project gauges,
+  every level_shift candidate that survived review was rejected by the human, so
+  treat this detector's output as "look here", not "this is an artifact".
+Gaps are **not** proposed for review — :func:`merge_decisions` labels them
+directly from the data. Nothing about a NaN run is a judgement call: the value is
+either present or it is not, and §5 is explicit that *every* missing run is
+``anomaly_type=gap``. Queueing them would only invite a reviewer to press
+"normal" on one and produce labels that contradict the contract.
 
 Drift is **not** proposed: the drift track is shelved (CLAUDE.md §9.2). SaQC 2.8
 ships no univariate drift detector, so it had to be a local heuristic, it was the
@@ -60,10 +73,16 @@ FIELD = VALUE_COL
 
 AnomalyType = Literal["spike", "plateau", "level_shift", "gap"]
 
-#: Order candidates are presented in. Point-like types first — they are the
-#: quickest to judge, so the reviewer builds a feel for the series before
-#: reaching the slow, ambiguous segment types.
-TYPE_ORDER: tuple[str, ...] = ("spike", "plateau", "level_shift", "gap")
+#: Types proposed for human review, in presentation order. Point-like first —
+#: they are the quickest to judge, so the reviewer builds a feel for the series
+#: before reaching the slower, more ambiguous segment types. ``gap`` is
+#: deliberately absent; see the module docstring.
+REVIEW_TYPES: tuple[str, ...] = ("spike", "plateau", "level_shift")
+
+#: Every type that can appear in a merged labels file. ``gap`` comes last so it
+#: wins overlap resolution in :func:`merge_decisions`: a missing value is missing
+#: whatever else a detector thought was happening there.
+LABEL_TYPES: tuple[str, ...] = REVIEW_TYPES + ("gap",)
 
 #: Colour per type, shared with the review page.
 TYPE_COLORS: dict[str, str] = {
@@ -102,10 +121,27 @@ class DetectConfig:
     # level shift
     jumps_window: str = "12h"
     jumps_thresh_sigmas: float = 24.0  # x step scale
-    # gap
-    min_gap: str = "1h"  # shorter NaN runs are dropouts, not gaps (§9)
+    # flagJumps flags any change of `thresh` within `window`, so on storm-driven
+    # turbidity it fires on every rising/falling limb — the "gradual slopes" a
+    # reviewer rejects. A real level shift (recalibration, sensor swap) moves
+    # most of its magnitude in one sample; a storm spreads it over hours. Keep a
+    # candidate only if its sharpest single step is at least this fraction of the
+    # net level change, and the net change clears the jump threshold. On the three
+    # gauges this cut level_shift candidates from 85/23/5 to 8/1/0. It does NOT
+    # remove flash-flood onsets, which are sharp and sustained too (probed in
+    # scratchpad/tune_level_shift.py; see the module docstring).
+    shift_min_sharpness: float = 0.5
+    shift_persist_window: str = "12h"  # horizon for the before/after medians
+    # NB: no gap settings. Gaps are labelled from the NaN mask at merge with no
+    # length threshold (§5) — there is nothing here to tune.
     # grouping / presentation
-    bridge: str = "2h"  # merge flagged runs separated by less than this
+    #: Merge flagged runs separated by less than this — but for **segment** types
+    #: only (plateau, level_shift), where a detector legitimately marks one long
+    #: event in patches. Spikes are never bridged: §6 defines a spike as one/few
+    #: values far from neighbours, so bridging glues distinct spikes together and
+    #: drags the normal rows between them into the label. At 2h on a 15-min grid
+    #: that put 12-27% never-flagged filler inside spike candidates.
+    segment_bridge: str = "2h"
     max_per_type: int = 50  # keep the worst N per type; the rest are reported
 
 
@@ -119,8 +155,9 @@ class Candidate:
     detectors: tuple[str, ...]
     start_pos: int  # inclusive row position in the gridded series
     end_pos: int  # exclusive
-    start: pd.Timestamp
-    end: pd.Timestamp
+    start: pd.Timestamp  # timestamp of start_pos
+    end: pd.Timestamp  # timestamp of the LAST included row (inclusive), so the
+    #: exported start/end read the way a human expects and can be narrowed by hand
     n_rows: int
     duration_hours: float
     score: float  # severity, comparable within a type only
@@ -179,6 +216,15 @@ class CandidateSet:
             out[c.anomaly_type] = out.get(c.anomaly_type, 0) + 1
         return out
 
+    def gap_totals(self) -> tuple[int, int]:
+        """``(number of missing runs, number of missing rows)`` — all of them.
+
+        Reported rather than reviewed: these are labelled wholesale by
+        :func:`merge_decisions`, with no length threshold, per §5.
+        """
+        mask = self.series.isna().to_numpy()
+        return len(_runs(mask)), int(mask.sum())
+
     def summary(self) -> str:
         """Human-readable proposal summary for the terminal."""
         lines = [
@@ -189,14 +235,16 @@ class CandidateSet:
             f"  {len(self.candidates)} candidate(s) for review:",
         ]
         counts = self.counts()
-        for t in TYPE_ORDER:
-            if t in counts:
-                extra = self.truncated.get(t, 0)
-                tail = f"  (+{extra} lower-scoring, dropped)" if extra else ""
-                lines.append(f"    {t:<12} {counts[t]:>4}{tail}")
-        for t in TYPE_ORDER:
-            if t not in counts:
-                lines.append(f"    {t:<12} {0:>4}")
+        for t in REVIEW_TYPES:
+            extra = self.truncated.get(t, 0)
+            tail = f"  (+{extra} lower-scoring, dropped)" if extra else ""
+            lines.append(f"    {t:<12} {counts.get(t, 0):>4}{tail}")
+
+        n_runs, n_rows = self.gap_totals()
+        lines.append(
+            f"  gap: {n_runs:,} missing run(s), {n_rows:,} row(s) — labelled "
+            "automatically at merge, not reviewed (§5)"
+        )
         for tool, msg in self.errors.items():
             lines.append(f"  ! {tool} failed: {msg}")
         return "\n".join(lines)
@@ -295,13 +343,38 @@ def _score_spike(values: pd.Series, seg: slice, step_scale: float, win: int) -> 
     return float((body - baseline).abs().max() / max(step_scale, 1e-9))
 
 
-def _score_shift(values: pd.Series, seg: slice, step_scale: float, win: int) -> float:
-    """Size of the level change across the segment, in step sigmas."""
+def _shift_metrics(
+    values: pd.Series, seg: slice, win: int
+) -> tuple[float, float]:
+    """``(net level change, sharpness)`` for a candidate level shift.
+
+    ``net`` is the absolute difference between the median of the ``win`` rows
+    before the edge and the ``win`` rows after it — the size of the step itself,
+    in data units. ``sharpness`` is the single largest one-sample move inside the
+    edge divided by ``net``: ~1.0 when the whole step happens in one sample (a
+    recalibration / sensor swap), and small when the change is spread over many
+    samples (a storm rising or falling limb — a gradual slope, not a step).
+
+    This is the discriminator behind :attr:`DetectConfig.shift_min_sharpness`.
+    It cannot separate a genuine step from a *flash-flood onset*, which is also
+    sharp and sustained — no univariate test can (see the module docstring).
+    """
     before = values.iloc[max(0, seg.start - win) : seg.start].median()
     after = values.iloc[seg.stop : seg.stop + win].median()
     if not (np.isfinite(before) and np.isfinite(after)):
-        return 0.0
-    return float(abs(after - before) / max(step_scale, 1e-9))
+        return 0.0, 0.0
+    net = abs(after - before)
+    # include one sample either side so the edge's own jump is inside the window
+    edge = values.iloc[max(0, seg.start - 1) : seg.stop + 1]
+    max_move = edge.diff().abs().max()
+    sharpness = float(max_move / net) if net > 0 else 0.0
+    return float(net), sharpness
+
+
+def _score_shift(values: pd.Series, seg: slice, step_scale: float, win: int) -> float:
+    """Size of the level change across the segment, in step sigmas."""
+    net, _ = _shift_metrics(values, seg, win)
+    return net / max(step_scale, 1e-9)
 
 
 # --------------------------------------------------------------------------- detect
@@ -371,26 +444,18 @@ def _detect_jumps(
         return {}
 
 
-def _detect_gaps(
-    series: pd.Series, cfg: DetectConfig, errors: dict[str, str]
-) -> dict[str, np.ndarray]:
-    try:
-        return {"flagNAN": _run_saqc(series, "flagNAN", {}).to_numpy()}
-    except Exception as exc:
-        errors["flagNAN"] = f"{type(exc).__name__}: {exc}"
-        return {}
-
-
 def find_candidates(
     path: str | Path,
     *,
     config: DetectConfig | None = None,
     value_col: str = VALUE_COL,
 ) -> CandidateSet:
-    """Load a series and propose candidate anomalies of every type.
+    """Load a series and propose reviewable candidates (:data:`REVIEW_TYPES`).
 
     The series is re-gridded onto its modal timestep first, so missing samples
-    become explicit NaN rows and gap detection has something to find (§9).
+    become explicit NaN rows. Those rows are excluded from every candidate mask
+    (a NaN carries no evidence of a spike or a plateau) and are labelled as gaps
+    wholesale by :func:`merge_decisions`.
     """
     path = Path(path)
     cfg = config or DetectConfig()
@@ -402,22 +467,22 @@ def find_candidates(
 
     level_scale, step_scale = robust_scales(series)
     step_minutes = _median_step_minutes(pd.DatetimeIndex(series.index))
-    bridge = _rows_for(cfg.bridge, step_minutes)
+    segment_bridge = _rows_for(cfg.segment_bridge, step_minutes)
     context = _rows_for("24h", step_minutes)
-    min_gap_rows = _rows_for(cfg.min_gap, step_minutes)
+    persist = _rows_for(cfg.shift_persist_window, step_minutes)
+    jump_floor = cfg.jumps_thresh_sigmas * step_scale  # min net step, data units
 
     errors: dict[str, str] = {}
     per_type: dict[str, dict[str, np.ndarray]] = {
         "spike": _detect_spikes(series, cfg, step_scale, errors),
         "plateau": _detect_plateaus(series, cfg, step_scale, errors),
         "level_shift": _detect_jumps(series, cfg, step_scale, errors),
-        "gap": _detect_gaps(series, cfg, errors),
     }
 
     is_nan = series.isna().to_numpy()
     values = series
     n = len(series)
-    proposals: dict[str, list[Candidate]] = {t: [] for t in TYPE_ORDER}
+    proposals: dict[str, list[Candidate]] = {t: [] for t in REVIEW_TYPES}
 
     for atype, masks in per_type.items():
         if not masks:
@@ -425,16 +490,13 @@ def find_candidates(
         union = np.zeros(n, dtype=bool)
         for m in masks.values():
             union |= m
-        # Only gap candidates may sit on missing rows; for every other type a
-        # NaN row carries no evidence, and letting them in merges unrelated
-        # events across dropouts.
-        if atype != "gap":
-            union &= ~is_nan
+        # A NaN row carries no evidence of a spike or a plateau, and letting one
+        # in would merge unrelated events across a dropout.
+        union &= ~is_nan
 
-        for a, b in _runs(union, bridge=0 if atype == "gap" else bridge):
-            if atype == "gap" and (b - a) < min_gap_rows:
-                continue  # isolated dropout, not a gap (§9)
-
+        # Point events are never bridged; segment events are (see segment_bridge).
+        bridge = 0 if atype == "spike" else segment_bridge
+        for a, b in _runs(union, bridge=bridge):
             seg = slice(a, b)
             detectors = tuple(
                 name for name, m in masks.items() if m[a:b].any()
@@ -442,8 +504,12 @@ def find_candidates(
             if atype == "spike":
                 score = _score_spike(values, seg, step_scale, context)
             elif atype == "level_shift":
-                score = _score_shift(values, seg, step_scale, context)
-            else:  # plateau, gap — duration is the severity
+                # Drop gradual slopes: keep only a sharp, threshold-sized step.
+                net, sharpness = _shift_metrics(values, seg, persist)
+                if net < jump_floor or sharpness < cfg.shift_min_sharpness:
+                    continue
+                score = net / max(step_scale, 1e-9)
+            else:  # plateau — duration is the severity
                 score = (b - a) * step_minutes / 60.0
 
             body = values.iloc[seg].dropna()
@@ -455,7 +521,7 @@ def find_candidates(
                     start_pos=a,
                     end_pos=b,
                     start=series.index[a],
-                    end=series.index[min(b, n - 1)],
+                    end=series.index[b - 1],
                     n_rows=b - a,
                     duration_hours=(b - a) * step_minutes / 60.0,
                     score=score,
@@ -467,7 +533,7 @@ def find_candidates(
     # Rank within type, cap, then id in presentation order.
     ordered: list[Candidate] = []
     truncated: dict[str, int] = {}
-    for atype in TYPE_ORDER:
+    for atype in REVIEW_TYPES:
         items = sorted(proposals[atype], key=lambda c: c.score, reverse=True)
         if len(items) > cfg.max_per_type:
             truncated[atype] = len(items) - cfg.max_per_type
@@ -492,6 +558,47 @@ def find_candidates(
 
 
 # --------------------------------------------------------------------------- merge
+def _decided_spans(
+    result: CandidateSet, decisions: pd.DataFrame, chosen: set[str]
+) -> dict[str, tuple[int, int]]:
+    """Row span ``[start, end)`` to label for each chosen candidate.
+
+    Defaults to the candidate's full extent, but honours a narrowed
+    ``start``/``end`` from the decisions frame (``end`` inclusive). A narrowed
+    span must lie inside the original: the reviewer is trimming a proposal, not
+    inventing a new one, and a stray timestamp would otherwise label rows nobody
+    ever looked at.
+    """
+    by_id = {c.candidate_id: c for c in result.candidates}
+    index = result.series.index
+    spans = {cid: (by_id[cid].start_pos, by_id[cid].end_pos)
+             for cid in chosen if cid in by_id}
+
+    if not {"start", "end"} <= set(decisions.columns):
+        return spans
+
+    for row in decisions.itertuples():
+        cid = str(row.candidate_id)
+        c = by_id.get(cid)
+        if cid not in chosen or c is None:
+            continue
+        start, end = pd.to_datetime(row.start), pd.to_datetime(row.end)
+        if pd.isna(start) or pd.isna(end):
+            continue
+        a = int(index.searchsorted(start, side="left"))
+        b = int(index.searchsorted(end, side="right"))  # end is inclusive
+        if a >= b:
+            raise ValueError(f"{cid}: start {start} is after end {end}")
+        if a < c.start_pos or b > c.end_pos:
+            raise ValueError(
+                f"{cid}: reviewed span {start}..{end} falls outside the candidate "
+                f"({c.start}..{c.end}). A decision may narrow a candidate, never "
+                "extend it — re-run 'detect' if you need a different span."
+            )
+        spans[cid] = (a, b)
+    return spans
+
+
 def merge_decisions(
     result: CandidateSet,
     decisions: pd.DataFrame,
@@ -505,13 +612,29 @@ def merge_decisions(
     empty). Only ``anomaly`` rows become labels — plus ``unsure`` when
     ``include_unsure`` is set, which is useful for a second pass.
 
+    **Gaps are added here, not reviewed.** Every missing run in the series is
+    labelled ``anomaly_type=gap`` regardless of length, which is what §5
+    requires — "**Every** missing run is labelled ``is_anomaly=True,
+    anomaly_type=gap``". No length threshold applies: on 06818000, 93% of
+    missing rows sit in runs shorter than an hour, and dropping those would
+    under-label the series by an order of magnitude.
+
     ``source`` is always ``natural`` and ``true_value`` always NaN: these
     anomalies were already in the record, so no uncontaminated value is known
     for them. That is exactly the §5 case where imputation cannot be scored.
 
-    Overlapping confirmed candidates of different types are resolved by
-    :data:`TYPE_ORDER` — the earlier type wins, so a spike sitting inside a
-    confirmed level_shift stays labelled ``spike``.
+    **Narrowed spans are honoured.** A detector marks a window; only part of it
+    may actually be the anomaly. If ``decisions`` carries ``start``/``end``
+    columns (the export always does, and they can be edited by hand), the
+    labelled rows are that span rather than the candidate's full extent —
+    validated to lie inside the original, so a typo cannot silently label
+    unrelated rows. ``end`` is **inclusive**.
+
+    Overlap resolution: among reviewed types the *earlier* entry in
+    :data:`REVIEW_TYPES` wins, so a confirmed spike inside a confirmed
+    level_shift stays labelled ``spike``. ``gap`` is applied last and beats
+    everything — a missing value is missing whatever else a detector thought was
+    happening there.
     """
     if "candidate_id" not in decisions.columns or "decision" not in decisions.columns:
         raise ValueError(
@@ -532,16 +655,24 @@ def merge_decisions(
     anomaly_type = np.full(n, "", dtype=object)
 
     by_id = {c.candidate_id: c for c in result.candidates}
+    spans = _decided_spans(result, decisions, chosen)
+
     # Apply lowest-priority type first so higher-priority types overwrite it.
     # Positional slices throughout: `.loc` on the default RangeIndex would treat
     # end_pos as inclusive and label one row too many.
-    for atype in reversed(TYPE_ORDER):
+    for atype in reversed(REVIEW_TYPES):
         for cid in chosen:
             c = by_id.get(cid)
             if c is None or c.anomaly_type != atype:
                 continue
-            is_anomaly[c.start_pos : c.end_pos] = True
-            anomaly_type[c.start_pos : c.end_pos] = atype
+            a, b = spans[cid]
+            is_anomaly[a:b] = True
+            anomaly_type[a:b] = atype
+
+    # Gaps last, and unconditionally: no review, no length threshold (§5).
+    missing = result.series.isna().to_numpy()
+    is_anomaly[missing] = True
+    anomaly_type[missing] = "gap"
 
     return pd.DataFrame(
         {

@@ -140,6 +140,63 @@ def insert_gap_breaks(s: pd.Series, max_gap: str = DEFAULT_MAX_GAP) -> pd.Series
     return pd.concat([s, breaks]).sort_index()
 
 
+def detect_spikes(
+    s: pd.Series,
+    thresh: float = 16.0,
+    window: int = 48,
+    max_width: int = 3,
+) -> pd.Series:
+    """Boolean mask of true isolated spikes (and physically impossible negatives).
+
+    The discriminator between a *sensor spike* and a *genuine event* (storm rise,
+    level shift, plateau) is **width**: a spike is a narrow pop of one to a few
+    samples that the surrounding baseline ignores, whereas a storm stays elevated
+    for many samples and a level shift never comes back. So a point is a spike
+    only when both hold:
+
+    - its residual from a **centred** rolling-median baseline (``window`` points
+      wide) exceeds ``thresh`` robust scale units — it sticks out from the local
+      trend; the centred median is barely moved by a narrow pop but *tracks* a
+      real multi-hour storm, so storm samples have small residuals, and
+    - it belongs to a contiguous run of such points no longer than ``max_width``
+      — this rejects storms and the transition band of a level shift, which
+      produce long runs of elevated residuals.
+
+    Scale is the rolling MAD about that baseline, floored so a dead-calm stretch
+    can't make the ratio explode. Negative turbidity is impossible, so any
+    ``value < 0`` is flagged regardless of width.
+
+    This is a *review* heuristic for eyeballing where genuine spikes sit, not the
+    QC pipeline's detector. ``max_width`` is in samples, so at a 15-min step
+    ``3`` means "up to 45 min"; lower ``thresh`` or higher ``max_width`` = more
+    marks.
+    """
+    v = s.astype(float)
+    minp = max(3, window // 3)
+    # Centred baseline: a narrow spike is ~1/window of the window, so the median
+    # ignores it; a sustained storm pulls the median up with it.
+    med = v.rolling(window, center=True, min_periods=minp).median()
+    resid = v - med
+    scale = resid.abs().rolling(window, center=True, min_periods=minp).median()
+    floor = (0.02 * med.abs()).clip(lower=0.5)
+    scale = scale.clip(lower=floor).fillna(floor)
+
+    elevated = (resid.abs() / scale > thresh).fillna(False).to_numpy()
+
+    # Run-length filter: keep only runs of elevated points no wider than
+    # ``max_width`` — wider excursions are events, not spikes.
+    if elevated.any():
+        starts = np.r_[True, elevated[1:] != elevated[:-1]]
+        run_id = np.cumsum(starts)
+        run_len = pd.Series(elevated).groupby(run_id).transform("size").to_numpy()
+        spike = elevated & (run_len <= max_width)
+    else:
+        spike = elevated
+
+    spike = spike | (v < 0).to_numpy()
+    return pd.Series(spike, index=s.index)
+
+
 def _describe(name: str, s: pd.Series, max_gap: str) -> str:
     """One-line terminal summary of a series (points, span, gaps, longest run)."""
     steps = pd.Series(s.index).diff()
@@ -155,8 +212,18 @@ def _describe(name: str, s: pd.Series, max_gap: str) -> str:
     )
 
 
-def build_figure(series: dict[str, pd.Series], max_gap: str = DEFAULT_MAX_GAP) -> go.Figure:
-    """Build a stacked, shared-x figure with one line panel per series."""
+def build_figure(
+    series: dict[str, pd.Series],
+    max_gap: str = DEFAULT_MAX_GAP,
+    mark_spikes: bool = False,
+    spike_thresh: float = 16.0,
+) -> go.Figure:
+    """Build a stacked, shared-x figure with one line panel per series.
+
+    When ``mark_spikes`` is set, each panel also overlays a red open-circle
+    marker at every point :func:`detect_spikes` flags, so excursions are easy to
+    locate against the baseline.
+    """
     names = list(series)
     fig = make_subplots(
         rows=len(names),
@@ -166,7 +233,8 @@ def build_figure(series: dict[str, pd.Series], max_gap: str = DEFAULT_MAX_GAP) -
         vertical_spacing=0.06,
     )
     for i, name in enumerate(names, start=1):
-        s = insert_gap_breaks(series[name], max_gap)
+        raw = series[name]
+        s = insert_gap_breaks(raw, max_gap)
         color = PANEL_COLORS[(i - 1) % len(PANEL_COLORS)]
         fig.add_trace(
             go.Scattergl(
@@ -184,6 +252,26 @@ def build_figure(series: dict[str, pd.Series], max_gap: str = DEFAULT_MAX_GAP) -
             row=i,
             col=1,
         )
+        if mark_spikes:
+            # Detect on the original series (no NaN gap-break sentinels) so the
+            # rolling median/MAD isn't polluted by inserted NaNs.
+            mask = detect_spikes(raw, thresh=spike_thresh).to_numpy()
+            sp = raw[mask]
+            fig.add_trace(
+                go.Scattergl(
+                    x=sp.index,
+                    y=sp.to_numpy().tolist(),  # list: same reason as above
+                    mode="markers",
+                    marker=dict(
+                        color="#dc2626", size=6, symbol="circle-open",
+                        line=dict(width=1.2),
+                    ),
+                    name=f"{name} spikes",
+                    hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y:.1f} FNU (spike)<extra></extra>",
+                ),
+                row=i,
+                col=1,
+            )
         fig.update_yaxes(title_text="FNU", row=i, col=1)
     fig.update_xaxes(title_text="datetime", row=len(names), col=1)
     fig.update_layout(
@@ -202,6 +290,8 @@ def visualize(
     out: Path = DEFAULT_OUT,
     open_browser: bool = True,
     max_gap: str = DEFAULT_MAX_GAP,
+    mark_spikes: bool = False,
+    spike_thresh: float = 16.0,
 ) -> Path:
     """Load ``paths``, write an interactive HTML to ``out``, and return its path."""
     if not paths:
@@ -211,8 +301,10 @@ def visualize(
     print(f"Loaded {len(series)} series:")
     for name, s in series.items():
         print(_describe(name, s, max_gap))
+        if mark_spikes:
+            print(f"    {int(detect_spikes(s, thresh=spike_thresh).sum())} spikes marked")
 
-    fig = build_figure(series, max_gap)
+    fig = build_figure(series, max_gap, mark_spikes=mark_spikes, spike_thresh=spike_thresh)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(out, include_plotlyjs=True, post_script=_AUTOSCALE_Y_JS)
     print(f"Wrote {out}")
@@ -257,10 +349,22 @@ def main(argv: list[str] | None = None) -> int:
         "--no-open", action="store_true",
         help="Write the HTML but do not open it in a browser.",
     )
+    parser.add_argument(
+        "--mark-spikes", action="store_true",
+        help="Overlay red markers on isolated spikes (and negative readings).",
+    )
+    parser.add_argument(
+        "--spike-thresh", type=float, default=16.0,
+        help="Spike sensitivity: MAD-scaled deviation above which a point is "
+             "marked (lower = more marks; default: 15).",
+    )
     args = parser.parse_args(argv)
 
     paths = _resolve_paths(args.paths)
-    visualize(paths, out=args.out, open_browser=not args.no_open, max_gap=args.max_gap)
+    visualize(
+        paths, out=args.out, open_browser=not args.no_open, max_gap=args.max_gap,
+        mark_spikes=args.mark_spikes, spike_thresh=args.spike_thresh,
+    )
     return 0
 
 

@@ -1,8 +1,18 @@
-"""Pull continuous turbidity time series from USGS NWIS.
+"""Pull continuous, USGS-**approved** turbidity time series from NWIS.
 
 Downloads instantaneous-value ("iv", sub-hourly / 15-min) turbidity for one or
 more stream gauges via the ``dataretrieval`` package and writes one tidy CSV per
 site to ``data/raw/`` (gitignored per CLAUDE.md §4).
+
+**Approved data is our clean base (CLAUDE.md §9).** By default we keep only rows
+whose USGS qualifier is *approved* (code starts with ``A``) and drop provisional
+(``P``), blank, or NaN-qualified rows. Approved records have already been through
+USGS record processing — fouling and calibration-drift corrections applied and
+prorated between field visits (TM 1-D3) — so an approved series is clean apart
+from gaps. That is what lets us inject synthetic anomalies straight into these
+files (``src.inject`` reads ``data/raw`` directly): there is no separate
+"clean-segment" carving or by-eye auditing step any more. Dropped rows simply
+become missing rows, i.e. gaps, once the series is re-gridded downstream.
 
 Turbidity parameter code
 ------------------------
@@ -55,31 +65,42 @@ import pandas as pd
 
 # ---------------------------------------------------------------------------
 # Defaults (recommended gauges — see the discovery/verification notes).
-# Selected for LONG UNBROKEN stretches first: each has a >=90-day span with no
-# internal gap exceeding `max_gap` (3h) — enough to carve a clean ~3-month
-# injection segment — verified via `longest_unbroken_run_days`. Then chosen for
-# geographic + turbidity-regime diversity over the 2-year default window:
-#   11501000  Sprague R nr Chiloquin, OR      -> Pacific NW; clear, low-turbidity
-#                                                 river (median ~1.4 FNU);
-#                                                 ~220-day unbroken stretch.
+# Every default gauge over the default window is 100% USGS-APPROVED, samples at a
+# consistent 15-min step, is >=95% complete, AND has a CALM approved baseline —
+# very few real spikes in the base itself (all verified). "Approved" corrects
+# fouling/drift and deletes clearly-bad data but KEEPS real storm spikes, so a
+# flashy river's approved record is still spiky; unlabelled base spikes would score
+# as false positives (§9.1), hence the calm-baseline requirement. Regime spread
+# (moderate / high):
 #   03447687  French Broad R nr Fletcher, NC  -> S. Appalachia; moderate regime
-#                                                 (median ~8 FNU);
-#                                                 ~513-day unbroken stretch.
-#   06818000  Missouri R at St. Joseph, MO    -> Great Plains big river; high
-#                                                 regime (median ~23 FNU);
-#                                                 ~253-day unbroken stretch.
-# Replaced the earlier GA/TX/ND set, whose strictly-continuous runs were only
-# ~2-5 weeks — too short to carve clean 3-month injection segments from.
+#                                                 (median ~8 FNU); ~95% complete;
+#                                                 ~25 base spikes (0.04%).
+#   02198840  Savannah R at I-95 nr Port Wentworth, GA -> tidal river; moderate-high
+#                                                 (median ~13 FNU, ~9x range);
+#                                                 ~99% complete; 0 base spikes.
+#   08041770  LNVA Canal at Beaumont, TX       -> managed canal; high regime
+#                                                 (median ~28 FNU, ~5x range);
+#                                                 ~99% complete; ~1 base spike.
+# Replaced 02203603 (South R, Atlanta) and 02198955 (Middle R, tidal): 100%
+# approved, 15-min, dense, but too FLASHY — 120 (0.18%) and 637 (0.91%) real spikes
+# in the base. Earlier retired: 12340500 (Blackfoot, 35% missing), 06818000
+# (Missouri, 14% missing), 11501000 (Sprague, mostly provisional).
 # ---------------------------------------------------------------------------
 TURBIDITY_PARAM = "63680"
-DEFAULT_SITES: tuple[str, ...] = ("11501000", "03447687", "06818000")
+DEFAULT_SITES: tuple[str, ...] = ("03447687", "02198840", "08041770")
 DEFAULT_START = "2023-07-01"
 DEFAULT_END = "2025-07-01"
 DEFAULT_OUTDIR = Path("data/raw")
 
-# "Unbroken-stretch" filter defaults (CLAUDE.md §9: clean segments come first).
-# A stretch stays "unbroken" as long as no internal gap exceeds `max_gap`, so a
-# few scattered 15-min dropouts don't disqualify an otherwise continuous span.
+# USGS qualifier codes starting with this prefix are "approved" (e.g. ``A``,
+# ``A e``, ``A, >``); ``P`` (provisional), blank, and NaN are not. Approved rows
+# are our clean base (CLAUDE.md §9); everything else is dropped by default.
+APPROVED_PREFIX = "A"
+
+# "Unbroken-stretch" reporting defaults. A stretch stays "unbroken" as long as no
+# internal gap exceeds `max_gap`, so a few scattered 15-min dropouts don't break
+# an otherwise continuous span. This is now an informational gauge-quality report
+# (we inject into the whole approved series), not a carving step.
 DEFAULT_MAX_GAP = "3h"
 DEFAULT_MIN_UNBROKEN_DAYS = 90.0
 
@@ -95,7 +116,9 @@ class PullConfig:
     outdir: Path = DEFAULT_OUTDIR
     max_retries: int = 3
     retry_wait_s: float = 5.0
-    # Unbroken-stretch filter (see `longest_unbroken_run_days`).
+    # Keep only USGS-approved rows (qualifier starts with ``A``); drop the rest.
+    approved_only: bool = True
+    # Unbroken-stretch report (see `longest_unbroken_run_days`).
     max_gap: str = DEFAULT_MAX_GAP
     min_unbroken_days: float = DEFAULT_MIN_UNBROKEN_DAYS
     drop_unqualified: bool = False
@@ -108,6 +131,8 @@ class SiteResult:
     site_no: str
     station_nm: str
     n_obs: int
+    n_raw: int
+    n_dropped_unapproved: int
     median_dt_min: float
     span_days: float
     completeness_pct: float
@@ -148,6 +173,29 @@ def select_turbidity_column(df: pd.DataFrame, param_cd: str = TURBIDITY_PARAM) -
         if str(c) == param_cd:
             return c
     return value_cols[0]
+
+
+def filter_approved(
+    df: pd.DataFrame, *, qualifier_col: str = "qualifier"
+) -> pd.DataFrame:
+    """Keep only USGS-approved rows (qualifier starting ``A``); drop the rest.
+
+    Approved records have been through USGS record processing — fouling and
+    calibration-drift corrections applied and prorated between field visits
+    (TM 1-D3) — so an approved series is clean apart from gaps, which is why we
+    inject synthetic anomalies straight into it (CLAUDE.md §9). Provisional
+    (``P``), blank, and NaN qualifiers are dropped; downstream re-gridding turns
+    the removed rows into missing rows (gaps), which is the honest label for
+    them. Codes like ``A e`` (approved estimated) and ``A, >`` (approved,
+    over-range) start with ``A`` and are kept — USGS approved them.
+
+    If the frame has no qualifier column it is returned unchanged.
+    """
+    if qualifier_col not in df.columns:
+        return df
+    q = df[qualifier_col].astype("string")
+    keep = q.str.startswith(APPROVED_PREFIX).fillna(False)
+    return df.loc[keep.to_numpy()].reset_index(drop=True)
 
 
 def summarise_series(
@@ -271,6 +319,17 @@ def pull_site(site: str, cfg: PullConfig, write: bool = True) -> SiteResult:
         raise RuntimeError(f"No turbidity data returned for {site} in {cfg.start}..{cfg.end}")
 
     tidy = tidy_frame(raw, cfg.param_cd)
+    n_raw = len(tidy)
+    if cfg.approved_only:
+        tidy = filter_approved(tidy)
+    n_dropped = n_raw - len(tidy)
+    if tidy.empty:
+        raise RuntimeError(
+            f"No approved turbidity rows for {site} in {cfg.start}..{cfg.end} "
+            f"(dropped all {n_raw} rows as non-approved). Try an earlier window "
+            f"or pass --keep-unapproved."
+        )
+
     idx = pd.DatetimeIndex(tidy["datetime"])
     median_dt, span_days, completeness, nan_pct, longest_gap = summarise_series(
         idx, tidy["value"]
@@ -291,6 +350,8 @@ def pull_site(site: str, cfg: PullConfig, write: bool = True) -> SiteResult:
         site_no=site,
         station_nm=_station_name(site),
         n_obs=len(tidy),
+        n_raw=n_raw,
+        n_dropped_unapproved=n_dropped,
         median_dt_min=median_dt,
         span_days=span_days,
         completeness_pct=completeness,
@@ -317,6 +378,12 @@ def pull_all(cfg: PullConfig, write: bool = True) -> list[SiteResult]:
             f"{res.completeness_pct:.1f}% complete | "
             f"range {res.value_min:.1f}-{res.value_max:.1f} FNU"
         )
+        if cfg.approved_only:
+            approved_pct = 100.0 * res.n_obs / res.n_raw if res.n_raw else float("nan")
+            print(
+                f"  approved: kept {res.n_obs:,}/{res.n_raw:,} rows ({approved_pct:.1f}%), "
+                f"dropped {res.n_dropped_unapproved:,} non-approved (provisional/blank)"
+            )
         gate = "PASS" if res.meets_unbroken else "FAIL"
         if res.out_path is not None:
             loc = f" -> {res.out_path}"
@@ -379,6 +446,9 @@ def main(argv: list[str] | None = None) -> int:
                              f"(default: {DEFAULT_MIN_UNBROKEN_DAYS:.0f}).")
     parser.add_argument("--drop-unqualified", action="store_true",
                         help="Do not write CSVs for sites that fail the unbroken-stretch filter.")
+    parser.add_argument("--keep-unapproved", action="store_true",
+                        help="Keep provisional/blank-qualified rows (default: approved-only, "
+                             "qualifier starting 'A').")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print what would be pulled and exit without downloading.")
     args = parser.parse_args(argv)
@@ -386,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = PullConfig(
         sites=tuple(args.sites), start=args.start, end=args.end,
         param_cd=args.param, outdir=args.outdir,
+        approved_only=not args.keep_unapproved,
         max_gap=args.max_gap, min_unbroken_days=args.min_unbroken_days,
         drop_unqualified=args.drop_unqualified,
     )
@@ -396,8 +467,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  param : {cfg.param_cd} (turbidity, FNU)")
         print(f"  window: {cfg.start} -> {cfg.end}")
         print(f"  outdir: {cfg.outdir}")
-        print(f"  filter: longest unbroken >= {cfg.min_unbroken_days:.0f} d "
-              f"at gaps <= {cfg.max_gap}"
+        print(f"  approved-only: {cfg.approved_only} "
+              f"(keep qualifier starting '{APPROVED_PREFIX}')")
+        print(f"  report: longest unbroken stretch at gaps <= {cfg.max_gap} "
+              f"(>= {cfg.min_unbroken_days:.0f} d flagged PASS)"
               f"{' (drop unqualified)' if cfg.drop_unqualified else ''}")
         for s in cfg.sites:
             print(f"  site  : {s} -> {cfg.outdir / f'{s}_turbidity_{cfg.param_cd}.csv'}")

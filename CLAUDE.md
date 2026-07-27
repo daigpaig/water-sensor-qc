@@ -72,11 +72,11 @@ deployment, Docker, CI beyond a basic test run).
 ├── .gitignore            # must include .env, .venv/, data/raw/, logs/
 ├── .env.example          # ANTHROPIC_API_KEY=
 ├── data/
-│   ├── raw/              # downloaded USGS/ECCC (gitignored)
-│   ├── clean/            # inspected clean segments used for injection
-│   ├── injected/         # synthetic datasets + label files
+│   ├── raw/              # downloaded USGS APPROVED series = the clean bases (gitignored)
+│   ├── injected/         # synthetic datasets + label files (injected straight from raw)
 │   └── review/           # candidate proposals (gitignored) + reviewed labels (§9.1)
 ├── src/
+│   ├── pull_usgs.py      # pull approved-only turbidity from NWIS -> data/raw (§9)
 │   ├── inspect_data.py   # load + summarise a series
 │   ├── inject.py         # synthetic anomaly injection (5 types, 3 levels, seeded)
 │   ├── evaluate.py       # metrics, fixed-pipeline baseline, ablation
@@ -285,18 +285,43 @@ we run the tool → we return tool_result → loop).
 - **Real data:** USGS NWIS via the `dataretrieval` package (primary — cleanly scriptable);
   ECCC (secondary — may be a manual download). Target ~2 years, 15-min/hourly, 2–3 gauges
   per variable. Start with **one variable** (turbidity or specific conductance).
-- **Clean segments:** visually inspect before use — real data may already contain anomalies.
-  Audit them with the candidate-proposal + review tool in §9.1 rather than trusting the eye.
-- **Synthetic injection:** inject all five types at recorded locations into clean segments;
-  save the labels (§5). Build **three contamination levels** with a **fixed random seed**
-  for reproducibility.
-- **What the level scales.** The `~3% / 7% / 12%` knob applies to the **point-like types
+- **Approved data is the base — but "approved" ≠ "no spikes".** Record processing (TM 1-D3,
+  §9.2) applies fouling and calibration-drift corrections and deletes *clearly erroneous*
+  data, but it **keeps real turbidity spikes** — a storm first-flush or resuspension event is
+  genuine signal, not an error. So a *flashy* river's approved record is still full of sharp
+  excursions, and those unlabelled base spikes would score as **false positives** against the
+  injected labels (§9.1). We therefore require the base to be **approved AND calm** — a
+  baseline with almost no real spikes — rather than assuming approval alone makes it clean.
+  `pull_usgs.py` keeps approved-only rows (drops `P`/blank, which become gaps) and writes to
+  `data/raw`; `inject.py` reads `data/raw` directly. There is no `data/clean/` folder and no
+  by-eye clean-segment selection. The §9.1 candidate/review tooling stays available for
+  auditing a spikier or provisional base if one is ever used, but the default calm bases don't
+  need it.
+- **The three default gauges** (all **100% approved, consistent 15-min, ≥95% complete, and
+  calm** — ≤0.04% real base spikes — over 2023-07→2025-07; regime spread moderate→high):
+  `03447687` French Broad R nr Fletcher, NC (S. Appalachia; moderate, median ~8 FNU; ~95%
+  complete; ~25 base spikes); `02198840` Savannah R at I-95 nr Port Wentworth, GA (tidal
+  river; moderate-high, ~13 FNU, ~9× range; ~99% complete; 0 base spikes); `08041770` LNVA
+  Canal at Beaumont, TX (managed canal; high, ~28 FNU, ~5× range; ~99% complete; ~1 base
+  spike). Replaced `02203603` (South R, Atlanta) and `02198955` (Middle R, tidal): 100%
+  approved and dense but too **flashy** — 120 (0.18%) and 637 (0.91%) real base spikes.
+  Earlier retired: `12340500` (Blackfoot, 35% missing), `06818000` (Missouri, 14% missing),
+  `11501000` (Sprague, mostly provisional). No clean *low/clear* base survived all filters —
+  clear rivers are spring/mountain-fed (winter gaps or provisional), so the spread is
+  moderate→high, not low→high.
+- **Synthetic injection:** inject all four types at recorded locations into the approved
+  bases; save the labels (§5). Build **three contamination levels** with a **fixed random
+  seed** for reproducibility.
+- **What the level scales.** The `~2% / 5% / 9%` knob applies to the **point-like types
   only** (spike, plateau, gap), where "percent of rows" is a natural unit. `level_shift` is
-  driven by episode count instead, and its row-share is a reported consequence rather than a
-  target — so a dataset's **total** anomalous share exceeds its headline level. Since drift
-  was removed (§9.2) the totals are far closer to the headline than they used to be: level 3
-  now lands at 15.2 / 27.1 / 17.3% on the three bases, against ~50% when drift was injected.
-  Read per-type counts from the manifest/labels; never infer them from the level number.
+  driven by episode count instead (1 / 2 / 3), and its row-share is a reported consequence
+  rather than a target — so a dataset's **total** anomalous share exceeds its headline level,
+  partly via *natural* gaps carried in from the base. Level 3 now lands at 14.2 / 11.0 / 10.5%
+  on 03447687 / 02198840 / 08041770 — close to the headline 9% now that the bases are ≥95%
+  complete (natural-gap share is only 0.6–4.6%, versus up to 35% with the old gappy
+  bases). (These per-type rates were toned down from an earlier `3 / 7 / 12` to look more
+  like real records.) Read per-type counts from the manifest/labels; never infer them from
+  the level number.
 - **Level shift is injected as a bounded window**, not a literal permanent step: a
   permanent step would either label every subsequent row anomalous (one mid-series shift
   ≈ 50% contamination) or leave post-step rows with `true_value != value` while marked
@@ -313,16 +338,24 @@ we run the tool → we return tool_result → loop).
   If a base genuinely cannot host its budget, injection reports `point_budget_met: false`
   and `types_missing` rather than silently under-filling.
 
-### 9.1 Auditing the "clean" bases (candidate proposal + human review)
+### 9.1 Auditing a base (candidate proposal + human review)
 
-The `data/clean/` segments were chosen **by eye**, so they may still hold real anomalies —
-which would silently become false positives when scoring detection against injected labels
-(§10), because the base is assumed anomaly-free everywhere the label file says nothing.
-`src/tools/candidates.py` + `src/tools/review.py` exist to check that assumption:
+**Not needed for the current approved bases.** Since we now inject into USGS *approved*
+series (§9), which are clean apart from gaps, there is no by-eye base to audit and this
+tooling is dormant. It is retained for one case: auditing a **provisional/unapproved** series
+pulled with `--keep-unapproved`, where the "assumed anomaly-free" premise below does not hold.
+The reviewed labels still in `data/review/` were made against the retired `data/clean/`
+segments and are kept only for provenance; they are not part of the approved-base pipeline.
+
+The original rationale (applies to any un-audited base): a base chosen **by eye** may still
+hold real anomalies — which would silently become false positives when scoring detection
+against injected labels (§10), because the base is assumed anomaly-free everywhere the label
+file says nothing. `src/tools/candidates.py` + `src/tools/review.py` exist to check that
+assumption:
 
 ```
-python -m src.tools.review detect data/clean/<gauge>.csv      # propose + open the page
-python -m src.tools.review merge  data/clean/<gauge>.csv <decisions.csv>
+python -m src.tools.review detect data/raw/<gauge>.csv        # propose + open the page
+python -m src.tools.review merge  data/raw/<gauge>.csv <decisions.csv>
 ```
 
 - **Proposal is tuned for recall, not precision.** Detectors run at deliberately sensitive
@@ -331,9 +364,56 @@ python -m src.tools.review merge  data/clean/<gauge>.csv <decisions.csv>
   defaults transfer across gauges spanning 0–40 and 0–1000 NTU. Defaults were picked in
   `scratchpad/tune_candidates.py` to land in the tens of segments per type, because a
   detector that proposes 800 segments cannot be reviewed by a human at all.
+- **Only spike, plateau and level_shift are reviewed — gaps are never queued.** Whether a
+  value is missing is not a judgement call, and §5 is explicit that *every* missing run is
+  `anomaly_type=gap`, so putting gaps in the queue only invites a reviewer to press "normal"
+  on one and produce labels that contradict the contract. `merge` labels them from the NaN
+  mask instead, with **no length threshold**. The first version filtered gaps to runs ≥ 1 h,
+  which looked reasonable and was badly wrong: it omitted 91% / 93% / 59% of the missing
+  rows on 03447687 / 06818000 / 11501000, because those series are dominated by sub-hour
+  dropouts. §9's "isolated dropouts are not gaps" governs where *injection* may place
+  anomalies — it does not govern *labelling*, and importing it here was the mistake.
+  (The one case where a NaN run is not a real gap: a series whose sampling rate changes
+  mid-record, where re-gridding to the modal step manufactures phantom NaN. None of the
+  three gauges does this. The guard for that is a periodicity check in `inspect_data`, not
+  a review queue.)
+- **level_shift is `flagJumps` + a sharpness filter — it was drowning in storms.**
+  `flagJumps` flags any change of `thresh` within its window, so on storm-driven turbidity
+  it fires on every rising and falling limb: gradual slopes that are normal water behaviour.
+  Neither `window` nor `thresh` nor a persistence test fixes this (a shorter window catches
+  more; storms recede over weeks; wet seasons shift the baseline for weeks). The lever that
+  works is **sharpness** — the largest single-sample move as a fraction of the net step. A
+  recalibration / sensor swap moves most of its magnitude in one sample; a storm spreads it
+  over hours. `shift_min_sharpness=0.5` cut candidates 85/23/5 → 8/1/0 on the three gauges.
+  **It does not, and cannot, reject a flash-flood onset** — sharp and sustained, identical
+  to a real step in one series. This is the level_shift analogue of the drift wall (§9.2):
+  across all 78 level_shift candidates reviewed before the filter, the human rejected every
+  one. Treat surviving candidates as "look here", not "this is an artifact".
+  (`scratchpad/tune_level_shift.py`.)
+- **Spikes are never bridged; segment types are.** `segment_bridge` (2h) stitches a
+  patchily-detected plateau or level_shift back into one event. Applying it to spikes was a
+  bug: §6 defines a spike as one/few values far from neighbours, so bridging glued distinct
+  spikes together across the normal rows between them — 12% / 19% / 27% of the rows inside
+  spike spans on the three gauges had never been flagged at all, and confirming such a
+  candidate would have labelled them spikes. One real case on 06818000: an 11-row "spike"
+  spanning 12:30–15:15 on 2024-07-16 was actually an isolated 66.7 NTU point at 12:30, a
+  NaN run, and a separate 52–55 bump at 14:30 — now three separate decisions.
+- **A decision may narrow a candidate, never extend it.** A detector marks a *window*;
+  often one sample in it is the anomaly. Clicking a point in the page narrows the label to
+  that sample, and the exported `start`/`end` (end **inclusive**) carry it through to
+  `merge_decisions`, which validates the span lies inside the original proposal. The CSV is
+  therefore hand-editable, and `start`/`end` are the source of truth for what was endorsed.
 - **The review page is a single self-contained HTML file** — plotly.js inlined, no server,
   no Streamlit, works offline. One candidate at a time, `A`/`N`/`U` to judge, auto-advance,
   `Z` to undo, progress mirrored to `localStorage` so closing the tab loses nothing.
+  That store is keyed on the dataset name **and candidate count**, so re-running `detect`
+  with different options orphans an in-progress review. Finish a pass before retuning.
+- **Two page traps, both verified in a browser, both silent failures.** Plotly renders a
+  `Date` object in the *viewer's* timezone, so an axis built from Dates printed hours away
+  from the timestamps in the side panel and the CSV; the series is timezone-naive, so x
+  values must be naive ISO **strings**. And `gd.on(...)` does not exist until Plotly has
+  plotted into that div — registering `plotly_click` at start-up throws and takes the rest
+  of the init down with it, keyboard handlers included. Wire it after the first draw.
 - **`merge` writes the §5 labels contract** with `source=natural` and an empty `true_value`:
   these anomalies were already in the record, so no uncontaminated value exists for them
   and they are scoreable for detection but not for imputation (§5, §10). It **refuses**
@@ -477,8 +557,9 @@ before continuing.
 - **Phase 0 — Scaffold.** Create the repo tree (§4), `requirements.txt`, `.gitignore` (with
   `.env`), `.env.example`, `README.md`. **Gate:** `pip install -r requirements.txt` succeeds;
   `pytest` runs (zero tests OK). Do not proceed until confirmed.
-- **Phase 1 — Data + injection.** `inspect_data.py`; pull USGS data via `dataretrieval`;
-  `inject.py` implementing all five anomaly types, labels, seed, and the three levels.
+- **Phase 1 — Data + injection.** `inspect_data.py`; pull approved USGS data via
+  `pull_usgs.py` (`dataretrieval`); `inject.py` implementing all four anomaly types, labels,
+  seed, and the three levels.
   **Gate:** three labelled datasets exist; a test confirms injected anomalies are recoverable
   from the label file.
 - **Phase 2 — Tools.** `schemas.py` (with parameter ranges) + `wrappers.py` for every tool,

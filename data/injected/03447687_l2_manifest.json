@@ -3,36 +3,36 @@
   "seed": 42,
   "level": 2,
   "level_name": "medium",
-  "n_rows": 49278,
-  "target_point_pct": 7.0,
-  "actual_point_pct": 6.948,
+  "n_rows": 70272,
+  "target_point_pct": 5.0,
+  "actual_point_pct": 4.981,
   "point_budget_met": true,
   "types_missing": [],
   "scoreable": true,
-  "total_anomalous_rows": 4783,
-  "total_anomalous_pct": 9.706,
-  "natural_gap_rows": 1223,
-  "natural_gap_pct": 2.482,
+  "total_anomalous_rows": 6879,
+  "total_anomalous_pct": 9.789,
+  "natural_gap_rows": 3245,
+  "natural_gap_pct": 4.618,
   "by_type": {
     "spike": {
-      "n_events": 365,
-      "n_rows": 690,
-      "pct_rows": 1.4
+      "n_events": 333,
+      "n_rows": 703,
+      "pct_rows": 1.0
     },
     "plateau": {
-      "n_events": 49,
-      "n_rows": 1354,
-      "pct_rows": 2.748
+      "n_events": 50,
+      "n_rows": 1391,
+      "pct_rows": 1.979
     },
     "level_shift": {
       "n_events": 2,
-      "n_rows": 136,
-      "pct_rows": 0.276
+      "n_rows": 134,
+      "pct_rows": 0.191
     },
     "gap": {
-      "n_events": 107,
-      "n_rows": 2603,
-      "pct_rows": 5.282
+      "n_events": 109,
+      "n_rows": 4651,
+      "pct_rows": 6.619
     }
   }
 }

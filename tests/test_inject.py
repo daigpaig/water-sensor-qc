@@ -460,16 +460,19 @@ def test_write_result_emits_the_full_triple(base: pd.DataFrame, tmp_path) -> Non
 def test_injected_files_recoverability() -> None:
     """Check that all generated files in data/injected/ are fully recoverable.
 
-    The contract demands that clean_series = injected_value where not is_anomaly
-    and true_value where is_anomaly.
+    The contract demands that base_series = injected_value where not is_anomaly
+    and true_value where is_anomaly. The base is the approved USGS series in
+    data/raw, re-gridded exactly as injection consumed it (via ``load_base``).
     """
     import glob
     from pathlib import Path
-    
+
+    from src.inject import load_base
+
     injected_dir = Path("data/injected")
-    clean_dir = Path("data/clean")
-    
-    if not injected_dir.exists() or not clean_dir.exists():
+    base_dir = Path("data/raw")
+
+    if not injected_dir.exists() or not base_dir.exists():
         pytest.skip("Data directories not found")
 
     injected_files = glob.glob(str(injected_dir / "*_l[1-3].csv"))
@@ -480,26 +483,27 @@ def test_injected_files_recoverability() -> None:
         inj_path = Path(inj_file)
         labels_path = inj_path.with_name(f"{inj_path.stem}_labels.csv")
         gauge_id = inj_path.stem.split("_")[0]
-        
-        # Find matching clean file
-        clean_files = glob.glob(str(clean_dir / f"{gauge_id}_clean_*.csv"))
-        assert len(clean_files) == 1, f"Missing or multiple clean files for {gauge_id}"
-        clean_path = Path(clean_files[0])
-        
+
+        # Find matching approved base file in data/raw.
+        base_files = glob.glob(str(base_dir / f"{gauge_id}_turbidity_*.csv"))
+        assert len(base_files) == 1, f"Missing or multiple base files for {gauge_id}"
+
+        # Re-grid the base the same way injection did, so indexes align exactly.
+        df_base = load_base(base_files[0]).set_index("datetime")
+
         df_inj = pd.read_csv(inj_path, parse_dates=["datetime"]).set_index("datetime")
         df_labels = pd.read_csv(labels_path, parse_dates=["datetime"]).set_index("datetime")
-        df_clean = pd.read_csv(clean_path, parse_dates=["datetime"]).set_index("datetime")
-        
+
         # Recover series
         recovered = df_inj["value"].copy()
         mask = df_labels["is_anomaly"]
         recovered[mask] = df_labels.loc[mask, "true_value"]
-        
+
         # Test equality
-        df_clean_aligned = df_clean["value"].reindex(recovered.index)
+        df_base_aligned = df_base["value"].reindex(recovered.index)
         pd.testing.assert_series_equal(
-            recovered, 
-            df_clean_aligned, 
+            recovered,
+            df_base_aligned,
             check_names=False,
             check_index_type=False,
             check_freq=False,

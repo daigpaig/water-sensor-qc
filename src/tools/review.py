@@ -10,9 +10,14 @@ Keys (also shown in the page's own help panel):
 
     A / 1   anomaly        N / 2   normal        U / 3   unsure
     ->      next           <-      previous      Z   undo last decision
-    F       cycle context width           E   export decisions CSV
+    F       cycle zoom     R       whole span    E   export decisions CSV
 
 Deciding auto-advances, so a straight run through is one keypress per candidate.
+
+A detector marks a *window*; sometimes only one sample in it is the anomaly.
+**Clicking a point narrows the label to that sample**, and the export carries the
+narrowed ``start``/``end`` so :func:`~src.tools.candidates.merge_decisions`
+labels only what was endorsed. A decision may narrow a proposal, never extend it.
 
 CLI
 ---
@@ -30,6 +35,10 @@ Artefacts land in ``data/review/`` (candidates and merged labels) and
 labels contract, with ``source=natural`` and an empty ``true_value`` (these
 anomalies were already in the record, so no clean value is known — see §5 on why
 that means they count for detection but not for imputation scoring).
+
+Only spike, plateau and level_shift are reviewed. **Gaps never appear in the
+queue**: whether a value is missing is not a judgement call, and ``merge`` labels
+every missing run from the data itself (§5). See ``src.tools.candidates``.
 """
 from __future__ import annotations
 
@@ -45,7 +54,8 @@ import pandas as pd
 from src.inspect_data import ContractError
 from src.tools.candidates import (
     TYPE_COLORS,
-    TYPE_ORDER,
+    LABEL_TYPES,
+    REVIEW_TYPES,
     CandidateSet,
     DetectConfig,
     find_candidates,
@@ -99,7 +109,7 @@ def build_payload(result: CandidateSet) -> dict:
         "n": len(series),
         "values": values,
         "candidates": candidates,
-        "type_order": list(TYPE_ORDER),
+        "type_order": list(REVIEW_TYPES),
         "type_colors": TYPE_COLORS,
         "level_scale": round(result.level_scale, 6),
         "step_scale": round(result.step_scale, 6),
@@ -251,6 +261,7 @@ _TEMPLATE = r"""<!doctype html>
   <button data-nav="-1">Prev<kbd>&larr;</kbd></button>
   <button data-nav="1">Next<kbd>&rarr;</kbd></button>
   <button id="undo">Undo<kbd>Z</kbd></button>
+  <button id="reset">Whole span<kbd>R</kbd></button>
   <span class="spacer"></span>
   <button id="context">Zoom: x2<kbd>F</kbd></button>
   <button id="export">Export CSV<kbd>E</kbd></button>
@@ -259,8 +270,11 @@ _TEMPLATE = r"""<!doctype html>
 <div class="card" style="margin: 0 20px 16px"><div id="overview-plot"></div></div>
 
 <p class="hint">
-  Decisions save to this browser automatically (<code>localStorage</code>) — you can close
-  the tab and come back. Press <code>E</code> to download the CSV, then run
+  <b>Click any point</b> to label just that sample instead of the whole highlighted span —
+  useful when a detector's window is wider than the actual anomaly. <code>R</code> restores
+  the full span. Decisions save to this browser automatically
+  (<code>localStorage</code>) — you can close the tab and come back. Press <code>E</code> to
+  download the CSV, then run
   <code>python -m src.tools.review merge &lt;series.csv&gt; &lt;decisions.csv&gt;</code>.
   <span id="warnings"></span>
 </p>
@@ -286,25 +300,40 @@ _TEMPLATE = r"""<!doctype html>
   const MIN_PAD_MS = 2 * 3600e3;
 
   // ---- state -------------------------------------------------------------
-  let decisions = {};
-  try { decisions = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { decisions = {}; }
+  let decisions = {};   // id -> "anomaly" | "normal" | "unsure"
+  let spans = {};       // id -> [i0, i1)  — only when narrowed from the proposal
+  try {
+    const raw = JSON.parse(localStorage.getItem(KEY)) || {};
+    decisions = raw.decisions || {};
+    spans = raw.spans || {};
+  } catch (e) { decisions = {}; spans = {}; }
   let idx = 0;
   let ctxI = 1;
   let filter = "";
   const history = [];
 
   const at = (i) => D.t0 + i * D.step_ms;
-  const save = () => { try { localStorage.setItem(KEY, JSON.stringify(decisions)); } catch (e) {} };
+  const save = () => {
+    try { localStorage.setItem(KEY, JSON.stringify({ decisions, spans })); } catch (e) {}
+  };
   const view = () => D.candidates.filter((c) => !filter || c.type === filter);
   const cur = () => view()[idx];
+  // What will actually be labelled: the proposal, unless narrowed by clicking.
+  const spanOf = (c) => spans[c.id] || [c.i0, c.i1];
+  // "YYYY-MM-DD HH:MM:SS" in the series' own (naive) clock, matching the CSV.
+  const fmt = (ms) => new Date(ms).toISOString().slice(0, 19).replace("T", " ");
 
   // ---- plots -------------------------------------------------------------
   // Slice on our side rather than handing Plotly the whole series each time:
   // a redraw happens on every keypress, and a 50k-point relayout is visibly slow.
+  // x values are naive ISO strings, never Date objects: Plotly renders a Date in
+  // the VIEWER's timezone, which would print an axis hours away from the
+  // timestamps in the side panel and the exported CSV. The series has no
+  // timezone, so it must be shown verbatim.
   function slice(a, b) {
     a = Math.max(0, a); b = Math.min(D.n, b);
     const x = new Array(b - a), y = new Array(b - a);
-    for (let i = a; i < b; i++) { x[i - a] = new Date(at(i)); y[i - a] = D.values[i]; }
+    for (let i = a; i < b; i++) { x[i - a] = fmt(at(i)); y[i - a] = D.values[i]; }
     return { x, y };
   }
 
@@ -328,37 +357,62 @@ _TEMPLATE = r"""<!doctype html>
     const a = mult === Infinity ? 0 : c.i0 - pad;
     const b = mult === Infinity ? D.n : c.i1 + pad;
 
+    const [s0, s1] = spanOf(c);
     const ctx = slice(a, b);
-    const seg = slice(c.i0, c.i1);
+    const prop = slice(c.i0, c.i1);
+    const sel = slice(s0, s1);
     const traces = [
-      { x: ctx.x, y: ctx.y, mode: "lines", type: "scattergl", name: "series",
-        line: { color: "#94a3b8", width: 1.4 }, connectgaps: false },
-      { x: seg.x, y: seg.y, mode: "lines+markers", type: "scattergl", name: c.type,
-        line: { color: color, width: 2.2 }, marker: { color: color, size: 5 },
+      // scatter (not scattergl) so plotly_click reports the point reliably
+      { x: ctx.x, y: ctx.y, mode: "lines+markers", type: "scatter", name: "series",
+        line: { color: "#94a3b8", width: 1.4 },
+        marker: { color: "#94a3b8", size: 4 }, connectgaps: false },
+      // the proposal, greyed where the reviewer has excluded it
+      { x: prop.x, y: prop.y, mode: "lines", type: "scatter", name: c.type,
+        line: { color: color, width: 1.6, dash: "dot" }, opacity: 0.55,
+        connectgaps: false, hoverinfo: "skip" },
+      { x: sel.x, y: sel.y, mode: "lines+markers", type: "scatter", name: "selected",
+        line: { color: color, width: 2.4 }, marker: { color: color, size: 7 },
         connectgaps: false },
     ];
-    // A gap candidate is all-NaN, so nothing above draws it: band the span instead.
+    // A gap-like all-NaN stretch draws nothing above, so band the span too.
     const layout = Object.assign({}, LAYOUT, {
       // i1 is exclusive, so band to at(i1): a one-row candidate then gets a
       // full sample-width band instead of a zero-width invisible rect.
       shapes: [{
         type: "rect", xref: "x", yref: "paper",
-        x0: new Date(at(c.i0)), x1: new Date(at(c.i1)),
+        x0: fmt(at(s0)), x1: fmt(at(s1)),
         y0: 0, y1: 1, fillcolor: color, opacity: 0.15, line: { width: 0 },
       }],
     });
     Plotly.react("main-plot", traces, layout, CONFIG);
+    wireClick();
+  }
+
+  // Plotly only adds `.on` to the div once it has plotted, so this cannot be
+  // registered with the other listeners at start-up — doing so throws and takes
+  // the whole init down with it.
+  let clickWired = false;
+  function wireClick() {
+    const gd = document.getElementById("main-plot");
+    if (clickWired || typeof gd.on !== "function") return;
+    clickWired = true;
+    // Click a sample to label only that point instead of the whole proposal.
+    gd.on("plotly_click", (ev) => {
+      const p = ev.points && ev.points[0];
+      if (!p) return;
+      narrowTo(Math.round((Date.parse(p.x + "Z") - D.t0) / D.step_ms));
+    });
   }
 
   function drawOverview() {
     // Stride-decimated: this strip is for orientation, not for reading values.
     const stride = Math.max(1, Math.ceil(D.n / 2500));
     const x = [], y = [];
-    for (let i = 0; i < D.n; i += stride) { x.push(new Date(at(i))); y.push(D.values[i]); }
+    for (let i = 0; i < D.n; i += stride) { x.push(fmt(at(i))); y.push(D.values[i]); }
 
     const marks = { anomaly: [], normal: [], unsure: [], pending: [] };
     for (const c of D.candidates) {
-      const mid = new Date(at(Math.floor((c.i0 + c.i1) / 2)));
+      const mid = fmt(at(Math.floor((c.i0 + c.i1) / 2)));
       (marks[decisions[c.id] || "pending"]).push(mid);
     }
     const tick = (times, color, name) => ({
@@ -383,7 +437,7 @@ _TEMPLATE = r"""<!doctype html>
       showlegend: false,
       shapes: c ? [{
         type: "line", xref: "x", yref: "paper",
-        x0: new Date(at(c.i0)), x1: new Date(at(c.i0)),
+        x0: fmt(at(c.i0)), x1: fmt(at(c.i0)),
         y0: 0, y1: 1, line: { color: "#0f172a", width: 1.5, dash: "dot" },
       }] : [],
     });
@@ -425,10 +479,13 @@ _TEMPLATE = r"""<!doctype html>
     const verdict = $("m-verdict");
     verdict.textContent = d === "pending" ? "— not yet judged" : d;
     verdict.className = "verdict " + d;
-    $("m-start").textContent = c.start;
-    $("m-end").textContent = c.end;
-    $("m-rows").textContent = c.n_rows;
-    $("m-hours").textContent = c.hours + " h";
+    const [s0, s1] = spanOf(c);
+    const narrowed = s0 !== c.i0 || s1 !== c.i1;
+    $("m-start").textContent = fmt(at(s0));
+    $("m-end").textContent = fmt(at(s1 - 1));
+    $("m-rows").textContent =
+      (s1 - s0) + (narrowed ? " of " + c.n_rows + " (narrowed — R resets)" : "");
+    $("m-hours").textContent = ((s1 - s0) * D.step_ms / 3600e3).toFixed(2) + " h";
     $("m-values").textContent =
       c.v_min === null ? "all missing" : c.v_min + " – " + c.v_max;
     // Severity is only comparable within a type, and its unit differs by type —
@@ -452,10 +509,32 @@ _TEMPLATE = r"""<!doctype html>
   function decide(verdict) {
     const c = cur();
     if (!c) return;
-    history.push({ id: c.id, prev: decisions[c.id], idx: idx });
+    history.push({ id: c.id, prev: decisions[c.id], prevSpan: spans[c.id], idx: idx });
     decisions[c.id] = verdict;
     save();
     if (idx < view().length - 1) idx++;
+    render();
+  }
+
+  // Narrow what gets labelled to a single sample. A detector marks a window;
+  // often only one point in it is the anomaly, and labelling the rest as one too
+  // would poison the ground truth. Can only narrow, never extend past the
+  // proposal — merge_decisions enforces the same rule on the Python side.
+  function narrowTo(i) {
+    const c = cur();
+    if (!c || i < c.i0 || i >= c.i1) return;
+    history.push({ id: c.id, prev: decisions[c.id], prevSpan: spans[c.id], idx: idx });
+    spans[c.id] = [i, i + 1];
+    save();
+    render();
+  }
+
+  function resetSpan() {
+    const c = cur();
+    if (!c || !spans[c.id]) return;
+    history.push({ id: c.id, prev: decisions[c.id], prevSpan: spans[c.id], idx: idx });
+    delete spans[c.id];
+    save();
     render();
   }
 
@@ -463,6 +542,7 @@ _TEMPLATE = r"""<!doctype html>
     const h = history.pop();
     if (!h) return;
     if (h.prev === undefined) delete decisions[h.id]; else decisions[h.id] = h.prev;
+    if (h.prevSpan === undefined) delete spans[h.id]; else spans[h.id] = h.prevSpan;
     idx = h.idx;
     save();
     render();
@@ -480,7 +560,11 @@ _TEMPLATE = r"""<!doctype html>
                   "duration_hours", "score", "detectors", "decision"];
     const rows = [head.join(",")];
     for (const c of D.candidates) {
-      rows.push([c.id, c.type, c.start, c.end, c.n_rows, c.hours, c.score,
+      // start/end are the span the reviewer actually endorsed (end inclusive),
+      // which merge_decisions labels — not necessarily the whole proposal.
+      const [s0, s1] = spanOf(c);
+      rows.push([c.id, c.type, fmt(at(s0)), fmt(at(s1 - 1)), s1 - s0,
+                 ((s1 - s0) * D.step_ms / 3600e3).toFixed(2), c.score,
                  '"' + c.detectors.join("|") + '"', decisions[c.id] || ""].join(","));
     }
     const blob = new Blob([rows.join("\n") + "\n"], { type: "text/csv" });
@@ -511,6 +595,7 @@ _TEMPLATE = r"""<!doctype html>
   $("undo").addEventListener("click", undo);
   $("export").addEventListener("click", exportCsv);
   $("context").addEventListener("click", cycleContext);
+  $("reset").addEventListener("click", resetSpan);
 
   function cycleContext() {
     ctxI = (ctxI + 1) % ZOOMS.length;
@@ -530,6 +615,7 @@ _TEMPLATE = r"""<!doctype html>
     else if (k === "z") { undo(); }
     else if (k === "e") { exportCsv(); }
     else if (k === "f") { cycleContext(); }
+    else if (k === "r") { resetSpan(); }
     else return;
     e.preventDefault();
   });
@@ -557,7 +643,6 @@ def _config_from_args(args: argparse.Namespace) -> DetectConfig:
         unilof_thresh=args.unilof_thresh,
         zscore_thresh=args.zscore_thresh,
         jumps_thresh_sigmas=args.jumps_sigmas,
-        min_gap=args.min_gap,
         max_per_type=args.max_per_type,
     )
 
@@ -612,9 +697,10 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     counts = labels.loc[labels["is_anomaly"], "anomaly_type"].value_counts().to_dict()
     print(f"wrote {out}")
     print(f"  {n:,} of {len(labels):,} rows marked anomalous ({100 * n / len(labels):.2f}%)")
-    for t in TYPE_ORDER:
+    for t in LABEL_TYPES:
         if t in counts:
-            print(f"    {t:<12} {counts[t]:>6} rows")
+            note = "  (auto-labelled, not reviewed)" if t == "gap" else ""
+            print(f"    {t:<12} {counts[t]:>6} rows{note}")
     return 0
 
 
@@ -633,8 +719,6 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--jumps-sigmas", type=float,
                        default=DetectConfig.jumps_thresh_sigmas,
                        help="flagJumps threshold, in robust step-sigmas of this series.")
-        p.add_argument("--min-gap", default=DetectConfig.min_gap,
-                       help="Shortest NaN run treated as a gap rather than a dropout.")
         p.add_argument("--max-per-type", type=int, default=DetectConfig.max_per_type,
                        help="Keep at most this many candidates per type.")
 

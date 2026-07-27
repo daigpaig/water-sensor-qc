@@ -14,7 +14,8 @@ import pandas as pd
 import pytest
 
 from src.tools.candidates import (
-    TYPE_ORDER,
+    LABEL_TYPES,
+    REVIEW_TYPES,
     Candidate,
     DetectConfig,
     _runs,
@@ -105,28 +106,85 @@ def test_finds_the_planted_plateau(result):
     assert _covering(result, "plateau", mid)
 
 
-def test_finds_the_planted_gap(result):
-    mid = (GAP_SLICE[0] + GAP_SLICE[1]) // 2
-    assert _covering(result, "gap", mid)
+def test_gaps_are_never_queued_for_review(result):
+    """Whether a value is missing is not a judgement call — §5 settles it."""
+    assert not any(c.anomaly_type == "gap" for c in result.candidates)
+    assert "gap" not in REVIEW_TYPES
+
+
+def test_gap_totals_count_every_missing_run(result):
+    n_runs, n_rows = result.gap_totals()
+    assert n_rows == int(result.series.isna().sum())
+    assert n_runs >= 1
 
 
 def test_finds_the_planted_level_shift(result):
-    """flagJumps marks the transition, so allow a window around the step."""
+    """An abrupt step survives the sharpness filter; flagJumps marks the edge."""
     assert any(
         c.anomaly_type == "level_shift" and abs(c.start_pos - SHIFT_POS) < 100
         for c in result.candidates
     )
 
 
-def test_short_dropouts_are_not_proposed_as_gaps(planted_csv: Path, tmp_path: Path):
-    """Isolated missing samples are dropouts, not gaps (CLAUDE.md §9)."""
+def test_gradual_slope_is_not_flagged_as_a_level_shift(tmp_path: Path):
+    """A ramp of the same total size as a step must be rejected (the user's bug).
+
+    flagJumps fires on a gradual rise the same as on an abrupt one; the sharpness
+    filter is what tells them apart. This is a storm limb, not a sensor step.
+    """
+    rng = np.random.default_rng(3)
+    n = 3000
+    idx = pd.date_range("2024-01-01", periods=n, freq="15min")
+    values = 20.0 + rng.normal(0, 0.4, n)
+    # +25 rise spread over 48 samples (~12h), then hold: steep enough for
+    # flagJumps to fire, but each step is ~0.5 — no single sharp edge.
+    ramp = np.linspace(0, 25, 48)
+    values[1000:1048] += ramp
+    values[1048:] += 25.0
+    path = tmp_path / "ramp.csv"
+    pd.DataFrame({"datetime": idx, "value": values}).to_csv(path, index=False)
+
+    res = find_candidates(path)
+    on_ramp = [
+        c for c in res.candidates
+        if c.anomaly_type == "level_shift" and c.start_pos < 1200 and c.end_pos > 1000
+    ]
+    assert not on_ramp, f"gradual slope wrongly flagged: {[c.candidate_id for c in on_ramp]}"
+
+
+def test_sharpness_filter_can_be_relaxed(tmp_path: Path):
+    """The filter is a knob, not a hard rule — 0.0 keeps flagJumps' raw output."""
+    rng = np.random.default_rng(4)
+    n = 3000
+    idx = pd.date_range("2024-01-01", periods=n, freq="15min")
+    values = 20.0 + rng.normal(0, 0.4, n)
+    values[1000:1048] += np.linspace(0, 25, 48)
+    values[1048:] += 25.0
+    path = tmp_path / "ramp2.csv"
+    pd.DataFrame({"datetime": idx, "value": values}).to_csv(path, index=False)
+
+    strict = find_candidates(path)
+    loose = find_candidates(path, config=DetectConfig(shift_min_sharpness=0.0))
+    n_strict = sum(c.anomaly_type == "level_shift" for c in strict.candidates)
+    n_loose = sum(c.anomaly_type == "level_shift" for c in loose.candidates)
+    assert n_loose > n_strict
+
+
+def test_even_a_single_missing_sample_is_labelled_a_gap(planted_csv: Path, tmp_path: Path):
+    """§5: *every* missing run is a gap. No length threshold — a 1-row hole counts.
+
+    The earlier design filtered gaps to runs >= 1h, which omitted 93% of the
+    missing rows on 06818000.
+    """
     df = pd.read_csv(planted_csv)
     df.loc[100, "value"] = np.nan  # a single missing sample
     path = tmp_path / "dropout.csv"
     df.to_csv(path, index=False)
 
     res = find_candidates(path)
-    assert not _covering(res, "gap", 100)
+    labels = merge_decisions(res, _decisions(res, {}))
+    assert labels.loc[100, "is_anomaly"]
+    assert labels.loc[100, "anomaly_type"] == "gap"
 
 
 def test_candidate_spans_are_the_detected_extent(result):
@@ -145,7 +203,7 @@ def test_candidate_ids_are_unique_and_typed(result):
 
 
 def test_candidates_are_ordered_by_time_within_type(result):
-    for atype in TYPE_ORDER:
+    for atype in REVIEW_TYPES:
         starts = [c.start_pos for c in result.candidates if c.anomaly_type == atype]
         assert starts == sorted(starts)
 
@@ -186,8 +244,29 @@ def test_frame_matches_the_candidate_list(result):
 
 def test_summary_mentions_every_type(result):
     text = result.summary()
-    for atype in TYPE_ORDER:
+    for atype in REVIEW_TYPES:
         assert atype in text
+
+
+def test_spike_candidates_contain_no_unflagged_filler(result):
+    """Spikes are never bridged: every row in the span was actually flagged.
+
+    Bridging at 2h glued distinct spikes together across the rows between them,
+    putting 12-27% never-flagged filler inside spike spans on the real gauges —
+    rows a confirmed candidate would then label as spikes.
+    """
+    for c in result.candidates:
+        if c.anomaly_type != "spike":
+            continue
+        body = result.series.iloc[c.start_pos : c.end_pos]
+        assert not body.isna().any(), f"{c.candidate_id} spans a missing row"
+
+
+def test_end_timestamp_is_the_last_included_row(result):
+    """`end` is inclusive so the exported span reads correctly and can be edited."""
+    for c in result.candidates:
+        assert c.end == result.series.index[c.end_pos - 1]
+        assert c.start <= c.end
 
 
 # --------------------------------------------------------------------------- merge
@@ -200,27 +279,65 @@ def _decisions(result, mapping: dict[str, str]) -> pd.DataFrame:
     )
 
 
+def _reviewed(labels: pd.DataFrame) -> pd.DataFrame:
+    """Rows labelled by a human decision — gaps are added unconditionally."""
+    return labels[labels["is_anomaly"] & (labels["anomaly_type"] != "gap")]
+
+
 def test_merge_labels_only_confirmed_candidates(result):
     spike = _covering(result, "spike", SPIKE_POS)[0]
     labels = merge_decisions(result, _decisions(result, {spike.candidate_id: "anomaly"}))
 
     assert labels.loc[spike.start_pos, "is_anomaly"]
     assert labels.loc[spike.start_pos, "anomaly_type"] == "spike"
-    assert int(labels["is_anomaly"].sum()) == spike.n_rows
+    assert len(_reviewed(labels)) == spike.n_rows
 
 
 def test_merge_ignores_rejected_and_undecided(result):
     labels = merge_decisions(
         result, _decisions(result, {c.candidate_id: "normal" for c in result.candidates})
     )
-    assert not labels["is_anomaly"].any()
+    assert _reviewed(labels).empty
 
 
 def test_merge_can_include_unsure(result):
     cid = result.candidates[0].candidate_id
     dec = _decisions(result, {cid: "unsure"})
-    assert not merge_decisions(result, dec)["is_anomaly"].any()
-    assert merge_decisions(result, dec, include_unsure=True)["is_anomaly"].any()
+    assert _reviewed(merge_decisions(result, dec)).empty
+    assert not _reviewed(merge_decisions(result, dec, include_unsure=True)).empty
+
+
+def test_merge_labels_every_missing_row_as_a_gap(result):
+    """§5, unconditionally — even with no decisions at all."""
+    labels = merge_decisions(result, _decisions(result, {}))
+    missing = result.series.isna().to_numpy()
+
+    assert (labels.loc[missing, "anomaly_type"] == "gap").all()
+    assert labels.loc[missing, "is_anomaly"].all()
+    assert int((labels["anomaly_type"] == "gap").sum()) == int(missing.sum())
+
+
+def test_gap_wins_over_an_overlapping_confirmed_candidate(result):
+    """A missing value is missing whatever else a detector thought was there."""
+    series = result.series
+    covering_gap = Candidate(
+        candidate_id="plateau_gapoverlap", anomaly_type="plateau", detectors=("x",),
+        start_pos=GAP_SLICE[0] - 5, end_pos=GAP_SLICE[1] + 5,
+        start=series.index[GAP_SLICE[0] - 5], end=series.index[GAP_SLICE[1] + 5],
+        n_rows=(GAP_SLICE[1] - GAP_SLICE[0]) + 10, duration_hours=1.0,
+        score=1.0, v_min=0.0, v_max=1.0,
+    )
+    result.candidates.append(covering_gap)
+    try:
+        labels = merge_decisions(
+            result, _decisions(result, {covering_gap.candidate_id: "anomaly"})
+        )
+        mid = (GAP_SLICE[0] + GAP_SLICE[1]) // 2
+        assert labels.loc[mid, "anomaly_type"] == "gap"
+        # the non-missing shoulders keep the reviewed label
+        assert labels.loc[GAP_SLICE[0] - 3, "anomaly_type"] == "plateau"
+    finally:
+        result.candidates.remove(covering_gap)
 
 
 def test_merge_output_satisfies_the_labels_contract(result, tmp_path: Path):
@@ -258,6 +375,51 @@ def test_merge_resolves_overlaps_by_type_priority(result):
         assert labels.loc[805, "anomaly_type"] == "level_shift"
     finally:
         result.candidates.remove(shift)
+
+
+def _decisions_with_span(result, cid: str, start, end) -> pd.DataFrame:
+    """Decisions frame carrying an explicit (possibly narrowed) span."""
+    rows = []
+    for c in result.candidates:
+        chosen = c.candidate_id == cid
+        rows.append({
+            "candidate_id": c.candidate_id,
+            "decision": "anomaly" if chosen else "",
+            "start": start if chosen else c.start,
+            "end": end if chosen else c.end,
+        })
+    return pd.DataFrame(rows)
+
+
+def test_merge_honours_a_narrowed_span(result):
+    """Only the endorsed sample is labelled, not the detector's whole window."""
+    wide = max(result.candidates, key=lambda c: c.n_rows)
+    assert wide.n_rows > 1, "need a multi-row candidate to narrow"
+    peak = result.series.index[wide.start_pos]
+
+    labels = merge_decisions(
+        result, _decisions_with_span(result, wide.candidate_id, peak, peak)
+    )
+    assert len(_reviewed(labels)) == 1
+    assert labels.loc[wide.start_pos, "anomaly_type"] == wide.anomaly_type
+    assert not labels.loc[wide.start_pos + 1, "is_anomaly"]
+
+
+def test_merge_rejects_a_span_outside_the_candidate(result):
+    """A decision may narrow a proposal, never extend it."""
+    c = result.candidates[0]
+    outside = result.series.index[c.end_pos + 50]
+    with pytest.raises(ValueError, match="outside the candidate"):
+        merge_decisions(
+            result, _decisions_with_span(result, c.candidate_id, c.start, outside)
+        )
+
+
+def test_merge_without_span_columns_uses_the_full_candidate(result):
+    """The narrowing columns are optional — a bare id/decision CSV still works."""
+    c = result.candidates[0]
+    labels = merge_decisions(result, _decisions(result, {c.candidate_id: "anomaly"}))
+    assert len(_reviewed(labels)) == c.n_rows
 
 
 def test_merge_rejects_a_frame_without_the_required_columns(result):
@@ -331,7 +493,9 @@ def test_merge_cli_round_trips_through_the_exported_csv(
     assert main(["merge", str(planted_csv), str(dec_path), "--out", str(out)]) == 0
 
     labels = pd.read_csv(out)
-    assert int(labels["is_anomaly"].sum()) == spike.n_rows
+    assert len(_reviewed(labels)) == spike.n_rows
+    # the planted NaN run is labelled too, without anyone reviewing it
+    assert int((labels["anomaly_type"] == "gap").sum()) == GAP_SLICE[1] - GAP_SLICE[0]
 
 
 def test_merge_cli_refuses_decisions_from_a_different_run(planted_csv: Path, tmp_path: Path):

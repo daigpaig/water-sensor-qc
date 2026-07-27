@@ -67,16 +67,19 @@ pip install pandas numpy dataretrieval pytest
 
 ## Pull raw USGS data
 
-No Anthropic API key needed. Downloads turbidity (`63680`) for the default 3 gauges into
-`data/raw/` (gitignored):
+No Anthropic API key needed. Downloads **approved-only** turbidity (`63680`) for the default
+3 gauges into `data/raw/` (gitignored). Approved USGS data has already had fouling/drift
+corrections applied (TM 1-D3), so it is clean apart from gaps and serves as the injection
+base directly (CLAUDE.md §9):
 
 ```bash
-python -m src.pull_usgs --dry-run    # show what would be downloaded
-python -m src.pull_usgs              # write CSVs under data/raw/
+python -m src.pull_usgs --dry-run       # show what would be downloaded
+python -m src.pull_usgs                 # write approved-only CSVs under data/raw/
+python -m src.pull_usgs --keep-unapproved  # also keep provisional/blank rows
 ```
 
-Each raw CSV has: `datetime`, `value` (turbidity, FNU), `qualifier` (e.g. `A` = approved;
-approved ≠ clean).
+Each raw CSV has: `datetime`, `value` (turbidity, FNU), `qualifier` (only approved codes —
+those starting `A` — are kept by default; `P`/blank rows are dropped and become gaps).
 
 ---
 
@@ -119,13 +122,12 @@ PYTHONPATH=. pytest tests/test_inspect_data.py -v
 ├── .gitignore
 ├── .env.example           # ANTHROPIC_API_KEY=
 ├── data/
-│   ├── raw/               # downloaded USGS/ECCC (gitignored)
-│   ├── clean/             # inspected clean segments used for injection
-│   └── injected/          # synthetic datasets + label files
+│   ├── raw/               # downloaded USGS APPROVED series = clean bases (gitignored)
+│   └── injected/          # synthetic datasets + label files (injected straight from raw)
 ├── src/
-│   ├── pull_usgs.py       # download continuous turbidity from USGS NWIS
+│   ├── pull_usgs.py       # download APPROVED continuous turbidity from USGS NWIS
 │   ├── inspect_data.py    # load, validate contracts, summarise a series
-│   ├── inject.py          # synthetic anomaly injection (5 types, 3 levels, seeded)
+│   ├── inject.py          # synthetic anomaly injection (4 types, 3 levels, seeded)
 │   ├── evaluate.py        # metrics, fixed-pipeline baseline, ablation
 │   ├── agent.py           # ReAct loop + API logger
 │   └── tools/

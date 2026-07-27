@@ -1,8 +1,14 @@
-"""Synthetic anomaly injection into clean segments.
+"""Synthetic anomaly injection into approved USGS base series.
 
 Injects the four failure types (spike, plateau, level_shift, gap) into a clean
 base series and records ground-truth labels. Everything is driven by a fixed
 seed, so a given (base, level, seed) always reproduces byte-identical output.
+
+The base series are the **approved** USGS turbidity files in ``data/raw`` (see
+``src.pull_usgs``): approved records have been through USGS record processing —
+fouling/calibration-drift corrections applied (TM 1-D3) — so they are clean apart
+from gaps (CLAUDE.md §9). There is no separate "clean-segment" carving or by-eye
+auditing step; we inject straight into the approved series.
 
 Drift is **not** injected: the drift track is shelved (CLAUDE.md §9.2). SaQC 2.8
 ships no univariate drift detector, so drift could only ever be handed in out of
@@ -30,9 +36,9 @@ shift = ~50% contamination) or leave post-step rows with ``true_value != value``
 while marked not-anomalous, which the §5 label contract cannot express. So the
 offset applies over a finite window and the series returns to its true level.
 
-**Natural gaps are labelled too.** The clean bases were selected for long
-unbroken stretches but still contain small natural gaps (the pull filter allows
-up to 3h). Every missing run is labelled ``is_anomaly=True, anomaly_type=gap``,
+**Natural gaps are labelled too.** The approved bases still contain natural gaps
+(dropped-out samples, and rows the pull removed as non-approved). Every missing
+run is labelled ``is_anomaly=True, anomaly_type=gap``,
 including pre-existing ones, so the ground truth is honest rather than
 pretending the base is pristine. The ``source`` column separates them: only
 ``injected`` gaps have a known ``true_value``, so imputation RMSE/MAE (§10) is
@@ -49,11 +55,11 @@ must delete a value we know, or its ``true_value`` would be unknown and its
 
 CLI
 ---
-    # Inject all three levels into every clean base (the default):
+    # Inject all three levels into every approved base in data/raw (the default):
     python -m src.inject
 
     # One base, one level, custom seed:
-    python -m src.inject --input data/clean/11501000_clean_20231226_20240803.csv \\
+    python -m src.inject --input data/raw/12340500_turbidity_63680.csv \\
         --levels 2 --seed 7
 
     # See what would be written, without writing it:
@@ -63,7 +69,7 @@ Usage from Python
 -----------------
     from src.inject import inject_series, load_base
 
-    base = load_base("data/clean/11501000_clean_20231226_20240803.csv")
+    base = load_base("data/raw/12340500_turbidity_63680.csv")
     result = inject_series(base, level=2, seed=42, name="11501000_l2")
     result.data      # datetime/value frame with anomalies
     result.labels    # datetime/is_anomaly/anomaly_type/true_value/source
@@ -92,7 +98,7 @@ from src.inspect_data import (
 # ---------------------------------------------------------------------------
 # Paths + contract vocabulary (CLAUDE.md §5)
 # ---------------------------------------------------------------------------
-DEFAULT_CLEAN_DIR = Path("data/clean")
+DEFAULT_BASE_DIR = Path("data/raw")  # approved USGS series are the clean bases
 DEFAULT_OUTDIR = Path("data/injected")
 DEFAULT_SEED = 42
 
@@ -186,9 +192,9 @@ class ContaminationLevel:
 
 
 LEVELS: dict[int, ContaminationLevel] = {
-    1: ContaminationLevel(1, "low", point_pct=3.0, n_level_shifts=1),
-    2: ContaminationLevel(2, "medium", point_pct=7.0, n_level_shifts=2),
-    3: ContaminationLevel(3, "high", point_pct=12.0, n_level_shifts=3),
+    1: ContaminationLevel(1, "low", point_pct=2.0, n_level_shifts=1),
+    2: ContaminationLevel(2, "medium", point_pct=5.0, n_level_shifts=2),
+    3: ContaminationLevel(3, "high", point_pct=9.0, n_level_shifts=3),
 }
 
 
@@ -791,7 +797,7 @@ def write_result(result: InjectionResult, outdir: Path) -> dict[str, Path]:
 
 
 def _base_name(path: Path, level: int) -> str:
-    """``03447687_clean_20230807_20250101.csv`` + level 2 -> ``03447687_l2``."""
+    """``03447687_turbidity_63680.csv`` + level 2 -> ``03447687_l2``."""
     stem = path.stem
     site = stem.split("_")[0]
     return f"{site}_l{level}"
@@ -841,7 +847,7 @@ def main(argv: list[str] | None = None) -> int:
         "--input",
         type=Path,
         nargs="*",
-        help="Clean base CSV(s). Default: every *.csv in data/clean.",
+        help="Approved base CSV(s). Default: every *.csv in data/raw.",
     )
     parser.add_argument(
         "--levels",
@@ -875,10 +881,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    inputs = list(args.input) if args.input else sorted(DEFAULT_CLEAN_DIR.glob("*.csv"))
+    inputs = list(args.input) if args.input else sorted(DEFAULT_BASE_DIR.glob("*.csv"))
     if not inputs:
         print(
-            f"ERROR: no base CSVs found (looked in {DEFAULT_CLEAN_DIR}). "
+            f"ERROR: no base CSVs found (looked in {DEFAULT_BASE_DIR}). "
             "Pass --input explicitly.",
             file=sys.stderr,
         )

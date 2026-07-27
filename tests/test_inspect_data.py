@@ -56,6 +56,7 @@ def labels_csv(tmp_path: Path) -> Path:
             "is_anomaly": [False, True, False, True],
             "anomaly_type": ["", "spike", "", "gap"],
             "true_value": [1.0, 2.0, 3.0, 4.0],
+            "source": ["", "injected", "", "natural"],
         }
     ).to_csv(path, index=False)
     return path
@@ -122,9 +123,25 @@ def test_validate_labels_rejects_bad_anomaly_type(tmp_path: Path) -> None:
             "is_anomaly": [True],
             "anomaly_type": ["weird"],
             "true_value": [1.0],
+            "source": ["injected"],
         }
     ).to_csv(path, index=False)
     with pytest.raises(ContractError, match="anomaly_type"):
+        validate_labels_csv(path)
+
+
+def test_validate_labels_rejects_bad_source(tmp_path: Path) -> None:
+    path = tmp_path / "bad_source_labels.csv"
+    pd.DataFrame(
+        {
+            "datetime": ["2024-01-01"],
+            "is_anomaly": [True],
+            "anomaly_type": ["gap"],
+            "true_value": [1.0],
+            "source": ["guessed"],
+        }
+    ).to_csv(path, index=False)
+    with pytest.raises(ContractError, match="source"):
         validate_labels_csv(path)
 
 
