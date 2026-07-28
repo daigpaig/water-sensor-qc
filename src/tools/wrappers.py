@@ -11,7 +11,6 @@ Implemented in Phase 2
 """
 
 import pandas as pd
-import numpy as np
 import saqc
 
 from src.inspect_data import summarise_series, DATETIME_COL
@@ -50,8 +49,8 @@ def _find_nan_runs(series: pd.Series) -> list[dict]:
 def _build_result(
     tool_name: str,
     params: dict,
-    qc_input,
-    qc_output,
+    qc_input: saqc.SaQC,
+    qc_output: saqc.SaQC,
     field: str,
     custom_msg: str = None
 ) -> dict:
@@ -90,7 +89,7 @@ def _build_result(
     }
 
 
-def inspect_dataset(qc, field: str = "value") -> dict:
+def inspect_dataset(qc: saqc.SaQC, field: str = "value") -> dict:
     """
     Summarizes the dataset. It looks at the data and counts the rows, missing values,
     and checks the start/end times.
@@ -109,7 +108,7 @@ def inspect_dataset(qc, field: str = "value") -> dict:
     }
 
 
-def get_flag_summary(qc, field: str = "value") -> dict:
+def get_flag_summary(qc: saqc.SaQC, field: str = "value") -> dict:
     """
     Looks at the history of the data and counts how many bad data points were found
     by each tool that the robot used so far.
@@ -130,7 +129,7 @@ def get_flag_summary(qc, field: str = "value") -> dict:
     }
 
 
-def export_clean_data(qc, field: str = "value") -> dict:
+def export_clean_data(qc: saqc.SaQC, field: str = "value") -> dict:
     """
     Takes the final, cleaned data and gives it back as a simple spreadsheet-like format,
     marking which points were flagged by the tools.
@@ -159,7 +158,7 @@ def export_clean_data(qc, field: str = "value") -> dict:
     }
 
 
-def flag_range(qc, field: str = "value", min=None, max=None) -> dict:
+def flag_range(qc: saqc.SaQC, field: str = "value", min=None, max=None) -> dict:
     """
     Flags any data points that are too high or too low based on a set minimum and maximum limit.
     """
@@ -168,7 +167,7 @@ def flag_range(qc, field: str = "value", min=None, max=None) -> dict:
     return _build_result("flag_range", params, qc, qc_out, field)
 
 
-def flag_constants(qc, field: str = "value", thresh=0.0, window=None, min_periods=2) -> dict:
+def flag_constants(qc: saqc.SaQC, field: str = "value", thresh=0.0, window=None, min_periods=2) -> dict:
     """
     Flags data points that get "stuck" (like a broken thermometer showing the exact same
     number for hours). It checks if values stay completely flat for a certain time window.
@@ -178,7 +177,7 @@ def flag_constants(qc, field: str = "value", thresh=0.0, window=None, min_period
     return _build_result("flag_constants", params, qc, qc_out, field)
 
 
-def flag_plateau(qc, field: str = "value", min_length=None, max_length=None, min_jump=None, granularity=None) -> dict:
+def flag_plateau(qc: saqc.SaQC, field: str = "value", min_length=None, max_length=None, min_jump=None, granularity=None) -> dict:
     """
     Flags a "plateau" - when the data suddenly jumps up, stays flat for a while, and then
     drops back down. This happens when debris gets stuck on the sensor temporarily.
@@ -197,7 +196,7 @@ def flag_plateau(qc, field: str = "value", min_length=None, max_length=None, min
     return _build_result("flag_plateau", params, qc, qc_out, field)
 
 
-def flag_spike_unilof(qc, field: str = "value", n=20, thresh=None, density='auto', slope_correct=True) -> dict:
+def flag_spike_unilof(qc: saqc.SaQC, field: str = "value", n=20, thresh=None, density='auto', slope_correct=True) -> dict:
     """
     Flags sudden, sharp "spikes" in the data (outliers) using a smart math trick called
     Local Outlier Factor. It looks for points that are very different from their neighbors.
@@ -207,7 +206,7 @@ def flag_spike_unilof(qc, field: str = "value", n=20, thresh=None, density='auto
     return _build_result("flag_spike_unilof", params, qc, qc_out, field)
 
 
-def flag_zscore(qc, field: str = "value", method='standard', window=None, thresh=3.0) -> dict:
+def flag_zscore(qc: saqc.SaQC, field: str = "value", method='standard', window=None, thresh=3.0) -> dict:
     """
     Another way to find spikes. It calculates an average over a rolling window of time,
     and flags any data points that stray too far away from that local average.
@@ -217,7 +216,7 @@ def flag_zscore(qc, field: str = "value", method='standard', window=None, thresh
     return _build_result("flag_zscore", params, qc, qc_out, field)
 
 
-def flag_jumps(qc, field: str = "value", thresh=0.0, window=None) -> dict:
+def flag_jumps(qc: saqc.SaQC, field: str = "value", thresh=0.0, window=None) -> dict:
     """
     Flags permanent jumps in the data. For example, if the sensor is bumped into a different
     position and the readings suddenly jump up and stay there forever.
@@ -227,7 +226,7 @@ def flag_jumps(qc, field: str = "value", thresh=0.0, window=None) -> dict:
     return _build_result("flag_jumps", params, qc, qc_out, field)
 
 
-def flag_nan(qc, field: str = "value") -> dict:
+def flag_nan(qc: saqc.SaQC, field: str = "value") -> dict:
     """
     Flags places where the data is completely missing (NaN - Not a Number).
     """
@@ -237,7 +236,7 @@ def flag_nan(qc, field: str = "value") -> dict:
 
 
 def impute_rolling(
-    qc,
+    qc: saqc.SaQC,
     field: str = "value",
     window=None,
     func: str = "median",
@@ -329,30 +328,3 @@ def impute_rolling(
     result["n_gaps_skipped_large"] = len(too_large_runs)
     result["gaps_summary"]         = gaps_summary
     return result
-
-
-def correct_drift(qc, maintenance_df, field: str = "value", model="linear", cal_range=5) -> dict:
-    """
-    An action tool! Over time, sensors get dirty and their readings "drift" away from reality.
-    This tool uses the exact times a human cleaned the sensor to bend the data back into place.
-    """
-    params = {"model": model, "cal_range": cal_range}
-
-    maint_ends = maintenance_df.iloc[:, 0]
-
-    data_dict = {
-        field: qc.data[field].copy(),
-        "maintenance": maintenance_df.iloc[:, 0].copy()
-    }
-    qc_drift = saqc.SaQC(data_dict)
-
-    qc_out = qc_drift.correctDrift(field, maintenance_field="maintenance", model=model, cal_range=cal_range)
-
-    # CLAUDE.md: correctDrift silently overwrites the final interval with NaN.
-    # We must restore the trailing span from the original data.
-    if len(maint_ends) > 0:
-        last_visit_end = maint_ends.max()
-        trailing_mask = qc_out.data[field].index >= last_visit_end
-        qc_out.data[field].loc[trailing_mask] = qc.data[field].loc[trailing_mask]
-
-    return _build_result("correct_drift", params, qc, qc_out, field)
