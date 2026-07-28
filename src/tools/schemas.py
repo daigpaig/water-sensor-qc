@@ -411,17 +411,19 @@ _FLAG_NAN = {
 _IMPUTE_ROLLING = {
     "name": "impute_rolling",
     "description": (
-        "Fills missing values using a rolling window median (or other aggregation). "
-        "Only use this on SHORT gaps — imputing long gaps degrades data quality more than "
-        "leaving them as NaN. Practical guidance: window must be larger than the gap to fill "
-        "(e.g. '12h' window to fill a 40-sample gap at 15-min frequency); a window narrower "
-        "than the gap will only partly fill it (§7.1). "
-        "Practical range for window: 1h–6h. Default 3h. "
-        "Increase window to cover longer gaps (↑ coverage but ↑ RMSE). "
-        "Decrease window for accuracy on very short gaps. "
+        "Fills NaN gaps using a rolling window median (or other aggregation). "
+        "Set max_gap to the longest gap you are willing to impute — any gap longer than "
+        "max_gap is left as NaN and reported in the result. "
+        "Do NOT impute long outages (hours to days); rolling median on a large gap produces "
+        "flat, unrealistic values that degrade data quality more than leaving them as NaN. "
+        "WORKFLOW: call inspect_dataset then flag_nan first to see gap sizes, then decide "
+        "an appropriate max_gap before calling this tool. "
+        "Practical range for window and max_gap: '1h'–'6h'. Default 3h. "
+        "window must be at least as large as max_gap so the roller has enough context "
+        "to bridge the gap (§7.1). "
         "func='median' is more robust than 'mean' near anomalous neighbours — keep it. "
-        "IMPORTANT — run flag_nan first so the agent knows how many and how long the gaps "
-        "are before deciding to impute."
+        "The result includes n_gaps_filled, n_gaps_skipped_large, and a gaps_summary list "
+        "so you can audit exactly what was and was not filled."
     ),
     "input_schema": {
         "type": "object",
@@ -435,8 +437,8 @@ _IMPUTE_ROLLING = {
                 "type": ["string", "null"],
                 "description": (
                     "Rolling window size as a pandas offset string, e.g. '3h', '6h'. "
-                    "Must exceed the longest gap you want to fill. "
-                    "Practical range: '1h'–'6h'. Default '3h'. Required — do not leave null."
+                    "Must be >= max_gap so the roller can bridge the full gap. "
+                    "Practical range: '1h'–'6h'. Required — do not leave null."
                 ),
                 "default": None,
             },
@@ -453,6 +455,16 @@ _IMPUTE_ROLLING = {
                     "imputed value. 0 means impute even when most of the window is NaN. Default 0."
                 ),
                 "default": 0,
+            },
+            "max_gap": {
+                "type": ["string", "null"],
+                "description": (
+                    "Maximum gap duration to impute, as a pandas offset string, e.g. '3h', '1h'. "
+                    "Gaps longer than this are skipped and left as NaN. "
+                    "Always set this — do not impute long maintenance outages or multi-hour dropouts. "
+                    "Practical range: '1h'–'6h'. If null, all gaps up to window size are filled."
+                ),
+                "default": None,
             },
         },
         "required": ["window"],

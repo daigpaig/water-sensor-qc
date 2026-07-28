@@ -2,7 +2,7 @@
 
 Each function wraps a SaQC 2.8 method and returns the tool-result dict defined in
 CLAUDE.md §5. Utility (inspect_dataset, get_flag_summary, export_clean_data),
-detection (flag_range, flag_constants, flag_spike_unilof, flag_zscore,
+detection (flag_range, flag_constants, flag_plateau, flag_spike_unilof, flag_zscore,
 flag_jumps, flag_nan), and action (impute_rolling) tools.
 
 NOTE: verify every SaQC method name/signature against the SaQC 2.8 API before use.
@@ -10,12 +10,41 @@ NOTE: verify every SaQC method name/signature against the SaQC 2.8 API before us
 Implemented in Phase 2
 """
 
-import inspect
 import pandas as pd
 import numpy as np
 import saqc
 
-from src.inspect_data import summarise_series, SeriesSummary, DATETIME_COL
+from src.inspect_data import summarise_series, DATETIME_COL
+
+
+def _find_nan_runs(series: pd.Series) -> list[dict]:
+    """Return one dict per contiguous NaN run in *series*.
+
+    Each dict contains:
+      start        -- first NaN timestamp
+      end          -- last NaN timestamp
+      duration_td  -- pd.Timedelta (end - start; zero for single-row gaps)
+      n_rows       -- number of NaN rows in the run
+    """
+    runs: list[dict] = []
+    if not series.isna().any():
+        return runs
+
+    is_nan = series.isna()
+    # Label each contiguous block of the same boolean
+    group_ids = (is_nan != is_nan.shift()).cumsum()
+    for _, grp in is_nan.groupby(group_ids):
+        if not grp.iloc[0]:          # skip non-NaN blocks
+            continue
+        start = grp.index[0]
+        end   = grp.index[-1]
+        runs.append({
+            "start":       start,
+            "end":         end,
+            "duration_td": end - start,
+            "n_rows":      len(grp),
+        })
+    return runs
 
 
 def _build_result(
@@ -207,25 +236,99 @@ def flag_nan(qc, field: str = "value") -> dict:
     return _build_result("flag_nan", params, qc, qc_out, field)
 
 
-def impute_rolling(qc, field: str = "value", window=None, func='median', min_periods=0) -> dict:
-    """
-    An action tool! It tries to "fill in" small gaps of missing data by looking at
-    the surrounding data and guessing the missing values (using an average/median).
-    """
-    params = {"window": window, "func": func, "min_periods": min_periods}
+def impute_rolling(
+    qc,
+    field: str = "value",
+    window=None,
+    func: str = "median",
+    min_periods: int = 0,
+    max_gap: str | None = None,
+) -> dict:
+    """Fill NaN gaps using a rolling window median (or other aggregation).
 
-    pre_nans = qc.data[field].isna().sum()
-    # explicitly pass flag=25 (DOUBTFUL) to track imputation in flags
-    qc_out = qc.interpolateByRolling(field, window=window, func=func, min_periods=min_periods, flag=25)
-    post_nans = qc_out.data[field].isna().sum()
+    Only fills gaps whose duration is <= max_gap. Longer gaps are left as NaN
+    and reported in the result so the agent knows they were skipped.
 
-    n_imputed = pre_nans - post_nans
-    n_total = len(qc.data[field])
+    max_gap: pandas offset string, e.g. '3h'. If None, all gaps are imputed
+    up to what the window can reach. Always set max_gap to the longest gap you
+    are willing to accept; do not impute multi-day outages.
+    """
+    params = {"window": window, "func": func, "min_periods": min_periods, "max_gap": max_gap}
+
+    # --- 1. Analyse gaps before touching the data ---
+    pre_series = qc.data.to_pandas()[field]
+    nan_runs   = _find_nan_runs(pre_series)
+
+    max_gap_td = pd.Timedelta(max_gap) if max_gap is not None else None
+
+    fillable_runs  = []
+    too_large_runs = []
+    for run in nan_runs:
+        if max_gap_td is not None and run["duration_td"] > max_gap_td:
+            too_large_runs.append(run)
+        else:
+            fillable_runs.append(run)
+
+    # --- 2. Call SaQC's interpolateByRolling ---
+    # flag=25 (DOUBTFUL) so imputed rows appear in the flag history (§7.1).
+    pre_nans = int(pre_series.isna().sum())
+    qc_out   = qc.interpolateByRolling(
+        field, window=window, func=func, min_periods=min_periods, flag=25
+    )
+    post_series = qc_out.data.to_pandas()[field]
+    post_nans   = int(post_series.isna().sum())
+    n_imputed   = pre_nans - post_nans
+    n_total     = len(pre_series)
+
+    # --- 3. Warn if any too-large gap was partially filled ---
+    # SaQC's rolling window naturally can't bridge a gap wider than `window`,
+    # but it will fill the edges.  Report every such case explicitly.
+    partial_fill_warnings: list[str] = []
+    for run in too_large_runs:
+        run_slice = post_series.loc[run["start"]:run["end"]]
+        n_partial  = int(run_slice.notna().sum())
+        if n_partial > 0:
+            partial_fill_warnings.append(
+                f"Gap {run['start'].isoformat()}–{run['end'].isoformat()} "
+                f"({run['duration_td']}) exceeds max_gap='{max_gap}': "
+                f"{n_partial} edge row(s) were partially filled."
+            )
+
+    # --- 4. Build gap summary (JSON-serialisable, for agent context) ---
+    gaps_summary = [
+        {
+            "start":           run["start"].isoformat(),
+            "end":             run["end"].isoformat(),
+            "duration":        str(run["duration_td"]),
+            "n_rows":          run["n_rows"],
+            "skipped_too_large": (max_gap_td is not None and run["duration_td"] > max_gap_td),
+        }
+        for run in nan_runs
+    ]
+
+    # --- 5. Compose message ---
     pct_imputed = round(n_imputed / n_total, 4) if n_total > 0 else 0.0
+    msg_parts   = [
+        f"Imputed {n_imputed} values ({pct_imputed * 100:.1f}%) across "
+        f"{len(fillable_runs)} of {len(nan_runs)} gap(s). "
+        f"{post_nans} NaN(s) remain."
+    ]
+    if too_large_runs:
+        msg_parts.append(
+            f"{len(too_large_runs)} gap(s) exceeded max_gap='{max_gap}' and were not imputed."
+        )
+    if partial_fill_warnings:
+        msg_parts.append("PARTIAL FILL WARNING: " + " | ".join(partial_fill_warnings))
 
-    msg = f"Imputed {n_imputed} values ({pct_imputed*100:.1f}%) using impute_rolling. Remaining NaNs: {post_nans}"
+    msg = " ".join(msg_parts)
 
-    return _build_result("impute_rolling", params, qc, qc_out, field, custom_msg=msg)
+    result = _build_result("impute_rolling", params, qc, qc_out, field, custom_msg=msg)
+    result["n_imputed"]            = n_imputed
+    result["n_gaps_total"]         = len(nan_runs)
+    result["n_gaps_filled"]        = len(fillable_runs)
+    result["n_gaps_skipped_large"] = len(too_large_runs)
+    result["gaps_summary"]         = gaps_summary
+    return result
 
 
 def correct_drift(qc, maintenance_df, field: str = "value", model="linear", cal_range=5) -> dict:
@@ -235,8 +338,6 @@ def correct_drift(qc, maintenance_df, field: str = "value", model="linear", cal_
     """
     params = {"model": model, "cal_range": cal_range}
 
-    # The maintenance variable is index=start, value=end
-    maint_starts = maintenance_df.index
     maint_ends = maintenance_df.iloc[:, 0]
 
     data_dict = {
@@ -245,7 +346,6 @@ def correct_drift(qc, maintenance_df, field: str = "value", model="linear", cal_
     }
     qc_drift = saqc.SaQC(data_dict)
 
-    pre_nans = qc_drift.data[field].isna().sum()
     qc_out = qc_drift.correctDrift(field, maintenance_field="maintenance", model=model, cal_range=cal_range)
 
     # CLAUDE.md: correctDrift silently overwrites the final interval with NaN.
@@ -253,14 +353,6 @@ def correct_drift(qc, maintenance_df, field: str = "value", model="linear", cal_
     if len(maint_ends) > 0:
         last_visit_end = maint_ends.max()
         trailing_mask = qc_out.data[field].index >= last_visit_end
-        # Restore the data
         qc_out.data[field].loc[trailing_mask] = qc.data[field].loc[trailing_mask]
 
-    post_nans = qc_out.data[field].isna().sum()
-
-    if post_nans > pre_nans:
-        # Just a safety check to warn if it did drop things
-        pass
-
-    # Build the result
     return _build_result("correct_drift", params, qc, qc_out, field)
