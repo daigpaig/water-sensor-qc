@@ -91,14 +91,14 @@ min/max/mean/std).
 
 ```bash
 # Check the series contract (datetime + value; extras like qualifier are kept)
-PYTHONPATH=. python -m src.inspect_data validate data/raw/02336000_turbidity_63680.csv
+PYTHONPATH=. python -m src.inspect_data validate data/raw/03447687_turbidity_63680.csv
 
 # Print a human-readable summary
-PYTHONPATH=. python -m src.inspect_data summarise data/raw/02336000_turbidity_63680.csv
+PYTHONPATH=. python -m src.inspect_data summarise data/raw/03447687_turbidity_63680.csv
 
 # Same summary as JSON; --reindex turns missing timestamps into NaN rows
-PYTHONPATH=. python -m src.inspect_data summarise data/raw/02336000_turbidity_63680.csv --json
-PYTHONPATH=. python -m src.inspect_data summarise data/raw/02336000_turbidity_63680.csv --reindex
+PYTHONPATH=. python -m src.inspect_data summarise data/raw/03447687_turbidity_63680.csv --json
+PYTHONPATH=. python -m src.inspect_data summarise data/raw/03447687_turbidity_63680.csv --reindex
 
 # Validate an injected labels file (when those exist)
 PYTHONPATH=. python -m src.inspect_data validate-labels data/injected/<name>_labels.csv
@@ -114,10 +114,22 @@ PYTHONPATH=. pytest tests/test_inspect_data.py -v
 
 ## Phase 2: Tools
 
-In Phase 2, we build the "toolkit" for our smart robot (the LLM) using the SaQC library.
+In Phase 2, we build the toolkit the LLM agent calls at runtime.
 
--  Testing the tools: We wrote automated tests (in `tests/test_tools.py`) to double-check that the SaQC tools work on our data without crashing.
-- Translators ("Wrappers"): Our robot cannot use the SaQC tools directly, so we built "wrappers" around them (in `src/tools/wrappers.py`). A wrapper is like a translator: the robot says "find a spike", the wrapper tells SaQC to do the math, and then the wrapper hands the robot back a simple report card (a JSON dictionary) of what happened.
+- **Wrappers** (`src/tools/wrappers.py`): each of the 11 QC functions wraps a SaQC 2.8
+  method and returns a JSON-serialisable result dict (CLAUDE.md §5).
+- **Schemas** (`src/tools/schemas.py`): Anthropic Messages API tool-use schemas for every
+  wrapper — name, description, parameter types, and valid ranges sourced from the
+  param-sweep results (CLAUDE.md §7.2). Pass `TOOL_SCHEMAS` directly to the API `tools=`
+  argument.
+- **Tests** (`tests/test_tools.py`, `tests/test_schemas.py`): `test_tools.py` requires SaQC
+  (Python 3.11/3.12 venv); `test_schemas.py` has no external dependencies and runs in any
+  environment:
+
+```bash
+PYTHONPATH=. pytest tests/test_schemas.py -v   # no SaQC needed
+PYTHONPATH=. pytest tests/test_tools.py -v     # requires saqc==2.8 installed
+```
 
 ---
 
@@ -125,35 +137,47 @@ In Phase 2, we build the "toolkit" for our smart robot (the LLM) using the SaQC 
 
 ```
 .
-├── CLAUDE.md              # durable project brief (read this first)
+├── CLAUDE.md                   # durable project brief (read this first)
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
-├── .env.example           # ANTHROPIC_API_KEY=
+├── .env.example                # ANTHROPIC_API_KEY=
 ├── data/
-│   ├── raw/               # downloaded USGS APPROVED series = clean bases (gitignored)
-│   └── injected/          # synthetic datasets + label files (injected straight from raw)
+│   ├── raw/                    # downloaded USGS APPROVED series (gitignored)
+│   └── injected/               # synthetic datasets + label files + manifests
 ├── src/
-│   ├── pull_usgs.py       # download APPROVED continuous turbidity from USGS NWIS
-│   ├── inspect_data.py    # load, validate contracts, summarise a series
-│   ├── inject.py          # synthetic anomaly injection (4 types, 3 levels, seeded)
-│   ├── evaluate.py        # metrics, fixed-pipeline baseline, ablation
-│   ├── agent.py           # ReAct loop + API logger
+│   ├── pull_usgs.py            # download APPROVED turbidity from USGS NWIS
+│   ├── inspect_data.py         # load, validate contracts, summarise a series
+│   ├── inject.py               # synthetic anomaly injection (4 types, 3 levels, seeded)
+│   ├── evaluate.py             # metrics, fixed-pipeline baseline, ablation  [stub]
+│   ├── agent.py                # ReAct loop + API logger                      [stub]
 │   └── tools/
-│       └── wrappers.py    # SaQC-wrapping tool functions
+│       ├── wrappers.py         # SaQC-wrapping tool functions (§5 result dict)
+│       ├── schemas.py          # Anthropic Messages API tool schemas (§7 + §7.2)
+│       ├── visualize.py        # interactive raw-series explorer
+│       ├── visualize_injected.py  # plot injected datasets with anomaly labels
+│       ├── param_sweep.py      # sweep one param, score vs labels (§7.2)
+│       ├── candidates.py       # propose candidate anomalies for human review
+│       └── review.py           # keyboard-driven HTML review + label merge
 ├── app/
-│   └── streamlit_app.py   # Streamlit UI
+│   └── streamlit_app.py        # Streamlit UI                                 [stub]
+├── scratchpad/                 # one-off probe/tune scripts (not imported)
 ├── tests/
 │   ├── test_inspect_data.py
-│   └── test_tools.py
-└── logs/                  # JSONL API logs (gitignored)
+│   ├── test_tools.py           # requires saqc==2.8
+│   ├── test_schemas.py         # no external deps — runs in any Python
+│   ├── test_inject.py
+│   ├── test_pull_usgs.py
+│   ├── test_candidates.py
+│   └── test_visualize_injected.py
+└── logs/                       # JSONL API logs (gitignored)
 ```
 
 ## Build status
 
-The project is built phase by phase (see §12 of `CLAUDE.md`).
+The project is built phase by phase:
 
-- [x] **Phase 0 — Scaffold**
+- [x] Phase 0 — Scaffold
 - [x] Phase 1 — Data + injection
 - [ ] Phase 2 — Tools
 - [ ] Phase 3 — Agent (CLI)
