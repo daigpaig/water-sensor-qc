@@ -1,7 +1,11 @@
 """Propose candidate anomalies in a "clean" series, for human review.
 
-The `data/clean/` segments were picked by eye, so they may still contain real
-anomalies. This module runs the §7 SaQC 2.8 detectors over such a series at
+A base that was *not* vetted by USGS record processing — a `data/raw/provisional/`
+series, or any segment picked by eye — may still contain real anomalies, which
+would score as false positives against the injected labels. This module is how
+that assumption gets checked; it is dormant for the default
+`data/raw/approved/` bases (CLAUDE.md §9.1). It runs the §7 SaQC 2.8 detectors
+over such a series at
 deliberately *sensitive* settings, groups the flagged rows into contiguous
 **segments**, and ranks them. Nothing here decides anything: every segment is a
 *candidate* that a human confirms or rejects in the review page built by
@@ -47,7 +51,7 @@ Usage
 -----
     from src.tools.candidates import find_candidates
 
-    result = find_candidates("data/clean/06818000_clean_20240515_20250123.csv")
+    result = find_candidates("data/raw/provisional/06818000_turbidity_63680_provisional.csv")
     print(result.summary())
 
 See ``src.tools.review`` for the CLI and the labelling page.

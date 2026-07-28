@@ -27,6 +27,7 @@ from src.inject import (
     inject_plateau,
     inject_series,
     inject_spike,
+    dataset_dir,
     write_result,
 )
 from src.inspect_data import DATETIME_COL, ContractError, validate_labels_frame
@@ -457,25 +458,48 @@ def test_write_result_emits_the_full_triple(base: pd.DataFrame, tmp_path) -> Non
     assert len(validate_labels_frame(reloaded)) == len(base)
 
 
+def test_write_result_files_by_gauge_then_level(base: pd.DataFrame, tmp_path) -> None:
+    """The §5 triple lands in <root>/<gauge>/l<level>/, all three together."""
+    result = inject_series(base, level=2, seed=1, name="03447687_l2")
+    paths = write_result(result, tmp_path)
+
+    dest = tmp_path / "03447687" / "l2"
+    assert {p.parent for p in paths.values()} == {dest}
+    assert sorted(p.name for p in dest.iterdir()) == [
+        "03447687_l2.csv",
+        "03447687_l2_labels.csv",
+        "03447687_l2_manifest.json",
+    ]
+
+
+def test_dataset_dir_rejects_an_unparseable_name(tmp_path) -> None:
+    """A name without a level would otherwise be filed somewhere unfindable."""
+    with pytest.raises(ValueError, match="<gauge>_l<level>"):
+        dataset_dir(tmp_path, "03447687")
+
+
 def test_injected_files_recoverability() -> None:
     """Check that all generated files in data/injected/ are fully recoverable.
 
     The contract demands that base_series = injected_value where not is_anomaly
     and true_value where is_anomaly. The base is the approved USGS series in
-    data/raw, re-gridded exactly as injection consumed it (via ``load_base``).
+    data/raw/approved, re-gridded exactly as injection consumed it (via
+    ``load_base``).
     """
     import glob
     from pathlib import Path
 
-    from src.inject import load_base
+    from src.inject import DEFAULT_BASE_DIR, DEFAULT_OUTDIR, load_base
 
-    injected_dir = Path("data/injected")
-    base_dir = Path("data/raw")
+    # Track the injector's own directories so a future move can't silently skip this.
+    injected_dir = DEFAULT_OUTDIR
+    base_dir = DEFAULT_BASE_DIR
 
     if not injected_dir.exists() or not base_dir.exists():
         pytest.skip("Data directories not found")
 
-    injected_files = glob.glob(str(injected_dir / "*_l[1-3].csv"))
+    # Datasets are filed <root>/<gauge>/l<level>/ (src.inject.dataset_dir).
+    injected_files = glob.glob(str(injected_dir / "*" / "l[1-3]" / "*_l[1-3].csv"))
     if not injected_files:
         pytest.skip("No injected files found to test")
 
@@ -484,7 +508,7 @@ def test_injected_files_recoverability() -> None:
         labels_path = inj_path.with_name(f"{inj_path.stem}_labels.csv")
         gauge_id = inj_path.stem.split("_")[0]
 
-        # Find matching approved base file in data/raw.
+        # Find matching approved base file in data/raw/approved.
         base_files = glob.glob(str(base_dir / f"{gauge_id}_turbidity_*.csv"))
         assert len(base_files) == 1, f"Missing or multiple base files for {gauge_id}"
 

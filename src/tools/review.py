@@ -22,7 +22,7 @@ labels only what was endorsed. A decision may narrow a proposal, never extend it
 CLI
 ---
     # propose candidates and open the review page
-    python -m src.tools.review detect data/clean/06818000_clean_20240515_20250123.csv
+    python -m src.tools.review detect data/raw/provisional/06818000_turbidity_63680_provisional.csv
 
     # be pickier / more paranoid
     python -m src.tools.review detect <csv> --jumps-sigmas 32 --max-per-type 25
@@ -63,9 +63,9 @@ from src.tools.candidates import (
 )
 
 DEFAULT_PAGE_DIR = Path("figures")
-#: Review artefacts live here, not beside the series: `data/clean/` is globbed
-#: by name elsewhere in the project, and a stray `*_candidates.csv` there breaks
-#: those lookups.
+#: Review artefacts live here, not beside the series: the raw subdirectories are
+#: globbed by name elsewhere in the project (`data/raw/approved/*.csv` feeds
+#: `src.inject`), and a stray `*_candidates.csv` there breaks those lookups.
 DEFAULT_DATA_DIR = Path("data/review")
 
 

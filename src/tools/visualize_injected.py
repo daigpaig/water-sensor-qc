@@ -1,7 +1,7 @@
 """Plot injected datasets with their ground-truth anomalies coloured by type.
 
 Companion to ``visualize.py`` (which reviews raw/approved series). For each
-injected dataset — ``data/injected/<gauge>_l<level>.csv`` plus its row-aligned
+injected dataset — ``data/injected/<gauge>/l<level>/<gauge>_l<level>.csv`` plus its row-aligned
 ``*_labels.csv`` (§5) — this stacks the uninjected base on top and one panel per
 level below it: the base panel shows the clean (uninjected) series, and each level
 panel shows that level's injected series with every labelled anomaly as a coloured
@@ -52,10 +52,19 @@ DEFAULT_OUTDIR = Path("figures")
 LEVELS: tuple[int, ...] = (1, 2, 3)
 
 
+def dataset_path(gauge: str, level: int, injected_dir: Path, suffix: str = ".csv") -> Path:
+    """Path to one artefact of the ``<gauge>_l<level>`` dataset.
+
+    Datasets are filed by gauge then level (``<root>/<gauge>/l<level>/``), so the
+    directory is derived rather than assumed flat — see ``src.inject.dataset_dir``.
+    """
+    return injected_dir / gauge / f"l{level}" / f"{gauge}_l{level}{suffix}"
+
+
 def find_gauges(injected_dir: Path = DEFAULT_INJECTED_DIR) -> list[str]:
     """Return the sorted gauge ids that have at least one ``<gauge>_l<level>.csv``."""
     gauges = set()
-    for p in injected_dir.glob("*_l[1-3].csv"):
+    for p in injected_dir.glob("*/l[1-3]/*_l[1-3].csv"):
         m = re.match(r"(.+)_l[1-3]$", p.stem)
         if m:
             gauges.add(m.group(1))
@@ -74,10 +83,10 @@ def load_injected(gauge: str, level: int, injected_dir: Path = DEFAULT_INJECTED_
       ``value``, or ``true_value`` where ``value`` is NaN, i.e. an injected gap).
     """
     data = pd.read_csv(
-        injected_dir / f"{gauge}_l{level}.csv", parse_dates=["datetime"]
+        dataset_path(gauge, level, injected_dir), parse_dates=["datetime"]
     ).set_index("datetime")
     labels = pd.read_csv(
-        injected_dir / f"{gauge}_l{level}_labels.csv", parse_dates=["datetime"]
+        dataset_path(gauge, level, injected_dir, "_labels.csv"), parse_dates=["datetime"]
     ).set_index("datetime")
     out = pd.DataFrame(index=data.index)
     out["value"] = data["value"]
@@ -192,7 +201,7 @@ def visualize_gauge(
     """Build and write ``figures/injected_<gauge>.html``; return its path."""
     levels = {}
     for level in LEVELS:
-        if (injected_dir / f"{gauge}_l{level}.csv").is_file():
+        if dataset_path(gauge, level, injected_dir).is_file():
             levels[level] = load_injected(gauge, level, injected_dir)
     if not levels:
         raise FileNotFoundError(f"No injected datasets found for gauge {gauge!r}.")

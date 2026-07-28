@@ -2,7 +2,13 @@
 
 Downloads instantaneous-value ("iv", sub-hourly / 15-min) turbidity for one or
 more stream gauges via the ``dataretrieval`` package and writes one tidy CSV per
-site to ``data/raw/`` (gitignored per CLAUDE.md §4).
+site to ``data/raw/approved/`` (gitignored per CLAUDE.md §4).
+
+``data/raw/`` is split by approval status, and the split is load-bearing:
+``data/raw/approved/`` holds the clean bases that ``src.inject`` globs, so a
+provisional pull must never land there. Passing ``--keep-unapproved`` therefore
+switches the default output directory to ``data/raw/provisional/``; an explicit
+``--outdir`` always wins.
 
 **Approved data is our clean base (CLAUDE.md §9).** By default we keep only rows
 whose USGS qualifier is *approved* (code starts with ``A``) and drop provisional
@@ -10,7 +16,7 @@ whose USGS qualifier is *approved* (code starts with ``A``) and drop provisional
 USGS record processing — fouling and calibration-drift corrections applied and
 prorated between field visits (TM 1-D3) — so an approved series is clean apart
 from gaps. That is what lets us inject synthetic anomalies straight into these
-files (``src.inject`` reads ``data/raw`` directly): there is no separate
+files (``src.inject`` reads ``data/raw/approved`` directly): there is no separate
 "clean-segment" carving or by-eye auditing step any more. Dropped rows simply
 become missing rows, i.e. gaps, once the series is re-gridded downstream.
 
@@ -21,7 +27,8 @@ Turbidity parameter code
 (FNU).* This is the standard **continuous optical-sensor** turbidity code. We
 deliberately avoid ``00076`` (NTU), which is more often discrete / lab data.
 
-Output CSV schema (one file per site, ``data/raw/<site>_turbidity_63680.csv``)
+Output CSV schema (one file per site,
+``data/raw/approved/<site>_turbidity_63680.csv``)
 ------------------------------------------------------------------------------
 - ``datetime``  : ISO-8601, **UTC, timezone-naive** (converted from the site's
   local reporting zone so multiple gauges share one clock).
@@ -90,7 +97,10 @@ TURBIDITY_PARAM = "63680"
 DEFAULT_SITES: tuple[str, ...] = ("03447687", "02198840", "08041770")
 DEFAULT_START = "2023-07-01"
 DEFAULT_END = "2025-07-01"
-DEFAULT_OUTDIR = Path("data/raw")
+# Approval status partitions data/raw: approved/ is what src.inject globs as its
+# clean bases, provisional/ is scratch for auditing (CLAUDE.md §9, §9.1).
+DEFAULT_OUTDIR = Path("data/raw/approved")
+DEFAULT_UNAPPROVED_OUTDIR = Path("data/raw/provisional")
 
 # USGS qualifier codes starting with this prefix are "approved" (e.g. ``A``,
 # ``A e``, ``A, >``); ``P`` (provisional), blank, and NaN are not. Approved rows
@@ -436,8 +446,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--start", default=DEFAULT_START, help="ISO start date.")
     parser.add_argument("--end", default=DEFAULT_END, help="ISO end date.")
     parser.add_argument("--param", default=TURBIDITY_PARAM, help="NWIS parameter code.")
-    parser.add_argument("--outdir", default=str(DEFAULT_OUTDIR), type=Path,
-                        help="Directory for output CSVs.")
+    parser.add_argument("--outdir", type=Path, default=None,
+                        help=f"Directory for output CSVs (default: {DEFAULT_OUTDIR}, or "
+                             f"{DEFAULT_UNAPPROVED_OUTDIR} with --keep-unapproved).")
     parser.add_argument("--max-gap", default=DEFAULT_MAX_GAP,
                         help=f"Largest gap that does NOT break an 'unbroken' stretch "
                              f"(pandas offset, e.g. '3h', '90min'; default: {DEFAULT_MAX_GAP}).")
@@ -448,14 +459,21 @@ def main(argv: list[str] | None = None) -> int:
                         help="Do not write CSVs for sites that fail the unbroken-stretch filter.")
     parser.add_argument("--keep-unapproved", action="store_true",
                         help="Keep provisional/blank-qualified rows (default: approved-only, "
-                             "qualifier starting 'A').")
+                             f"qualifier starting 'A'). Redirects the default outdir to "
+                             f"{DEFAULT_UNAPPROVED_OUTDIR} so unapproved data never lands "
+                             f"in {DEFAULT_OUTDIR}, which src.inject treats as clean bases.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print what would be pulled and exit without downloading.")
     args = parser.parse_args(argv)
 
+    # An explicit --outdir always wins; otherwise approval status picks the dir.
+    outdir = args.outdir
+    if outdir is None:
+        outdir = DEFAULT_UNAPPROVED_OUTDIR if args.keep_unapproved else DEFAULT_OUTDIR
+
     cfg = PullConfig(
         sites=tuple(args.sites), start=args.start, end=args.end,
-        param_cd=args.param, outdir=args.outdir,
+        param_cd=args.param, outdir=outdir,
         approved_only=not args.keep_unapproved,
         max_gap=args.max_gap, min_unbroken_days=args.min_unbroken_days,
         drop_unqualified=args.drop_unqualified,
@@ -468,7 +486,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  window: {cfg.start} -> {cfg.end}")
         print(f"  outdir: {cfg.outdir}")
         print(f"  approved-only: {cfg.approved_only} "
-              f"(keep qualifier starting '{APPROVED_PREFIX}')")
+              + (f"(keep only qualifiers starting '{APPROVED_PREFIX}')"
+                 if cfg.approved_only else "(keep provisional/blank rows too)"))
         print(f"  report: longest unbroken stretch at gaps <= {cfg.max_gap} "
               f"(>= {cfg.min_unbroken_days:.0f} d flagged PASS)"
               f"{' (drop unqualified)' if cfg.drop_unqualified else ''}")

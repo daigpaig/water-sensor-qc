@@ -68,15 +68,20 @@ pip install pandas numpy dataretrieval pytest
 ## Pull raw USGS data
 
 No Anthropic API key needed. Downloads **approved-only** turbidity (`63680`) for the default
-3 gauges into `data/raw/` (gitignored). Approved USGS data has already had fouling/drift
-corrections applied (TM 1-D3), so it is clean apart from gaps and serves as the injection
-base directly (CLAUDE.md §9):
+3 gauges into `data/raw/approved/` (gitignored). Approved USGS data has already had
+fouling/drift corrections applied (TM 1-D3), so it is clean apart from gaps and serves as
+the injection base directly (CLAUDE.md §9):
 
 ```bash
 python -m src.pull_usgs --dry-run       # show what would be downloaded
-python -m src.pull_usgs                 # write approved-only CSVs under data/raw/
-python -m src.pull_usgs --keep-unapproved  # also keep provisional/blank rows
+python -m src.pull_usgs                 # approved-only CSVs -> data/raw/approved/
+python -m src.pull_usgs --keep-unapproved  # provisional too -> data/raw/provisional/
 ```
+
+`data/raw/` is partitioned by approval status, and the split matters: **only
+`data/raw/approved/` is globbed as an injection base**, so a provisional pull can never be
+mistaken for a clean base. `--keep-unapproved` redirects the default output directory
+accordingly; an explicit `--outdir` always wins.
 
 Each raw CSV has: `datetime`, `value` (turbidity, FNU), `qualifier` (only approved codes —
 those starting `A` — are kept by default; `P`/blank rows are dropped and become gaps).
@@ -91,17 +96,17 @@ min/max/mean/std).
 
 ```bash
 # Check the series contract (datetime + value; extras like qualifier are kept)
-PYTHONPATH=. python -m src.inspect_data validate data/raw/03447687_turbidity_63680.csv
+PYTHONPATH=. python -m src.inspect_data validate data/raw/approved/03447687_turbidity_63680.csv
 
 # Print a human-readable summary
-PYTHONPATH=. python -m src.inspect_data summarise data/raw/03447687_turbidity_63680.csv
+PYTHONPATH=. python -m src.inspect_data summarise data/raw/approved/03447687_turbidity_63680.csv
 
 # Same summary as JSON; --reindex turns missing timestamps into NaN rows
-PYTHONPATH=. python -m src.inspect_data summarise data/raw/03447687_turbidity_63680.csv --json
-PYTHONPATH=. python -m src.inspect_data summarise data/raw/03447687_turbidity_63680.csv --reindex
+PYTHONPATH=. python -m src.inspect_data summarise data/raw/approved/03447687_turbidity_63680.csv --json
+PYTHONPATH=. python -m src.inspect_data summarise data/raw/approved/03447687_turbidity_63680.csv --reindex
 
 # Validate an injected labels file (when those exist)
-PYTHONPATH=. python -m src.inspect_data validate-labels data/injected/<name>_labels.csv
+PYTHONPATH=. python -m src.inspect_data validate-labels data/injected/<gauge>/l<level>/<name>_labels.csv
 ```
 
 Run the unit tests:
@@ -143,8 +148,11 @@ PYTHONPATH=. pytest tests/test_tools.py -v     # requires saqc==2.8 installed
 ├── .gitignore
 ├── .env.example                # ANTHROPIC_API_KEY=
 ├── data/
-│   ├── raw/                    # downloaded USGS APPROVED series (gitignored)
-│   └── injected/               # synthetic datasets + label files + manifests
+│   ├── raw/                    # downloaded USGS series (gitignored)
+│   │   ├── approved/           #   APPROVED series = the injection bases (§9)
+│   │   └── provisional/        #   unapproved pulls, for auditing only (§9.1)
+│   └── injected/               # synthetic datasets, filed by gauge then level
+│       └── <gauge>/l<level>/   #   <name>.csv + <name>_labels.csv + <name>_manifest.json
 ├── src/
 │   ├── pull_usgs.py            # download APPROVED turbidity from USGS NWIS
 │   ├── inspect_data.py         # load, validate contracts, summarise a series

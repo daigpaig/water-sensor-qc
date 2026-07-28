@@ -21,7 +21,7 @@ Usage from Python
 -----------------
     from src.inspect_data import load_series, summarise_series, validate_series_frame
 
-    df = load_series("data/raw/02336000_turbidity_63680.csv")
+    df = load_series("data/raw/approved/03447687_turbidity_63680.csv")
     summary = summarise_series(df)
 """
 from __future__ import annotations

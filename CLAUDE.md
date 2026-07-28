@@ -72,11 +72,14 @@ deployment, Docker, CI beyond a basic test run).
 ├── .gitignore            # must include .env, .venv/, data/raw/, logs/
 ├── .env.example          # ANTHROPIC_API_KEY=
 ├── data/
-│   ├── raw/              # downloaded USGS APPROVED series = the clean bases (gitignored)
+│   ├── raw/              # downloaded USGS series, split by approval (gitignored)
+│   │   ├── approved/     #   APPROVED = the clean bases; the ONLY dir inject globs (§9)
+│   │   └── provisional/  #   unapproved pulls; audit scratch only (§9.1)
 │   ├── injected/         # synthetic datasets + label files (injected straight from raw)
+│   │   └── <gauge>/l<level>/  # the §5 triple, filed by gauge then level
 │   └── review/           # candidate proposals (gitignored) + reviewed labels (§9.1)
 ├── src/
-│   ├── pull_usgs.py      # pull approved-only turbidity from NWIS -> data/raw (§9)
+│   ├── pull_usgs.py      # pull approved-only turbidity from NWIS -> data/raw/approved (§9)
 │   ├── inspect_data.py   # load + summarise a series
 │   ├── inject.py         # synthetic anomaly injection (5 types, 3 levels, seeded)
 │   ├── evaluate.py       # metrics, fixed-pipeline baseline, ablation
@@ -105,11 +108,18 @@ deployment, Docker, CI beyond a basic test run).
 
 ## 5. Data contracts (single source of truth — keep code consistent with this)
 
-**Injected dataset CSV** (`data/injected/<name>.csv`)
+**Where a dataset lives.** `<name>` is always `<gauge>_l<level>`, and the §5 triple below
+is filed together in `data/injected/<gauge>/l<level>/`. Keeping the three files in one
+directory is load-bearing: `param_sweep` and `visualize_injected` find the labels *beside*
+the series (`path.with_name(f"{stem}_labels.csv")`), so never split them across
+directories. `src.inject.dataset_dir(root, name)` is the single place that maps a name to
+its directory — derive paths from it rather than rebuilding the layout by hand.
+
+**Injected dataset CSV** (`data/injected/<gauge>/l<level>/<name>.csv`)
 
 - `datetime` (ISO 8601), `value` (float; may be NaN for gaps).
 
-**Ground-truth labels** (`data/injected/<name>_labels.csv`, row-aligned by `datetime`)
+**Ground-truth labels** (`<name>_labels.csv`, beside the series, row-aligned by `datetime`)
 
 - `datetime`, `is_anomaly` (bool), `anomaly_type` (one of: `spike`, `plateau`,
   `level_shift`, `gap`, or empty), `true_value` (the original clean value),
@@ -123,7 +133,7 @@ deployment, Docker, CI beyond a basic test run).
 **Maintenance schedule** — **removed.** `*_maintenance.csv` no longer exists and is no
 longer emitted; drift is removed and this file existed only to feed `correctDrift` (§9.2).
 
-**Injection manifest** (`data/injected/<name>_manifest.json`)
+**Injection manifest** (`<name>_manifest.json`, beside the series)
 
 - Per-type event/row counts, the seed, and target-vs-actual point contamination.
   `evaluate.py` must read per-type counts from here or from the labels — never infer them
@@ -318,7 +328,11 @@ we run the tool → we return tool_result → loop).
   injected labels (§9.1). We therefore require the base to be **approved AND calm** — a
   baseline with almost no real spikes — rather than assuming approval alone makes it clean.
   `pull_usgs.py` keeps approved-only rows (drops `P`/blank, which become gaps) and writes to
-  `data/raw`; `inject.py` reads `data/raw` directly. There is no `data/clean/` folder and no
+  **`data/raw/approved/`**; `inject.py` globs that directory and only that one. The split is
+  load-bearing, not cosmetic: `data/raw/provisional/` (and `expert_flagged/`) sit alongside it
+  holding *unvetted* series, and the non-recursive glob is what keeps them out of the
+  injection bases. `--keep-unapproved` therefore redirects `pull_usgs.py`'s default output to
+  `data/raw/provisional/`. There is no `data/clean/` folder and no
   by-eye clean-segment selection. The §9.1 candidate/review tooling stays available for
   auditing a spikier or provisional base if one is ever used, but the default calm bases don't
   need it.
@@ -378,8 +392,8 @@ file says nothing. `src/tools/candidates.py` + `src/tools/review.py` exist to ch
 assumption:
 
 ```
-python -m src.tools.review detect data/raw/<gauge>.csv        # propose + open the page
-python -m src.tools.review merge  data/raw/<gauge>.csv <decisions.csv>
+python -m src.tools.review detect data/raw/provisional/<gauge>.csv   # propose + open page
+python -m src.tools.review merge  data/raw/provisional/<gauge>.csv <decisions.csv>
 ```
 
 - **Proposal is tuned for recall, not precision.** Detectors run at deliberately sensitive

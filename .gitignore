@@ -6,13 +6,17 @@
 venv/
 env/
 
-# Raw downloaded data (USGS/ECCC) and API logs are gitignored
-# (ignore contents but allow the .gitkeep below to be re-included)
-data/raw/*
+# Raw downloaded data (USGS/ECCC) and API logs are gitignored.
+# data/raw/ is partitioned by approval status: approved/ holds the clean bases
+# src.inject globs, provisional/ and expert_flagged/ are audit scratch.
+# (ignore contents but allow the .gitkeep files below to be re-included)
+data/raw/**
 logs/*
 
 # Keep the gitignored directories in the tree
 !data/raw/.gitkeep
+!data/raw/approved/
+!data/raw/approved/.gitkeep
 !logs/.gitkeep
 
 # Generated review artifacts (regenerate via `python -m src.tools.visualize`)

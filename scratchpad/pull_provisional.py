@@ -6,8 +6,9 @@ Approved USGS data has already had fouling/calibration-drift corrections applied
 uncorrected anomalies — fouling spikes, drift, dropouts. This grabs a recent
 window (mostly provisional, since approval lags ~1 year) for a few varied gauges,
 keeps the non-approved rows, and writes them to ``data/raw/provisional/`` (which
-is gitignored via ``data/raw/*`` and, being a subdir, is not picked up by the
-injection pipeline's non-recursive ``data/raw/*.csv`` glob).
+is gitignored via ``data/raw/*`` and is a sibling of ``data/raw/approved/``, the
+only directory the injection pipeline globs — so provisional data can never be
+mistaken for a clean base).
 
     python scratchpad/pull_provisional.py
     python -m src.tools.visualize data/raw/provisional/*.csv \\

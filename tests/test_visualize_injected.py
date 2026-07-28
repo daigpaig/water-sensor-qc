@@ -16,7 +16,13 @@ from src.tools.visualize_injected import (
 
 
 def _write_dataset(d: Path, gauge: str, level: int) -> None:
-    """A tiny injected dataset + labels: one spike, one injected gap, rest clean."""
+    """A tiny injected dataset + labels: one spike, one injected gap, rest clean.
+
+    Written into the real ``<root>/<gauge>/l<level>/`` layout, so these tests fail
+    if the visualiser ever reverts to assuming a flat directory.
+    """
+    d = d / gauge / f"l{level}"
+    d.mkdir(parents=True, exist_ok=True)
     idx = pd.date_range("2024-01-01", periods=6, freq="15min")
     value = pd.Series([1.0, 2.0, 50.0, 4.0, np.nan, 6.0], index=idx)   # spike @2, gap @4
     is_anom = [False, False, True, False, True, False]
