@@ -77,9 +77,31 @@ def test_flag_nan_returns_json():
 
 def test_impute_rolling_returns_json():
     qc = _toy_qc()
-    result = wrappers.impute_rolling(qc, field="value", window="2h")
+    result = wrappers.impute_rolling(qc, field="value", window="2h", max_gap="1h")
 
     assert result["tool"] == "impute_rolling"
-    assert result["n_flagged"] > 0
+    assert "n_imputed" in result
+    assert "n_gaps_total" in result
+    assert "gaps_summary" in result
     assert result["message"]
+    # Check JSON serialisability
     json.dumps({k: v for k, v in result.items() if k not in ["qc", "df"]})
+
+
+def test_all_detection_tools_return_json():
+    qc = _toy_qc()
+    tools_to_test = [
+        (wrappers.flag_range, {"min": 0, "max": 100}),
+        (wrappers.flag_constants, {"thresh": 0.0, "window": "1h"}),
+        (wrappers.flag_plateau, {"max_length": "2h"}),
+        (wrappers.flag_spike_unilof, {"n": 20}),
+        (wrappers.flag_zscore, {"window": "2h"}),
+        (wrappers.flag_jumps, {"thresh": 1.0, "window": "1h"}),
+        (wrappers.flag_nan, {}),
+    ]
+    for func, kwargs in tools_to_test:
+        result = func(qc, field="value", **kwargs)
+        assert result["tool"] == func.__name__
+        assert "n_flagged" in result
+        # Check JSON serialisability
+        json.dumps({k: v for k, v in result.items() if k not in ["qc", "df"]})

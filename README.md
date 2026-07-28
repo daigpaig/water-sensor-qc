@@ -187,7 +187,7 @@ The project is built phase by phase:
 
 - [x] Phase 0 — Scaffold
 - [x] Phase 1 — Data + injection
-- [ ] Phase 2 — Tools
+- [x] Phase 2 — Tools
 - [ ] Phase 3 — Agent (CLI)
 - [ ] Phase 4 — Evaluation
 - [ ] Phase 5 — UI
