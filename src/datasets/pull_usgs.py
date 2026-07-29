@@ -5,7 +5,7 @@ more stream gauges via the ``dataretrieval`` package and writes one tidy CSV per
 site to ``data/raw/approved/`` (gitignored per CLAUDE.md §4).
 
 ``data/raw/`` is split by approval status, and the split is load-bearing:
-``data/raw/approved/`` holds the clean bases that ``src.inject`` globs, so a
+``data/raw/approved/`` holds the clean bases that ``src.datasets.inject`` globs, so a
 provisional pull must never land there. Passing ``--keep-unapproved`` therefore
 switches the default output directory to ``data/raw/provisional/``; an explicit
 ``--outdir`` always wins.
@@ -16,7 +16,7 @@ whose USGS qualifier is *approved* (code starts with ``A``) and drop provisional
 USGS record processing — fouling and calibration-drift corrections applied and
 prorated between field visits (TM 1-D3) — so an approved series is clean apart
 from gaps. That is what lets us inject synthetic anomalies straight into these
-files (``src.inject`` reads ``data/raw/approved`` directly): there is no separate
+files (``src.datasets.inject`` reads ``data/raw/approved`` directly): there is no separate
 "clean-segment" carving or by-eye auditing step any more. Dropped rows simply
 become missing rows, i.e. gaps, once the series is re-gridded downstream.
 
@@ -43,21 +43,21 @@ re-indexes onto a regular grid to expose those gaps.
 CLI
 ---
     # See what would be pulled, but download nothing:
-    python -m src.pull_usgs --dry-run
+    python -m src.datasets.pull_usgs --dry-run
 
     # Pull the default 3-gauge, 2-year set (each verified to hold a >=90-day
     # unbroken stretch at gaps <= 3h):
-    python -m src.pull_usgs
+    python -m src.datasets.pull_usgs
 
     # Custom sites / window:
-    python -m src.pull_usgs --sites 06818000 11501000 --start 2022-07-01 --end 2024-07-01
+    python -m src.datasets.pull_usgs --sites 06818000 11501000 --start 2022-07-01 --end 2024-07-01
 
     # Screen candidates and only keep gauges with a >=120-day unbroken stretch:
-    python -m src.pull_usgs --sites 06818000 11501000 --min-unbroken-days 120 --drop-unqualified
+    python -m src.datasets.pull_usgs --sites 06818000 11501000 --min-unbroken-days 120 --drop-unqualified
 
 Usage from Python
 -----------------
-    from src.pull_usgs import PullConfig, pull_all
+    from src.datasets.pull_usgs import PullConfig, pull_all
     results = pull_all(PullConfig())
 """
 from __future__ import annotations
@@ -97,7 +97,7 @@ TURBIDITY_PARAM = "63680"
 DEFAULT_SITES: tuple[str, ...] = ("03447687", "02198840", "08041770")
 DEFAULT_START = "2023-07-01"
 DEFAULT_END = "2025-07-01"
-# Approval status partitions data/raw: approved/ is what src.inject globs as its
+# Approval status partitions data/raw: approved/ is what src.datasets.inject globs as its
 # clean bases, provisional/ is scratch for auditing (CLAUDE.md §9, §9.1).
 DEFAULT_OUTDIR = Path("data/raw/approved")
 DEFAULT_UNAPPROVED_OUTDIR = Path("data/raw/provisional")
@@ -461,7 +461,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="Keep provisional/blank-qualified rows (default: approved-only, "
                              f"qualifier starting 'A'). Redirects the default outdir to "
                              f"{DEFAULT_UNAPPROVED_OUTDIR} so unapproved data never lands "
-                             f"in {DEFAULT_OUTDIR}, which src.inject treats as clean bases.")
+                             f"in {DEFAULT_OUTDIR}, which src.datasets.inject treats as clean bases.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print what would be pulled and exit without downloading.")
     args = parser.parse_args(argv)

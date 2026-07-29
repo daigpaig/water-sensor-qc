@@ -17,10 +17,10 @@ and simply render as breaks in the line (same gap-break logic as ``visualize``).
 CLI
 ---
     # Every gauge found in data/injected (default) -> figures/injected_<gauge>.html:
-    python -m src.tools.visualize_injected
+    python -m src.workbench.visualize_injected
 
     # One gauge, don't open a browser:
-    python -m src.tools.visualize_injected --gauge 12340500 --no-open
+    python -m src.workbench.visualize_injected --gauge 12340500 --no-open
 """
 from __future__ import annotations
 
@@ -34,8 +34,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from src.pull_usgs import DEFAULT_MAX_GAP
-from src.tools.visualize import _AUTOSCALE_Y_JS, insert_gap_breaks
+from src.datasets.pull_usgs import DEFAULT_MAX_GAP
+from src.workbench.visualize import _AUTOSCALE_Y_JS, insert_gap_breaks
 
 # One stable colour per anomaly type (spike/plateau/level_shift/gap), matching
 # the four failure types in CLAUDE.md §6.
@@ -56,7 +56,7 @@ def dataset_path(gauge: str, level: int, injected_dir: Path, suffix: str = ".csv
     """Path to one artefact of the ``<gauge>_l<level>`` dataset.
 
     Datasets are filed by gauge then level (``<root>/<gauge>/l<level>/``), so the
-    directory is derived rather than assumed flat — see ``src.inject.dataset_dir``.
+    directory is derived rather than assumed flat — see ``src.datasets.inject.dataset_dir``.
     """
     return injected_dir / gauge / f"l{level}" / f"{gauge}_l{level}{suffix}"
 

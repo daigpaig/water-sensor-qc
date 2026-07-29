@@ -26,7 +26,7 @@ from __future__ import annotations
 import pandas as pd
 
 from src.inspect_data import DATETIME_COL, load_series, reindex_to_grid
-from src.tools.candidates import DetectConfig, _run_saqc, _runs, _shift_metrics, robust_scales
+from src.workbench.candidates import DetectConfig, _run_saqc, _runs, _shift_metrics, robust_scales
 
 GAUGES = (
     "data/clean/03447687_clean_20230807_20250101.csv",

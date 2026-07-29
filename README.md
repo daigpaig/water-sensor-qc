@@ -73,9 +73,9 @@ fouling/drift corrections applied (TM 1-D3), so it is clean apart from gaps and 
 the injection base directly (CLAUDE.md §9):
 
 ```bash
-python -m src.pull_usgs --dry-run       # show what would be downloaded
-python -m src.pull_usgs                 # approved-only CSVs -> data/raw/approved/
-python -m src.pull_usgs --keep-unapproved  # provisional too -> data/raw/provisional/
+python -m src.datasets.pull_usgs --dry-run       # show what would be downloaded
+python -m src.datasets.pull_usgs                 # approved-only CSVs -> data/raw/approved/
+python -m src.datasets.pull_usgs --keep-unapproved  # provisional too -> data/raw/provisional/
 ```
 
 `data/raw/` is partitioned by approval status, and the split matters: **only
@@ -121,9 +121,9 @@ PYTHONPATH=. pytest tests/test_inspect_data.py -v
 
 In Phase 2, we build the toolkit the LLM agent calls at runtime.
 
-- **Wrappers** (`src/tools/wrappers.py`): each of the 11 QC functions wraps a SaQC 2.8
+- **Wrappers** (`src/agent_tools/wrappers.py`): each of the 11 QC functions wraps a SaQC 2.8
   method and returns a JSON-serialisable result dict (CLAUDE.md §5).
-- **Schemas** (`src/tools/schemas.py`): Anthropic Messages API tool-use schemas for every
+- **Schemas** (`src/agent_tools/schemas.py`): Anthropic Messages API tool-use schemas for every
   wrapper — name, description, parameter types, and valid ranges sourced from the
   param-sweep results (CLAUDE.md §7.2). Pass `TOOL_SCHEMAS` directly to the API `tools=`
   argument.
@@ -153,15 +153,18 @@ PYTHONPATH=. pytest tests/test_tools.py -v     # requires saqc==2.8 installed
 │   │   └── provisional/        #   unapproved pulls, for auditing only (§9.1)
 │   └── injected/               # synthetic datasets, filed by gauge then level
 │       └── <gauge>/l<level>/   #   <name>.csv + <name>_labels.csv + <name>_manifest.json
-├── src/
-│   ├── pull_usgs.py            # download APPROVED turbidity from USGS NWIS
-│   ├── inspect_data.py         # load, validate contracts, summarise a series
-│   ├── inject.py               # synthetic anomaly injection (4 types, 3 levels, seeded)
+├── src/                        # grouped by audience (CLAUDE.md §4)
+│   ├── inspect_data.py         # load, validate contracts, summarise — shared foundation
 │   ├── evaluate.py             # metrics, fixed-pipeline baseline, ablation  [stub]
 │   ├── agent.py                # ReAct loop + API logger                      [stub]
-│   └── tools/
-│       ├── wrappers.py         # SaQC-wrapping tool functions (§5 result dict)
-│       ├── schemas.py          # Anthropic Messages API tool schemas (§7 + §7.2)
+│   ├── datasets/               # writes everything under data/
+│   │   ├── pull_usgs.py        # download APPROVED turbidity from USGS NWIS
+│   │   ├── pull_comparison.py  # one series in BOTH approval states (§9.3)
+│   │   └── inject.py           # synthetic anomaly injection (4 types, 3 levels, seeded)
+│   ├── agent_tools/            # AGENT-facing: the §7 tool inventory
+│   │   ├── wrappers.py         # SaQC-wrapping tool functions (§5 result dict)
+│   │   └── schemas.py          # Anthropic Messages API tool schemas (§7 + §7.2)
+│   └── workbench/              # HUMAN-facing: CLIs, HTML pages, plots
 │       ├── visualize.py        # interactive raw-series explorer
 │       ├── visualize_injected.py  # plot injected datasets with anomaly labels
 │       ├── param_sweep.py      # sweep one param, score vs labels (§7.2)
@@ -176,6 +179,7 @@ PYTHONPATH=. pytest tests/test_tools.py -v     # requires saqc==2.8 installed
 │   ├── test_schemas.py         # no external deps — runs in any Python
 │   ├── test_inject.py
 │   ├── test_pull_usgs.py
+│   ├── test_pull_comparison.py
 │   ├── test_candidates.py
 │   └── test_visualize_injected.py
 └── logs/                       # JSONL API logs (gitignored)

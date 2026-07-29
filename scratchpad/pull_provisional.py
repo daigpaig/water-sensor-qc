@@ -11,7 +11,7 @@ only directory the injection pipeline globs — so provisional data can never be
 mistaken for a clean base).
 
     python scratchpad/pull_provisional.py
-    python -m src.tools.visualize data/raw/provisional/*.csv \\
+    python -m src.workbench.visualize data/raw/provisional/*.csv \\
         --out figures/provisional_overview.html --mark-spikes --no-open
 """
 from __future__ import annotations
@@ -25,8 +25,8 @@ import pandas as pd
 
 from dataretrieval import nwis
 
-from src.pull_usgs import TURBIDITY_PARAM, tidy_frame
-from src.tools.visualize import detect_spikes
+from src.datasets.pull_usgs import TURBIDITY_PARAM, tidy_frame
+from src.workbench.visualize import detect_spikes
 
 # Varied geography + turbidity regime, each with visible provisional anomalies.
 SITES: dict[str, str] = {

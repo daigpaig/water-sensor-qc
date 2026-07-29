@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.inject import (
+from src.datasets.inject import (
     GAP,
     LEVEL_SHIFT,
     LEVELS,
@@ -406,7 +406,7 @@ def test_magnitudes_stay_physical_on_a_flashy_storm_driven_series() -> None:
 
 
 def test_local_scale_is_bounded_by_the_global_scale() -> None:
-    from src.inject import (
+    from src.datasets.inject import (
         LOCAL_SCALE_CAP_K,
         LOCAL_SCALE_FLOOR_K,
         LOCAL_SCALE_WINDOW_ROWS,
@@ -425,7 +425,7 @@ def test_local_scale_is_bounded_by_the_global_scale() -> None:
 
 
 def test_robust_scale_survives_a_flat_series() -> None:
-    from src.inject import _robust_scale
+    from src.datasets.inject import _robust_scale
 
     # A flat base has no spread, but injection still needs a non-zero scale or
     # every magnitude would be zero and rejected by the injectors.
@@ -489,7 +489,7 @@ def test_injected_files_recoverability() -> None:
     import glob
     from pathlib import Path
 
-    from src.inject import DEFAULT_BASE_DIR, DEFAULT_OUTDIR, load_base
+    from src.datasets.inject import DEFAULT_BASE_DIR, DEFAULT_OUTDIR, load_base
 
     # Track the injector's own directories so a future move can't silently skip this.
     injected_dir = DEFAULT_OUTDIR
@@ -498,7 +498,7 @@ def test_injected_files_recoverability() -> None:
     if not injected_dir.exists() or not base_dir.exists():
         pytest.skip("Data directories not found")
 
-    # Datasets are filed <root>/<gauge>/l<level>/ (src.inject.dataset_dir).
+    # Datasets are filed <root>/<gauge>/l<level>/ (src.datasets.inject.dataset_dir).
     injected_files = glob.glob(str(injected_dir / "*" / "l[1-3]" / "*_l[1-3].csv"))
     if not injected_files:
         pytest.skip("No injected files found to test")

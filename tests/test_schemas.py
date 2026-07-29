@@ -1,4 +1,4 @@
-"""Tests for src/tools/schemas.py — Anthropic tool schema definitions.
+"""Tests for src/agent_tools/schemas.py — Anthropic tool schema definitions.
 
 These tests require only the stdlib + the schemas module itself (no saqc, no
 pandas), so they run in any Python environment including Python 3.13.
@@ -17,7 +17,7 @@ import json
 
 import pytest
 
-from src.tools.schemas import TOOL_SCHEMAS, TOOL_SCHEMA_BY_NAME
+from src.agent_tools.schemas import TOOL_SCHEMAS, TOOL_SCHEMA_BY_NAME
 
 
 # ---------------------------------------------------------------------------

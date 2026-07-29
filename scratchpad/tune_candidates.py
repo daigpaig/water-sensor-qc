@@ -1,4 +1,4 @@
-"""Pick review-friendly default thresholds for src/tools/candidates.py.
+"""Pick review-friendly default thresholds for src/workbench/candidates.py.
 
 The review page is only usable if each detector proposes tens of segments, not
 thousands. This prints, per clean gauge, how many flagged rows and how many
@@ -14,7 +14,7 @@ import pandas as pd
 import saqc
 
 from src.inspect_data import DATETIME_COL, load_series, reindex_to_grid
-from src.tools.candidates import _runs, robust_scales
+from src.workbench.candidates import _runs, robust_scales
 
 
 def flagged(s: pd.Series, func: str, **kw) -> np.ndarray:

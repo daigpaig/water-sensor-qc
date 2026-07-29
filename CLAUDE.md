@@ -77,17 +77,23 @@ deployment, Docker, CI beyond a basic test run).
 │   │   └── provisional/  #   unapproved pulls; audit scratch only (§9.1)
 │   ├── injected/         # synthetic datasets + label files (injected straight from raw)
 │   │   └── <gauge>/l<level>/  # the §5 triple, filed by gauge then level
+│   ├── comparison/       # same sensor either side of the approval boundary (§9.3)
+│   │   └── <gauge>/      #   *_approved.csv, *_provisional.csv, *_manifest.json
 │   └── review/           # candidate proposals (gitignored) + reviewed labels (§9.1)
-├── src/
-│   ├── pull_usgs.py      # pull approved-only turbidity from NWIS -> data/raw/approved (§9)
-│   ├── inspect_data.py   # load + summarise a series
-│   ├── inject.py         # synthetic anomaly injection (5 types, 3 levels, seeded)
+├── src/                  # grouped by AUDIENCE — see the note below the tree
+│   ├── inspect_data.py   # load + validate the §5 contracts + summarise (shared foundation)
 │   ├── evaluate.py       # metrics, fixed-pipeline baseline, ablation
 │   ├── agent.py          # ReAct loop + API logger
-│   └── tools/
-│       ├── schemas.py    # JSON tool schemas for the Messages API
-│       ├── wrappers.py   # SaQC-wrapping tool functions
+│   ├── datasets/         # writes everything under data/
+│   │   ├── pull_usgs.py  # pull approved-only turbidity from NWIS -> data/raw/approved (§9)
+│   │   ├── pull_comparison.py # pull one series in BOTH approval states -> data/comparison (§9.3)
+│   │   └── inject.py     # synthetic anomaly injection (4 types, 3 levels, seeded)
+│   ├── agent_tools/      # AGENT-facing: the §7 inventory, handed to the Messages API
+│   │   ├── schemas.py    # JSON tool schemas for the Messages API
+│   │   └── wrappers.py   # SaQC-wrapping tool functions (§5 result dict)
+│   └── workbench/        # HUMAN-facing: run by a person; CLI/HTML/plot output
 │       ├── visualize.py  # series/overview plots
+│       ├── visualize_injected.py # plot injected datasets with anomaly labels
 │       ├── param_sweep.py # sweep one param, score vs labels, plot (§7.2)
 │       ├── candidates.py # propose anomalies in a "clean" series for review (§9.1)
 │       └── review.py     # keyboard-driven labelling page + merge back to labels (§9.1)
@@ -99,10 +105,33 @@ deployment, Docker, CI beyond a basic test run).
 │   ├── probe_saqc.py          # signature + toy-call probe for every §7 method
 │   ├── probe_saqc_behavior.py # reproduces the §7.1 constraints
 │   ├── probe_plateau_cost.py  # flagPlateau's crash + multiprocessing trap (§7.1)
+│   ├── screen_prov_vs_approved.py # screens gauges for an approved+provisional split (§9.3)
 │   ├── tune_candidates.py     # picks the §9.1 proposal thresholds
+│   ├── tune_spike_recall.py   # sweeps the §9.1 spike params for >=95% recall
+│   ├── probe_candidate_recall.py # candidates.py recall vs the injected labels
 │   └── tune_zscore.py         # flagZScore min_residuals on quantised data (§7.1)
 └── logs/                 # JSONL API logs (gitignored)
 ```
+
+**`src/` is grouped by audience, because the three audiences impose different contracts**
+(reorganised 2026-07-29; there is no longer a `src/tools/`):
+
+- **`src/agent_tools/`** — what the agent calls. Every function here returns the §5
+  tool-result dict and is described by a schema in `schemas.py`. Adding a tool means
+  touching both files. Nothing here prints, plots, or writes to `data/`.
+- **`src/workbench/`** — what a *person* runs. Free to emit CLIs, HTML pages, and Plotly
+  figures; bound by no result-dict contract. These are how we tune and audit (§7.2, §9.1),
+  not part of an agent run.
+- **`src/datasets/`** — what produces `data/`. The §5 file layout is these modules'
+  output contract.
+- **Top level** — `inspect_data.py` is deliberately *not* in a subpackage: it owns the §5
+  column contracts and validators and is imported by all three groups (`wrappers.py` builds
+  the `inspect_dataset` tool on top of its `summarise_series`). `agent.py` and `evaluate.py`
+  are single-purpose entry points.
+
+Dependencies point one way — everything → `inspect_data`, `workbench` → `datasets` — and
+must stay acyclic. If you find yourself needing `agent_tools` → `workbench`, the shared
+piece belongs at the top level instead.
 
 ---
 
@@ -112,7 +141,7 @@ deployment, Docker, CI beyond a basic test run).
 is filed together in `data/injected/<gauge>/l<level>/`. Keeping the three files in one
 directory is load-bearing: `param_sweep` and `visualize_injected` find the labels *beside*
 the series (`path.with_name(f"{stem}_labels.csv")`), so never split them across
-directories. `src.inject.dataset_dir(root, name)` is the single place that maps a name to
+directories. `src.datasets.inject.dataset_dir(root, name)` is the single place that maps a name to
 its directory — derive paths from it rather than rebuilding the layout by hand.
 
 **Injected dataset CSV** (`data/injected/<gauge>/l<level>/<name>.csv`)
@@ -180,7 +209,7 @@ detected, not scored, and not in the label vocabulary. Do not add it back withou
 
 ## 7. QC tool inventory
 
-Each is a Python function in `src/tools/wrappers.py` wrapping a SaQC 2.8 method, returning
+Each is a Python function in `src/agent_tools/wrappers.py` wrapping a SaQC 2.8 method, returning
 the tool-result dict from §5. `inspect_dataset` must be callable first.
 
 **All method names below were probed against the installed 2.8.0 and are correct as
@@ -273,7 +302,7 @@ accepts two things we should reject ourselves in `inspect_dataset`: a non-dateti
 
 ### 7.2 Practical parameter ranges (measured via `param_sweep`)
 
-Swept against the injected labels with `src/tools/param_sweep.py` across all three gauges
+Swept against the injected labels with `src/workbench/param_sweep.py` across all three gauges
 (median 8 / 13 / 28 FNU) and levels 1–3. Ranges are wide because the optimum shifts with
 **turbidity scale** and **anomaly density**. These are starting ranges + directional rules
 for the agent (§8), not hard bounds — re-run the sweep if the data changes. Overriding
@@ -388,20 +417,40 @@ segments and are kept only for provenance; they are not part of the approved-bas
 The original rationale (applies to any un-audited base): a base chosen **by eye** may still
 hold real anomalies — which would silently become false positives when scoring detection
 against injected labels (§10), because the base is assumed anomaly-free everywhere the label
-file says nothing. `src/tools/candidates.py` + `src/tools/review.py` exist to check that
-assumption:
+file says nothing. `src/workbench/candidates.py` + `src/workbench/review.py` exist to check
+that assumption:
 
 ```
-python -m src.tools.review detect data/raw/provisional/<gauge>.csv   # propose + open page
-python -m src.tools.review merge  data/raw/provisional/<gauge>.csv <decisions.csv>
+python -m src.workbench.review detect data/raw/provisional/<gauge>.csv   # propose + open page
+python -m src.workbench.review merge  data/raw/provisional/<gauge>.csv <decisions.csv>
 ```
 
 - **Proposal is tuned for recall, not precision.** Detectors run at deliberately sensitive
   settings; false positives are expected and are what the review step removes. Every
   threshold in data units is derived from the series' own robust (MAD) scale, so the
-  defaults transfer across gauges spanning 0–40 and 0–1000 NTU. Defaults were picked in
-  `scratchpad/tune_candidates.py` to land in the tens of segments per type, because a
-  detector that proposes 800 segments cannot be reviewed by a human at all.
+  defaults transfer across gauges spanning 0–40 and 0–1000 NTU.
+- **Recall is measured, and the target is >95% per type** (2026-07-29). The old defaults
+  were picked to land in the *tens of segments* per type, on the reasoning that a detector
+  proposing 800 segments cannot be reviewed by a human at all. Measured against the injected
+  labels that costs far too much: spike recall was **59–81%** of injected spike rows, and the
+  `max_per_type=50` cap alone accounted for most of it — a dataset proposes thousands of spike
+  segments, so the cap discarded ~98% of them and a *truncated candidate never reaches the
+  reviewer*. Both were changed:
+  - `unilof_n` 20 → **10** (an injected spike is 1–3 rows; a 20-sample LOF neighbourhood blurs
+    a 3-row burst into its own local density), `unilof_thresh` 1.5 → **1.1**, `zscore_thresh`
+    10 → **3**, `zscore_min_residual_sigmas` 3.0 → **2.0**. Spike recall is now **96.8–99.1%**
+    on all nine datasets. (`scratchpad/tune_spike_recall.py`.)
+  - `max_per_type` 50 → **None** (opt-in, `--max-per-type`). It is a *presentation* limit for
+    the review page, not a detection setting, and defaulting it on made the cap rather than the
+    detectors the binding constraint on recall.
+  - The cost is real and accepted: a proposal now flags 4–10% of a two-year series across
+    ~2,500 spike segments, which is past one-by-one human review. Reviewing a provisional base
+    means setting `--max-per-type` explicitly and accepting the recall that buys.
+  `tests/test_candidates.py::test_candidate_type_recall_on_injected_datasets` holds the line at
+  95% per type per dataset. **Currently green for spike, gap; red for level_shift** (2.8–27.9%
+  — `flagJumps` marks a step's *edge* while the §5 label covers the whole injected window, so
+  row-recall cannot be high; open, see the level_shift bullet below) **and for plateau on
+  03447687_l1** (88.6%; every other dataset is 95.2–100%).
 - **Only spike, plateau and level_shift are reviewed — gaps are never queued.** Whether a
   value is missing is not a judgement call, and §5 is explicit that *every* missing run is
   `anomaly_type=gap`, so putting gaps in the queue only invites a reviewer to press "normal"
@@ -470,10 +519,10 @@ What was removed, and where it used to live:
 
 | Removed | From |
 | ------- | ---- |
-| `inject_drift`, `_place_drift_episodes`, `_n_drift_episodes`, `_inject_drift_and_maintenance`, `MaintenanceEvent`, `DRIFT_*` / `MAINTENANCE_*` constants, `ContaminationLevel.maintenance_interval_days`, `InjectionResult.maintenance` | `src/inject.py` |
-| `_detect_drift` heuristic proposer, `drift_*` config fields, the `drift` type/colour | `src/tools/candidates.py` |
-| the `drift` review category and `--drift-min-days` | `src/tools/review.py` |
-| the `correct_drift` ToolSpec, `MAINT_FIELD`, `maintenance_variable`, the whole `correct` tool kind | `src/tools/param_sweep.py` |
+| `inject_drift`, `_place_drift_episodes`, `_n_drift_episodes`, `_inject_drift_and_maintenance`, `MaintenanceEvent`, `DRIFT_*` / `MAINTENANCE_*` constants, `ContaminationLevel.maintenance_interval_days`, `InjectionResult.maintenance` | `src/datasets/inject.py` |
+| `_detect_drift` heuristic proposer, `drift_*` config fields, the `drift` type/colour | `src/workbench/candidates.py` |
+| the `drift` review category and `--drift-min-days` | `src/workbench/review.py` |
+| the `correct_drift` ToolSpec, `MAINT_FIELD`, `maintenance_variable`, the whole `correct` tool kind | `src/workbench/param_sweep.py` |
 | `"drift"` from `ANOMALY_TYPES` | `src/inspect_data.py` |
 | all nine `data/injected/*_maintenance.csv`; all nine datasets regenerated without drift | `data/injected/` |
 
@@ -550,6 +599,48 @@ realistic cadence; (3) write the `correctDrift` guard the probe findings above d
 (5) regenerate all nine datasets and re-check §9.1 tuning; (6) restore the §10 and §11 drift
 criteria. Recover the deleted code from git history rather than rewriting it — branch
 `no_drift_detection`, the commit before the removal.
+
+### 9.3 Provisional vs approved (`data/comparison/`, 2026-07-29)
+
+**It is a split, not a pair — do not go looking for the archived provisional values.**
+NWIS serves the *current* state of a record: when USGS approves a period, the provisional
+values it carried are **overwritten in place**. There is no public archive of superseded
+provisional values, and the instantaneous-values service has no revision / as-of parameter,
+so **the same timestamps cannot be retrieved in two states**. A row-for-row before/after
+diff would have to have been captured live, pre-approval, and kept. (Checked 2026-07-29.
+The `63680_final` / `63680_from multiparameter sonde…` column names some sites return are
+*time-series labels*, not a raw-vs-corrected pair — do not mistake them for one.)
+
+What is retrievable is the moving **approval boundary**: older rows are `A` (record
+processing applied per TM 1-D3 — fouling/drift corrections prorated between field visits,
+clearly-erroneous data deleted), newer rows are `P` (essentially as the sensor reported).
+Same site, same sensor, same 15-min grid, opposite sides of the processing step.
+`src/datasets/pull_comparison.py` splits one pull on that boundary and writes both sides plus a
+manifest to `data/comparison/<gauge>/`.
+
+- **Compare distributions, not counterparts.** The two sides are different calendar
+  periods, so seasonality confounds a naive comparison. Each manifest carries a
+  `season_matched_approved_window` — the same calendar dates one year earlier — as the
+  fairer slice of the approved side.
+- **The three gauges** (screened from a 24-gauge pool by
+  `scratchpad/screen_prov_vs_approved.py` on: ≥1 yr approved, ≥3 mo provisional, consistent
+  15-min, dense on *both* sides): `03447687` French Broad, NC (S. Appalachian mountain;
+  moderate ~8 FNU; 1018 d / 96.2% approved vs 106 d / 98.9% provisional); `02198840`
+  Savannah at I-95, GA (Atlantic tidal; moderate-high ~13 FNU; 894 d / 98.8% vs 231 d /
+  98.0%); `06818000` Missouri at St Joseph, MO (Great Plains; high ~24 FNU; 926 d / 85.4%
+  vs 198 d / 90.4%). All three split cleanly — zero approved rows after the boundary, zero
+  timestamp overlap.
+- **`08041770` (LNVA Canal, TX) cannot be used here** — its record ends 2025-11-19 with
+  **zero** provisional rows, so the third injection base has no comparison counterpart.
+  `06818000` stands in: it was retired as an *injection base* for 14% missing rows, but §9
+  establishes those are overwhelmingly isolated single-sample dropouts, which does not
+  disqualify it for a distribution comparison.
+- **Modified approved codes stay on the approved side** (`A e` estimated, `A, >`
+  over-range, `A, R` revised) — USGS approved those readings. `P`, blank and NaN are
+  not-approved.
+- This is **reference material, not an injection base**. Nothing in `data/comparison/`
+  feeds `src.datasets.inject`, which globs `data/raw/approved/` and only that (§9). The CSVs are
+  gitignored and regenerable; `data/comparison/README.md` is committed.
 
 ---
 

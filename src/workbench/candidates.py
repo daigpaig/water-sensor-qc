@@ -9,7 +9,7 @@ over such a series at
 deliberately *sensitive* settings, groups the flagged rows into contiguous
 **segments**, and ranks them. Nothing here decides anything: every segment is a
 *candidate* that a human confirms or rejects in the review page built by
-``src.tools.review``.
+``src.workbench.review``.
 
 Because the aim is recall (miss nothing) rather than precision, the output is
 expected to contain false positives. That is what the review step is for.
@@ -17,7 +17,12 @@ expected to contain false positives. That is what the review step is for.
 Per-type notes
 --------------
 - **spike** — ``flagUniLOF`` + ``flagZScore``; a segment found by both is ranked
-  higher via its score, but either alone is enough to propose it.
+  higher via its score, but either alone is enough to propose it. Both run at
+  settings tuned for >=95% recall against the injected labels
+  (``scratchpad/tune_spike_recall.py``, measured by
+  ``tests/test_candidates.py::test_candidate_type_recall_on_injected_datasets``),
+  which means thousands of segments per two-year series — recall first,
+  precision never. ``max_per_type`` is how you trade that back.
 - **plateau** — ``flagConstants`` (stuck at any level) + ``flagPlateau``
   (offset segment). These find different failures, so both run (CLAUDE.md §7.1).
 - **level_shift** — ``flagJumps``, then a **sharpness filter**. ``flagJumps``
@@ -49,12 +54,12 @@ gauges on very different turbidity ranges. Every one can be overridden.
 
 Usage
 -----
-    from src.tools.candidates import find_candidates
+    from src.workbench.candidates import find_candidates
 
     result = find_candidates("data/raw/provisional/06818000_turbidity_63680_provisional.csv")
     print(result.summary())
 
-See ``src.tools.review`` for the CLI and the labelling page.
+See ``src.workbench.review`` for the CLI and the labelling page.
 """
 from __future__ import annotations
 
@@ -108,16 +113,33 @@ class DetectConfig:
     """
 
     # spike
-    unilof_n: int = 20
-    unilof_thresh: float = 1.5
+    #
+    # Tuned for >=95% recall of the injected spikes on all nine datasets
+    # (scratchpad/tune_spike_recall.py); the earlier n=20/thresh=1.5,
+    # zscore thresh=10 defaults recalled only 59-81% of them, which is a miss the
+    # review step cannot repair. These settings are deliberately extreme: they
+    # flag 4-10% of the series across ~2,500 spike segments per dataset, so the
+    # proposal is now far past what a human can review one-by-one. That is the
+    # trade this module's docstring already names — recall first, precision
+    # never — but see max_per_type below.
+    #
+    # n is the LOF neighbourhood. 10 beats 20 at every threshold: an injected
+    # spike is 1-3 rows (inject.SPIKE_LEN_ROWS), and a 20-sample neighbourhood
+    # blurs a 3-row burst into its own local density. At thresh=1.1 on
+    # 02198840_l3, n=10 recalls 95.7% vs 87.6% for n=20.
+    unilof_n: int = 10
+    unilof_thresh: float = 1.1
     zscore_window: str = "12h"
-    zscore_thresh: float = 10.0
+    zscore_thresh: float = 3.0
     # A residual floor in data units. Without it, a 12h window of quantised
     # readings has a near-zero MAD and every wiggle scores an enormous modified
     # z: on 11501000 (0.1 NTU quantisation) flagZScore stuck at ~195 segments
     # even at thresh=30. At 3 step-sigmas that falls to 7. Probed, see
     # scratchpad/tune_zscore.py.
-    zscore_min_residual_sigmas: float = 3.0  # x step scale
+    # Lowered 3.0 -> 2.0: the floor still does its job (it is what keeps a
+    # quantised window from flagging everything) but 3.0 cost ~5 points of spike
+    # recall on 03447687 for no reduction in segment count worth having.
+    zscore_min_residual_sigmas: float = 2.0  # x step scale
     # plateau
     constants_window: str = "3h"
     constants_thresh_sigmas: float = 0.1  # x step scale; must stay << noise sd (§7.1)
@@ -146,7 +168,16 @@ class DetectConfig:
     #: drags the normal rows between them into the label. At 2h on a 15-min grid
     #: that put 12-27% never-flagged filler inside spike candidates.
     segment_bridge: str = "2h"
-    max_per_type: int = 50  # keep the worst N per type; the rest are reported
+    #: Keep only the worst N candidates per type, reporting the rest in
+    #: ``CandidateSet.truncated``. **Off by default.** It used to default to 50,
+    #: which silently made the cap — not the detectors — the binding constraint on
+    #: recall: at the settings above a dataset proposes ~2,500 spike segments, so
+    #: a cap of 50 discarded ~98% of them and dropped measured spike recall from
+    #: ~97% to ~4%. A truncated candidate is not "found" in any usable sense; it
+    #: never reaches the reviewer. This is a *presentation* limit for the review
+    #: page, so it is now opt-in (``--max-per-type``) and the caller chooses how
+    #: much of the queue to face.
+    max_per_type: int | None = None
 
 
 # --------------------------------------------------------------------------- types
@@ -539,7 +570,7 @@ def find_candidates(
     truncated: dict[str, int] = {}
     for atype in REVIEW_TYPES:
         items = sorted(proposals[atype], key=lambda c: c.score, reverse=True)
-        if len(items) > cfg.max_per_type:
+        if cfg.max_per_type is not None and len(items) > cfg.max_per_type:
             truncated[atype] = len(items) - cfg.max_per_type
             items = items[: cfg.max_per_type]
         items.sort(key=lambda c: c.start_pos)

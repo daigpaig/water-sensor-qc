@@ -1,4 +1,4 @@
-"""Tests for src/tools/candidates.py and src/tools/review.py.
+"""Tests for src/workbench/candidates.py and src/workbench/review.py.
 
 The series built here contain *planted* anomalies at known positions, so a test
 can assert that a candidate actually lands on the thing that was planted rather
@@ -7,13 +7,15 @@ than merely that some candidate exists.
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.tools.candidates import (
+from src.datasets.inject import DEFAULT_OUTDIR
+from src.workbench.candidates import (
     LABEL_TYPES,
     REVIEW_TYPES,
     Candidate,
@@ -23,7 +25,7 @@ from src.tools.candidates import (
     merge_decisions,
     robust_scales,
 )
-from src.tools.review import build_payload, build_review_html, main
+from src.workbench.review import build_payload, build_review_html, main
 
 # Planted positions in the fixture series (see `planted_csv`).
 SPIKE_POS = 900
@@ -221,7 +223,7 @@ def test_max_per_type_caps_and_reports_the_remainder(planted_csv: Path):
 
 def test_a_failing_detector_is_recorded_not_raised(planted_csv: Path, monkeypatch):
     """flagPlateau raises on some real inputs (§7.1) — one failure must not sink the run."""
-    import src.tools.candidates as mod
+    import src.workbench.candidates as mod
 
     real = mod._run_saqc
 
@@ -515,3 +517,105 @@ def test_merge_cli_reports_a_malformed_decisions_csv(planted_csv: Path, tmp_path
 
     assert main(["merge", str(planted_csv), str(dec_path), "--out", str(tmp_path / "l.csv")]) == 1
     assert "missing column(s)" in capsys.readouterr().err
+
+
+# ------------------------------------------------------- recall on real datasets
+#: A proposal run is tuned for recall, not precision (§9.1): false positives are
+#: what the review step removes, but anything the detectors *miss* never reaches a
+#: human at all. The nine injected datasets are the only place where ground truth
+#: is known, so they are what that claim gets measured against.
+MIN_RECALL = 0.95
+
+#: Rows are the unit, not events: `merge_decisions` labels the rows a candidate
+#: spans, so a candidate that clips half an injected plateau leaves the other half
+#: unlabelled. A row counts as recalled when any candidate covers it.
+RECALL_TYPES: tuple[str, ...] = (*REVIEW_TYPES, "gap")
+
+
+def _injected_datasets() -> list[Path]:
+    """The nine `data/injected/<gauge>/l<level>/<name>.csv` series, if generated."""
+    return sorted(DEFAULT_OUTDIR.glob("*/l[1-3]/*_l[1-3].csv"))
+
+
+@lru_cache(maxsize=None)
+def _recall(path_str: str) -> tuple[float, dict[str, tuple[int, int]]]:
+    """``(overall recall, {type: (hits, total)})`` on one injected dataset.
+
+    Scored on ``source == injected`` rows only. Natural anomalies carried in from
+    the base are excluded: they are all gaps (§5) and would flatter the number,
+    since gaps are recalled by construction.
+    """
+    path = Path(path_str)
+    result = find_candidates(path)
+    labels = pd.read_csv(
+        path.with_name(f"{path.stem}_labels.csv"), parse_dates=["datetime"]
+    ).set_index("datetime").reindex(result.series.index)
+
+    covered = np.zeros(len(result.series), dtype=bool)
+    for c in result.candidates:
+        covered[c.start_pos : c.end_pos] = True
+    # Gaps are never proposed for review — merge_decisions labels them straight
+    # from the NaN mask (§9.1), so that mask is their detection.
+    covered |= result.series.isna().to_numpy()
+
+    injected = (
+        labels["is_anomaly"].fillna(False).to_numpy(dtype=bool)
+        & (labels["source"].fillna("").to_numpy() == "injected")
+    )
+    atype = labels["anomaly_type"].fillna("").to_numpy()
+
+    per_type = {
+        t: (int((injected & (atype == t) & covered).sum()),
+            int((injected & (atype == t)).sum()))
+        for t in RECALL_TYPES
+    }
+    total = int(injected.sum())
+    return (int((injected & covered).sum()) / total if total else 1.0), per_type
+
+
+def _recall_report(name: str, recall: float, per_type: dict[str, tuple[int, int]]) -> str:
+    parts = [
+        f"{t}={100 * hits / n:.1f}% ({hits}/{n})" if n else f"{t}=n/a"
+        for t, (hits, n) in per_type.items()
+    ]
+    return f"{name}: recall {100 * recall:.1f}%  [" + ", ".join(parts) + "]"
+
+
+@pytest.mark.parametrize(
+    "path", _injected_datasets() or [None], ids=lambda p: p.stem if p else "no-data"
+)
+@pytest.mark.parametrize("atype", RECALL_TYPES)
+def test_candidate_type_recall_on_injected_datasets(path: Path | None, atype: str) -> None:
+    """Each anomaly type must be recalled at >95% of its injected rows.
+
+    Per type as well as overall, because the two failure modes are different
+    repairs: a type at 0% is a detector that does not fit the label (level_shift
+    — flagJumps marks a step's *edge*, the label covers the whole window),
+    whereas a type at 70% is a threshold set too tight.
+    """
+    if path is None:
+        pytest.skip(f"no injected datasets under {DEFAULT_OUTDIR}")
+
+    _, per_type = _recall(str(path))
+    hits, total = per_type[atype]
+    if not total:
+        pytest.skip(f"{path.stem} has no injected {atype} rows")
+    assert hits / total > MIN_RECALL, (
+        f"{path.stem} {atype}: recall {100 * hits / total:.1f}% ({hits}/{total})"
+    )
+
+
+@pytest.mark.parametrize(
+    "path", _injected_datasets() or [None], ids=lambda p: p.stem if p else "no-data"
+)
+def test_candidate_recall_on_injected_datasets(path: Path | None) -> None:
+    """Candidates must cover >95% of the injected anomaly rows in each dataset.
+
+    This is the assumption the review workflow rests on: a reviewer can only
+    reject what was proposed, so a missed anomaly is unrecoverable downstream.
+    """
+    if path is None:
+        pytest.skip(f"no injected datasets under {DEFAULT_OUTDIR}")
+
+    recall, per_type = _recall(str(path))
+    assert recall > MIN_RECALL, _recall_report(path.stem, recall, per_type)

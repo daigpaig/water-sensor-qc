@@ -8,21 +8,24 @@ env/
 
 # Raw downloaded data (USGS/ECCC) and API logs are gitignored.
 # data/raw/ is partitioned by approval status: approved/ holds the clean bases
-# src.inject globs, provisional/ and expert_flagged/ are audit scratch.
+# src.datasets.inject globs, provisional/ and expert_flagged/ are audit scratch.
 # (ignore contents but allow the .gitkeep files below to be re-included)
 data/raw/**
+# Provisional-vs-approved comparison pulls (regenerate: `python -m src.datasets.pull_comparison`)
+data/comparison/**
 logs/*
 
 # Keep the gitignored directories in the tree
 !data/raw/.gitkeep
 !data/raw/approved/
 !data/raw/approved/.gitkeep
+!data/comparison/README.md
 !logs/.gitkeep
 
-# Generated review artifacts (regenerate via `python -m src.tools.visualize`)
+# Generated review artifacts (regenerate via `python -m src.workbench.visualize`)
 figures/
 
-# Proposed candidates are regenerable from the series (`src.tools.review detect`).
+# Proposed candidates are regenerable from the series (`src.workbench.review detect`).
 # The reviewed *labels* are hand-made ground truth — those stay in the repo.
 data/review/*_candidates.csv
 

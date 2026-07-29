@@ -1,4 +1,4 @@
-"""Tests for the injected-dataset visualiser (src/tools/visualize_injected.py)."""
+"""Tests for the injected-dataset visualiser (src/workbench/visualize_injected.py)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.tools.visualize_injected import (
+from src.workbench.visualize_injected import (
     ANOMALY_COLORS,
     build_figure,
     find_gauges,

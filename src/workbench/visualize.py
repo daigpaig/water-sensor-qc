@@ -15,14 +15,14 @@ scattered samples renders as one line, while real gaps lift the line.
 CLI
 ---
     # View every approved turbidity CSV in data/raw/approved (default):
-    python -m src.tools.visualize
+    python -m src.workbench.visualize
 
     # Specific files, custom output, and don't auto-open a browser:
-    python -m src.tools.visualize data/raw/provisional/06818000_turbidity_63680_provisional.csv \\
+    python -m src.workbench.visualize data/raw/provisional/06818000_turbidity_63680_provisional.csv \\
         --out figures/one.html --no-open
 
     # Only break the line at gaps longer than 6 hours:
-    python -m src.tools.visualize --max-gap 6h
+    python -m src.workbench.visualize --max-gap 6h
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from src.pull_usgs import DEFAULT_MAX_GAP, longest_unbroken_run_days
+from src.datasets.pull_usgs import DEFAULT_MAX_GAP, longest_unbroken_run_days
 
 # Calm, distinguishable panel colors (blue / green / amber, then cycled).
 PANEL_COLORS: tuple[str, ...] = ("#2563eb", "#059669", "#d97706", "#7c3aed")

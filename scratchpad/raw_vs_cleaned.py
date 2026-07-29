@@ -28,8 +28,8 @@ import plotly.graph_objects as go
 
 from dataretrieval import nwis
 
-from src.pull_usgs import TURBIDITY_PARAM, tidy_frame
-from src.tools.visualize import detect_spikes, insert_gap_breaks
+from src.datasets.pull_usgs import TURBIDITY_PARAM, tidy_frame
+from src.workbench.visualize import detect_spikes, insert_gap_breaks
 
 SITE = "06818000"
 FIG = Path("figures/raw_vs_cleaned_06818000.html")

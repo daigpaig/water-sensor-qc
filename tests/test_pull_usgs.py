@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.pull_usgs import (
+from src.datasets.pull_usgs import (
     PullConfig,
     _validate,
     filter_approved,

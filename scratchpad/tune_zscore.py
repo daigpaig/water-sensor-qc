@@ -14,7 +14,7 @@ import pandas as pd
 import saqc
 
 from src.inspect_data import DATETIME_COL, load_series, reindex_to_grid
-from src.tools.candidates import _runs, robust_scales
+from src.workbench.candidates import _runs, robust_scales
 
 
 def main() -> None:

@@ -16,14 +16,14 @@ nothing can legitimately detect a spike in a missing reading.
 Usage
 -----
     # list what can be swept
-    python -m src.tools.param_sweep --list
+    python -m src.workbench.param_sweep --list
 
     # sweep one parameter (uses the built-in default grid)
-    python -m src.tools.param_sweep --dataset data/injected/03447687/l2/03447687_l2.csv \\
+    python -m src.workbench.param_sweep --dataset data/injected/03447687/l2/03447687_l2.csv \\
         --tool flag_spike_unilof --param thresh
 
     # your own grid, zoomed to a window
-    python -m src.tools.param_sweep --dataset data/injected/03447687/l2/03447687_l2.csv \\
+    python -m src.workbench.param_sweep --dataset data/injected/03447687/l2/03447687_l2.csv \\
         --tool flag_constants --param thresh --values 0,0.001,0.01,0.1 \\
         --start 2024-07-01 --end 2024-08-01
 """

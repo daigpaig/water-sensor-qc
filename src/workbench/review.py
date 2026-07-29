@@ -1,6 +1,6 @@
 """Build a keyboard-driven page for reviewing proposed anomalies, and merge the result.
 
-``src.tools.candidates`` proposes segments; this module walks a human through
+``src.workbench.candidates`` proposes segments; this module walks a human through
 them one at a time and writes the verdicts back out. The page is a single
 self-contained HTML file — no server, no Streamlit — so it opens straight from
 disk and keeps working offline. Progress is mirrored into ``localStorage`` after
@@ -16,19 +16,19 @@ Deciding auto-advances, so a straight run through is one keypress per candidate.
 
 A detector marks a *window*; sometimes only one sample in it is the anomaly.
 **Clicking a point narrows the label to that sample**, and the export carries the
-narrowed ``start``/``end`` so :func:`~src.tools.candidates.merge_decisions`
+narrowed ``start``/``end`` so :func:`~src.workbench.candidates.merge_decisions`
 labels only what was endorsed. A decision may narrow a proposal, never extend it.
 
 CLI
 ---
     # propose candidates and open the review page
-    python -m src.tools.review detect data/raw/provisional/06818000_turbidity_63680_provisional.csv
+    python -m src.workbench.review detect data/raw/provisional/06818000_turbidity_63680_provisional.csv
 
     # be pickier / more paranoid
-    python -m src.tools.review detect <csv> --jumps-sigmas 32 --max-per-type 25
+    python -m src.workbench.review detect <csv> --jumps-sigmas 32 --max-per-type 25
 
     # fold the page's exported CSV back into a §5 labels file
-    python -m src.tools.review merge <csv> ~/Downloads/<name>_decisions.csv
+    python -m src.workbench.review merge <csv> ~/Downloads/<name>_decisions.csv
 
 Artefacts land in ``data/review/`` (candidates and merged labels) and
 ``figures/`` (the page). ``merge`` writes ``<name>_review_labels.csv`` in the §5
@@ -38,7 +38,7 @@ that means they count for detection but not for imputation scoring).
 
 Only spike, plateau and level_shift are reviewed. **Gaps never appear in the
 queue**: whether a value is missing is not a judgement call, and ``merge`` labels
-every missing run from the data itself (§5). See ``src.tools.candidates``.
+every missing run from the data itself (§5). See ``src.workbench.candidates``.
 """
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ import numpy as np
 import pandas as pd
 
 from src.inspect_data import ContractError
-from src.tools.candidates import (
+from src.workbench.candidates import (
     TYPE_COLORS,
     LABEL_TYPES,
     REVIEW_TYPES,
@@ -65,7 +65,7 @@ from src.tools.candidates import (
 DEFAULT_PAGE_DIR = Path("figures")
 #: Review artefacts live here, not beside the series: the raw subdirectories are
 #: globbed by name elsewhere in the project (`data/raw/approved/*.csv` feeds
-#: `src.inject`), and a stray `*_candidates.csv` there breaks those lookups.
+#: `src.datasets.inject`), and a stray `*_candidates.csv` there breaks those lookups.
 DEFAULT_DATA_DIR = Path("data/review")
 
 
@@ -275,7 +275,7 @@ _TEMPLATE = r"""<!doctype html>
   the full span. Decisions save to this browser automatically
   (<code>localStorage</code>) — you can close the tab and come back. Press <code>E</code> to
   download the CSV, then run
-  <code>python -m src.tools.review merge &lt;series.csv&gt; &lt;decisions.csv&gt;</code>.
+  <code>python -m src.workbench.review merge&lt;series.csv&gt; &lt;decisions.csv&gt;</code>.
   <span id="warnings"></span>
 </p>
 
@@ -720,7 +720,10 @@ def main(argv: list[str] | None = None) -> int:
                        default=DetectConfig.jumps_thresh_sigmas,
                        help="flagJumps threshold, in robust step-sigmas of this series.")
         p.add_argument("--max-per-type", type=int, default=DetectConfig.max_per_type,
-                       help="Keep at most this many candidates per type.")
+                       help="Keep at most this many candidates per type (default: "
+                            "no limit). Trims the queue to something reviewable, "
+                            "at the cost of recall — dropped candidates never "
+                            "reach you.")
 
     p_det = sub.add_parser("detect", help="Propose candidates and build the review page.")
     add_common(p_det)

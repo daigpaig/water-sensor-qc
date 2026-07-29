@@ -5,7 +5,7 @@ base series and records ground-truth labels. Everything is driven by a fixed
 seed, so a given (base, level, seed) always reproduces byte-identical output.
 
 The base series are the **approved** USGS turbidity files in ``data/raw/approved`` (see
-``src.pull_usgs``): approved records have been through USGS record processing —
+``src.datasets.pull_usgs``): approved records have been through USGS record processing —
 fouling/calibration-drift corrections applied (TM 1-D3) — so they are clean apart
 from gaps (CLAUDE.md §9). There is no separate "clean-segment" carving or by-eye
 auditing step; we inject straight into the approved series.
@@ -56,18 +56,18 @@ must delete a value we know, or its ``true_value`` would be unknown and its
 CLI
 ---
     # Inject all three levels into every approved base in data/raw/approved (the default):
-    python -m src.inject
+    python -m src.datasets.inject
 
     # One base, one level, custom seed:
-    python -m src.inject --input data/raw/approved/12340500_turbidity_63680.csv \\
+    python -m src.datasets.inject --input data/raw/approved/12340500_turbidity_63680.csv \\
         --levels 2 --seed 7
 
     # See what would be written, without writing it:
-    python -m src.inject --dry-run
+    python -m src.datasets.inject --dry-run
 
 Usage from Python
 -----------------
-    from src.inject import inject_series, load_base
+    from src.datasets.inject import inject_series, load_base
 
     base = load_base("data/raw/approved/12340500_turbidity_63680.csv")
     result = inject_series(base, level=2, seed=42, name="11501000_l2")
