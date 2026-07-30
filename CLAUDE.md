@@ -90,7 +90,8 @@ deployment, Docker, CI beyond a basic test run).
 │   │   └── inject.py     # synthetic anomaly injection (4 types, 3 levels, seeded)
 │   ├── agent_tools/      # AGENT-facing: the §7 inventory, handed to the Messages API
 │   │   ├── schemas.py    # JSON tool schemas for the Messages API
-│   │   └── wrappers.py   # SaQC-wrapping tool functions (§5 result dict)
+│   │   ├── wrappers.py   # SaQC-wrapping tool functions (§5 result dict)
+│   │   └── context.py    # point-context measurements: storm vs artifact (§7.3)
 │   └── workbench/        # HUMAN-facing: run by a person; CLI/HTML/plot output
 │       ├── visualize.py  # series/overview plots
 │       ├── visualize_injected.py # plot injected datasets with anomaly labels
@@ -324,6 +325,50 @@ Data-unit thresholds (`flag_zscore`, `flag_constants`, `flag_jumps`) don't trans
 gauges of different scale — rescale by the series' robust (MAD) spread when moving to a new
 gauge (§7.1). Measured across 3 gauges × 3 levels, but level_shift and imputation remain
 under-powered, so treat those two rows as guidance-to-flag, not tuned optima.
+
+### 7.3 Point-context tools (`src/agent_tools/context.py`, 2026-07-30)
+
+Detectors say **where** a rule fired; they cannot say **whether it is real water**, which is
+the §6 decision the agent actually has to make. `context.py` closes that gap: given one
+timestamp it measures the shape around it and returns JSON-serialisable dicts. Nothing in it
+flags or mutates — it observes. Eight primitives (`slope_context`, `excursion_context`,
+`recovery_context`, `level_shift_context`, `flatness_context`, `neighbourhood_stats`,
+`gap_context`, `historical_context`) plus two aggregators, `describe_point` and
+`describe_points`. **Only the aggregators get schemas** — nine near-identical tools would
+eat the 25-call cap; the primitives stay library functions.
+
+Every threshold is in **robust sigmas of the series**, floored by the series-wide robust
+first-difference scale, because a windowed MAD collapses to 0 on quantised turbidity and
+blows up any local z (§7.1).
+
+**What separates a storm peak from a spike (measured, 3 gauges × level 2, injected labels
+as truth; `scratchpad/demo_point_context.py` reproduces the table):**
+
+| metric | spike | storm peak | normal | plateau |
+| --- | --- | --- | --- | --- |
+| `|robust_z|` (±6h) | 4.8 | 1.3 | 0.4 | 0.0 |
+| excursion width (samples at half height) | 2–3 | 7–25 | 2–14 | 22–43 |
+| samples to recover | 2 | 12–30 | 1 | 1 |
+| `step_sharpness` | 5–10 | 0.6 | 1.2 | 0.5 |
+
+- **The rise-vs-fall gradient ratio does NOT work — do not rediscover this.** The intuition
+  (storms recede gradually, spikes are symmetric) fails on this data: injected upward spikes
+  and genuine storm peaks sit at median `fall_rise_ratio` 1.00 vs 0.97 at a 2 h window, and
+  overlap just as badly at 1 h, 6 h and 24 h, with or without the point excluded from the
+  fits. A storm's asymmetry is an **event-scale** property (rise in hours, recession over
+  days), not a local gradient either side of one sample. `slope_context` is kept for shape
+  and direction; **width and recovery time are what actually separate them.**
+- **Recovery must be anchored at the excursion's onset, not at the point.** Mid-storm, the
+  six hours before the *point* are already storm, so a point-anchored baseline reports an
+  instant recovery for an event nowhere near over. `recovery_context(anchor='excursion')`
+  is the default for this reason.
+- **`reads_like` is a hint, not a verdict**, and it is deliberately conservative. Measured
+  hit rates: spike 87/120 with 11 storm-peak false positives and 0 on normal rows; plateau
+  exact; gap exact; **level_shift weak (6/9 onsets, 6 storm-peak FP)** — the same wall §9.1
+  hit from a different direction, so treat that label as "look here".
+- **Level shift is measured as a duration, not a persistence ratio**, because §9 injects
+  bounded 6–72 h windows rather than permanent steps; a "does it hold forever" test would
+  score every injected shift as transient.
 
 ---
 

@@ -11,6 +11,9 @@ Tools are grouped:
   Utility    — inspect_dataset, get_flag_summary, export_clean_data
   Detection  — flag_range, flag_constants, flag_plateau, flag_spike_unilof,
                 flag_zscore, flag_jumps, flag_nan
+  Context    — describe_points, describe_point (from context.py, not SaQC:
+                they measure the shape around a flagged timestamp so the agent
+                can tell a storm from an artifact)
   Action     — impute_rolling
 
 Implemented in Phase 2.
@@ -405,6 +408,144 @@ _FLAG_NAN = {
 }
 
 # ---------------------------------------------------------------------------
+# Context tools (src/agent_tools/context.py)
+#
+# Only the two aggregators are exposed. The eight primitives behind them
+# (slope_context, excursion_context, recovery_context, level_shift_context,
+# flatness_context, neighbourhood_stats, gap_context, historical_context) are
+# library functions: offering them individually would spend the 25-call budget
+# on nine near-identical calls when describe_point returns all of them at once.
+# ---------------------------------------------------------------------------
+
+_DESCRIBE_POINTS = {
+    "name": "describe_points",
+    "description": (
+        "Describes the SHAPE of the data around a list of timestamps — use this on a "
+        "detector's flagged_datetimes to decide whether each flag is a sensor artifact or "
+        "real water. A detector tells you WHERE a statistical rule fired; this tells you "
+        "what the surrounding points look like, which is the evidence you need to choose "
+        "delete / correct / keep. "
+        "Returns one compact row per timestamp: value, robust_z (distance from the local "
+        "median in robust sigmas), width_samples (how many samples the excursion spans at "
+        "half height), peak_sharpness, fall_rise_ratio, samples_to_recover (how long until "
+        "the series returns to its pre-event baseline), and a reads_like hint. "
+        "HOW TO READ IT — measured on this project's datasets: an artifact SPIKE has "
+        "|robust_z| >= 3, width 2-3 samples and recovers in ~2 samples; a genuine STORM "
+        "peak has |robust_z| ~1.3, width 7-25 samples and takes 12+ samples to recover. "
+        "Width and recovery time are the reliable discriminators. Do NOT rely on "
+        "fall_rise_ratio alone — it was measured and does not separate storms from spikes. "
+        "The reads_like label is a hint, not a verdict: you decide the action and justify it. "
+        "This is one call for a whole detector output, so prefer it over describe_point when "
+        "you have more than one timestamp to judge."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "field": {
+                "type": "string",
+                "description": "Column name that holds the measurement values. Default 'value'.",
+                "default": "value",
+            },
+            "ats": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Timestamps to describe, ISO 8601 (e.g. '2024-06-01T03:00:00'). "
+                    "Pass the flagged_datetimes from a detector result, or a subset of them. "
+                    "A timestamp that is not in the series is reported in 'errors', not "
+                    "silently rounded."
+                ),
+            },
+            "max_points": {
+                "type": "integer",
+                "description": (
+                    "Maximum timestamps to describe in this call. Default 20. Any extras are "
+                    "reported in n_truncated and named in the message — never dropped "
+                    "silently — so call again with the remainder if you need them."
+                ),
+                "default": 20,
+            },
+            "window": {
+                "type": "string",
+                "description": (
+                    "Neighbourhood size for the local statistics, as a pandas offset string. "
+                    "Practical range '3h'-'12h'. Default '6h'."
+                ),
+                "default": "6h",
+            },
+        },
+        "required": ["ats"],
+    },
+}
+
+_DESCRIBE_POINT = {
+    "name": "describe_point",
+    "description": (
+        "Full shape analysis of ONE timestamp — the detailed version of describe_points. "
+        "Use it when a single point needs a careful decision and the compact row from "
+        "describe_points was not enough. "
+        "Returns eight nested measurement blocks: slope (gradient into and out of the point, "
+        "plus the single-sample steps either side), excursion (width at half height, "
+        "sharpness, size in robust sigmas), recovery (samples until the series returns to its "
+        "pre-event baseline), level_shift (median before vs after, step in robust sigmas, and "
+        "how long the new level held), flatness (length of the unchanged-value run — the "
+        "stuck-sensor signature), neighbourhood (local median, robust sigma, robust z, "
+        "percentile), gap (distance to the nearest missing run), and history (whether this "
+        "series ever reached this level elsewhere, and in how many separate episodes — a level "
+        "reached in 40 separate episodes is part of the regime, not an outlier). "
+        "Every block also carries a plain-language 'message'. The reads_like label is a hint "
+        "from these numbers, not a verdict."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "field": {
+                "type": "string",
+                "description": "Column name that holds the measurement values. Default 'value'.",
+                "default": "value",
+            },
+            "at": {
+                "type": "string",
+                "description": (
+                    "The timestamp to describe, ISO 8601 (e.g. '2024-06-01T03:00:00'). "
+                    "Must be a timestamp present in the series."
+                ),
+            },
+            "n_before": {
+                "type": "integer",
+                "description": (
+                    "Samples before the point used for the incoming gradient (the window "
+                    "includes the point). 8 samples = 2 h on a 15-min grid. Default 8."
+                ),
+                "default": 8,
+            },
+            "n_after": {
+                "type": "integer",
+                "description": "Samples after the point used for the outgoing gradient. Default 8.",
+                "default": 8,
+            },
+            "window": {
+                "type": "string",
+                "description": (
+                    "Neighbourhood size for the local statistics and flatness check, as a "
+                    "pandas offset string. Practical range '3h'-'12h'. Default '6h'."
+                ),
+                "default": "6h",
+            },
+            "shift_window": {
+                "type": "string",
+                "description": (
+                    "Window either side used for the before/after level comparison. "
+                    "Practical range '12h'-'48h'. Default '24h'."
+                ),
+                "default": "24h",
+            },
+        },
+        "required": ["at"],
+    },
+}
+
+# ---------------------------------------------------------------------------
 # Action tools
 # ---------------------------------------------------------------------------
 
@@ -488,6 +629,9 @@ TOOL_SCHEMAS: list[dict] = [
     _FLAG_ZSCORE,
     _FLAG_JUMPS,
     _FLAG_NAN,
+    # Context
+    _DESCRIBE_POINTS,
+    _DESCRIBE_POINT,
     # Action
     _IMPUTE_ROLLING,
 ]

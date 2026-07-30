@@ -37,6 +37,9 @@ EXPECTED_TOOLS = {
     "flag_zscore",
     "flag_jumps",
     "flag_nan",
+    # Context (the two aggregators from context.py; its primitives stay library-only)
+    "describe_point",
+    "describe_points",
     # Action
     "impute_rolling",
 }
