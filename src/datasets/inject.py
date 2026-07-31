@@ -149,12 +149,19 @@ VALUE_FLOOR = 0.0
 # Spike: one to a few samples thrown far off by debris or an air bubble.
 SPIKE_LEN_ROWS = (1, 3)
 # Sampled *log-uniformly* over this range (see ``_loguniform``), not uniformly:
-# real spikes span an order of magnitude — most are modest, a few are enormous —
-# so a flat U(4, 10) made every spike a similar, uniformly-large size and gave the
-# detector an unrealistically easy, narrow target. Log-uniform over a wider band
-# puts many spikes just above the local noise (2-3x) and a long tail of big ones
-# (up to 15x), which is both more realistic and a harder test of recall.
-SPIKE_MAGNITUDE_SCALE = (2.0, 15.0)
+# real spikes span a range of sizes — most are modest, a few are large — so a flat
+# draw makes every spike a similar size and gives the detector an unrealistically
+# narrow target. Log-uniform keeps the median well below the arithmetic midpoint.
+#
+# The floor was raised 2.0 -> 5.0 (2026-07-31) while the ceiling stayed at 15x.
+# At a 2x floor the smallest spikes sat inside the local noise band, where they
+# are not distinguishable from ordinary sensor wiggle even by eye — an unlabelled
+# reader could not call them anomalies, so scoring a detector on them measured
+# luck rather than recall. A 5x floor is the smallest displacement that is
+# unambiguously a spike. The ceiling is deliberately unchanged: 15x local scale is
+# already at the edge of physical plausibility for turbidity, and raising it would
+# only add trivially-detectable outliers that flatter the metrics.
+SPIKE_MAGNITUDE_SCALE = (5.0, 15.0)
 SPIKE_UPWARD_PROB = 0.8  # debris/fouling pushes turbidity readings up far more often
 
 # Plateau: the sensor sticks and repeats one reading.
@@ -164,7 +171,13 @@ PLATEAU_DURATION_HOURS = (2.0, 12.0)
 GAP_DURATION_HOURS = (0.5, 6.0)
 
 # Level shift: a bounded offset window (see the module docstring).
-LEVEL_SHIFT_DURATION_HOURS = (6.0, 72.0)
+# Shortened 6-72h -> 4-24h (2026-07-31) alongside the point-budget cut. Level shift
+# is sized by episode *count*, not by the point budget, so leaving a 72h ceiling in
+# place while the point types got ~5x rarer would have made a single shift episode
+# the dominant anomaly in a level-1 dataset. The count stays 1/2/3 — dropping it
+# further would leave a dataset with one episode, too thin a basis for per-type
+# recall (§10).
+LEVEL_SHIFT_DURATION_HOURS = (4.0, 24.0)
 LEVEL_SHIFT_MAGNITUDE_SCALE = (2.0, 5.0)
 
 # How the point budget splits across the point-like types, by row count.
@@ -217,10 +230,16 @@ class ContaminationLevel:
     n_level_shifts: int
 
 
+# Toned down in stages — 3/7/12 -> 2/5/9 -> 0.8/2/3.5 -> 0.15/0.4/0.8 (2026-07-31)
+# — each time because the datasets still read as more contaminated than a real
+# maintained record. A USGS approved series carries a handful of artifacts per year,
+# not one every few days; at 3.5% the level-3 series was visibly speckled on a plot,
+# which makes detection easier than the real problem and inflates recall. These rates
+# put level 1 at ~10 spike events across two years and level 3 near the old level 1.
 LEVELS: dict[int, ContaminationLevel] = {
-    1: ContaminationLevel(1, "low", point_pct=0.8, n_level_shifts=1),
-    2: ContaminationLevel(2, "medium", point_pct=2.0, n_level_shifts=2),
-    3: ContaminationLevel(3, "high", point_pct=3.5, n_level_shifts=3),
+    1: ContaminationLevel(1, "low", point_pct=0.15, n_level_shifts=1),
+    2: ContaminationLevel(2, "medium", point_pct=0.4, n_level_shifts=2),
+    3: ContaminationLevel(3, "high", point_pct=0.8, n_level_shifts=3),
 }
 
 
@@ -600,6 +619,16 @@ def _inject_point_anomalies(
                 magnitude = _signed(
                     rng, _loguniform(rng, SPIKE_MAGNITUDE_SCALE) * local, SPIKE_UPWARD_PROB
                 )
+                # A downward spike is clipped at VALUE_FLOOR (turbidity cannot go
+                # negative), so on a low reading a -30 FNU draw lands as a -3 FNU
+                # displacement — back inside the noise band the magnitude floor
+                # exists to clear. Measured before this guard: 9.9% of spike rows
+                # ended up under 5x local scale, some as low as 0.7x. Flip such a
+                # spike upward rather than clip it, which preserves the drawn
+                # magnitude exactly and matches the physics (SPIKE_UPWARD_PROB is
+                # already 0.8 because fouling pushes turbidity up).
+                if magnitude < 0 and float(np.min(window)) + magnitude < VALUE_FLOOR:
+                    magnitude = -magnitude
                 values, seg = inject_spike(values, start, magnitude=magnitude, length=length)
             elif kind == PLATEAU:
                 # A stuck sensor may span an isolated dropout, but it has to stick
@@ -838,7 +867,9 @@ def format_manifest(manifest: dict[str, Any]) -> str:
     """Human-readable per-type breakdown for the terminal."""
     lines = [
         f"  rows              : {manifest['n_rows']:,}",
-        f"  point budget      : {manifest['target_point_pct']:.1f}% target -> "
+        # Two decimals, not one: the level-1 target is 0.15%, which `:.1f` rounds
+        # to a printed "0.1%" that does not match any configured level.
+        f"  point budget      : {manifest['target_point_pct']:.2f}% target -> "
         f"{manifest['actual_point_pct']:.2f}% actual (spike/plateau/gap, injected only)",
         f"  total anomalous   : {manifest['total_anomalous_rows']:,} rows "
         f"({manifest['total_anomalous_pct']:.2f}%, incl. level_shift/natural gaps)",
@@ -854,7 +885,7 @@ def format_manifest(manifest: dict[str, Any]) -> str:
     if not manifest["point_budget_met"]:
         lines.append(
             f"  ⚠ point budget UNMET ({manifest['actual_point_pct']:.2f}% of "
-            f"{manifest['target_point_pct']:.1f}%): the base has too little usable room "
+            f"{manifest['target_point_pct']:.2f}%): the base has too little usable room "
             f"to place the longer plateaus/gaps. This dataset does not carry its "
             f"nominal level."
         )

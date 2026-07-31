@@ -311,6 +311,14 @@ principle: **raise a sensitivity threshold when the base is spiky/variable or an
 sparse (favor precision); lower it when anomalies are dense or the base is calm (favor
 recall).**
 
+> ⚠ **These ranges were swept against the pre-2026-07-31 datasets and have NOT been re-run**
+> since the §9 frequency cut (`0.8/2/3.5` → `0.15/0.4/0.8`) and the spike-magnitude floor
+> raise (2× → 5×). Both changes push the same direction the table's own rule predicts:
+> anomalies are now ~5× sparser, which favors **higher** thresholds for precision, while
+> spikes are uniformly larger, which means a higher `flag_spike_unilof`/`flag_zscore`
+> threshold now costs less recall than it used to. Treat every number below as a stale
+> starting point and re-run `param_sweep` before quoting any of it as tuned.
+
 | Tool · param | range (default) | increase (↑) when | decrease (↓) when |
 | --- | --- | --- | --- |
 | `flag_spike_unilof` · `thresh` (`n≈20`) | **1.2–2.0** (1.5) | many false positives; sparse anomalies (low level); base naturally spiky | missing spikes; dense spikes (high level); calm base. *LOF ratio → same range every gauge.* |
@@ -367,8 +375,10 @@ as truth; `scratchpad/demo_point_context.py` reproduces the table):**
   exact; gap exact; **level_shift weak (6/9 onsets, 6 storm-peak FP)** — the same wall §9.1
   hit from a different direction, so treat that label as "look here".
 - **Level shift is measured as a duration, not a persistence ratio**, because §9 injects
-  bounded 6–72 h windows rather than permanent steps; a "does it hold forever" test would
-  score every injected shift as transient.
+  bounded 4–24 h windows rather than permanent steps; a "does it hold forever" test would
+  score every injected shift as transient. (The window was 6–72 h when this was measured;
+  shortened 2026-07-31 with the frequency cut, so shifts are now shorter than the durations
+  the table above was calibrated on — expect the weak level_shift hit rate to be no better.)
 
 ---
 
@@ -425,15 +435,33 @@ we run the tool → we return tool_result → loop).
 - **Synthetic injection:** inject all four types at recorded locations into the approved
   bases; save the labels (§5). Build **three contamination levels** with a **fixed random
   seed** for reproducibility.
-- **What the level scales.** The `0.8% / 2% / 3.5%` knob applies to the **point-like types
+- **What the level scales.** The `0.15% / 0.4% / 0.8%` knob applies to the **point-like types
   only** (spike, plateau, gap), where "percent of rows" is a natural unit. `level_shift` is
   driven by episode count instead (1 / 2 / 3), and its row-share is a reported consequence
   rather than a target — so a dataset's **total** anomalous share exceeds its headline level,
-  partly via *natural* gaps carried in from the base. Level 3 now lands at 8.7 / 5.5 / 5.0%
-  on 03447687 / 02198840 / 08041770 (natural-gap share is only 0.6–4.6%). (These per-type
-  rates were deliberately toned down in stages — from `3 / 7 / 12` to `2 / 5 / 9` to the
-  current `0.8 / 2 / 3.5` — to look like real, sparsely-anomalous records.) Read per-type
-  counts from the manifest/labels; never infer them from the level number.
+  partly via *natural* gaps carried in from the base. Level 3 now lands at 5.6 / 2.4 / 1.7%
+  on 03447687 / 02198840 / 08041770 (natural-gap share is 4.6 / 1.4 / 0.6%, which now
+  *dominates* the total on 03447687). (These per-type rates were toned down in stages —
+  `3 / 7 / 12` → `2 / 5 / 9` → `0.8 / 2 / 3.5` → the current `0.15 / 0.4 / 0.8`
+  (2026-07-31) — to look like real, sparsely-anomalous records. At 3.5% the level-3 series
+  was visibly speckled on a plot, which makes detection easier than the real problem.)
+  Read per-type counts from the manifest/labels; never infer them from the level number.
+- **Level 1 is now thin by design — check `n_events` before trusting a per-type score.**
+  At 0.15% a dataset carries ~11–13 spike events, **1–2 plateau events**, and 3–4 injected
+  gap events across two years. That is the intended realism, but per-type precision/recall
+  on plateau at level 1 rests on one or two events, so it is noisy and a single miss swings
+  it to 0. Score plateau on levels 2–3, or pool levels. All nine datasets still report
+  `point_budget_met: true` and `types_missing: []`.
+- **Spike magnitude is log-uniform 5–15× the local robust scale** (`SPIKE_MAGNITUDE_SCALE`).
+  The floor was raised from 2× (2026-07-31): below ~5× an injected spike sits inside the
+  local noise band and is not identifiable as an anomaly even by eye, so scoring a detector
+  on it measures luck. The ceiling stayed at 15× deliberately — that is already the edge of
+  physical plausibility for turbidity, and raising it would only add trivially-detectable
+  outliers that flatter the metrics. **A downward spike that would clip at `VALUE_FLOOR` is
+  flipped upward, not clipped**: turbidity cannot go negative, so on a low reading a −30 FNU
+  draw used to land as a −3 FNU displacement, putting 9.9% of spike rows back under the
+  floor (some at 0.7× local scale) and silently defeating the floor. Realised spread across
+  all nine datasets is now p10 5.7× / median 9.0× / p90 13.5×.
 - **Level shift is injected as a bounded window**, not a literal permanent step: a
   permanent step would either label every subsequent row anomalous (one mid-series shift
   ≈ 50% contamination) or leave post-step rows with `true_value != value` while marked
@@ -492,10 +520,15 @@ python -m src.workbench.review merge  data/raw/provisional/<gauge>.csv <decision
     ~2,500 spike segments, which is past one-by-one human review. Reviewing a provisional base
     means setting `--max-per-type` explicitly and accepting the recall that buys.
   `tests/test_candidates.py::test_candidate_type_recall_on_injected_datasets` holds the line at
-  95% per type per dataset. **Currently green for spike, gap; red for level_shift** (2.8–27.9%
-  — `flagJumps` marks a step's *edge* while the §5 label covers the whole injected window, so
-  row-recall cannot be high; open, see the level_shift bullet below) **and for plateau on
-  03447687_l1** (88.6%; every other dataset is 95.2–100%).
+  95% per type per dataset. **These recall figures predate the 2026-07-31 regeneration and
+  have not been re-measured** — the whole `tests/test_candidates.py` file is currently failing
+  for an unrelated environment reason (see the §9 note below), so the numbers here are the last
+  known-good ones, not a current reading. As recorded then: **green for spike, gap; red for
+  level_shift** (2.8–27.9% — `flagJumps` marks a step's *edge* while the §5 label covers the
+  whole injected window, so row-recall cannot be high; open, see the level_shift bullet below)
+  **and for plateau on 03447687_l1** (88.6%; every other dataset is 95.2–100%). Note the
+  frequency cut makes plateau recall at level 1 rest on 1–2 events, so that figure will be far
+  noisier than it was.
 - **Only spike, plateau and level_shift are reviewed — gaps are never queued.** Whether a
   value is missing is not a judgement call, and §5 is explicit that *every* missing run is
   `anomaly_type=gap`, so putting gaps in the queue only invites a reviewer to press "normal"

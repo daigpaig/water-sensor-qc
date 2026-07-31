@@ -19,6 +19,7 @@ from src.datasets.inject import (
     LEVEL_SHIFT,
     LEVELS,
     PLATEAU,
+    POINT_BUDGET_TOLERANCE_FRAC,
     SOURCE_INJECTED,
     SOURCE_NATURAL,
     SPIKE,
@@ -330,7 +331,13 @@ def test_streams_are_independent_across_names_and_levels(base: pd.DataFrame) -> 
 def test_point_budget_lands_near_its_target(base: pd.DataFrame, level: int) -> None:
     result = inject_series(base, level=level, seed=1, name="t")
     actual = result.manifest["actual_point_pct"]
-    assert actual == pytest.approx(LEVELS[level].point_pct, abs=0.5)
+    # Relative, not absolute. The old `abs=0.5` was written when level 1 targeted
+    # 0.8%; against the current 0.15% target it would wave through a dataset
+    # carrying no point anomalies at all. Tied to the same tolerance the manifest
+    # uses for `point_budget_met`, so the test and the flag cannot disagree.
+    assert actual == pytest.approx(
+        LEVELS[level].point_pct, rel=POINT_BUDGET_TOLERANCE_FRAC
+    )
     assert result.manifest["point_budget_met"]
 
 
