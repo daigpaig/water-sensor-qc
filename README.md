@@ -156,7 +156,7 @@ PYTHONPATH=. pytest tests/test_tools.py -v     # requires saqc==2.8 installed
 ├── src/                        # grouped by audience (CLAUDE.md §4)
 │   ├── inspect_data.py         # load, validate contracts, summarise — shared foundation
 │   ├── evaluate.py             # metrics, fixed-pipeline baseline, ablation  [stub]
-│   ├── agent.py                # ReAct loop + API logger                      [stub]
+│   ├── agent.py                # ReAct loop + API logger
 │   ├── datasets/               # writes everything under data/
 │   │   ├── pull_usgs.py        # download APPROVED turbidity from USGS NWIS
 │   │   ├── pull_comparison.py  # one series in BOTH approval states (§9.3)
@@ -181,7 +181,8 @@ PYTHONPATH=. pytest tests/test_tools.py -v     # requires saqc==2.8 installed
 │   ├── test_pull_usgs.py
 │   ├── test_pull_comparison.py
 │   ├── test_candidates.py
-│   └── test_visualize_injected.py
+│   ├── test_visualize_injected.py
+│   └── test_agent.py           # ReAct loop + tool dispatch tests
 └── logs/                       # JSONL API logs (gitignored)
 ```
 

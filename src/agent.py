@@ -11,6 +11,19 @@ STATUS: draft. Only the system prompt below is written; the loop, dispatch, cap
 and logger are still to come (handled separately).
 """
 
+import json
+import datetime
+import os
+from pathlib import Path
+
+import anthropic
+import pandas as pd
+import saqc
+
+from src.agent_tools.schemas import TOOL_SCHEMAS
+from src.agent_tools import wrappers
+from src.agent_tools import context
+
 # Bump on every edit to SYSTEM_PROMPT and note the change in the commit message,
 # so a run in logs/*.jsonl can be tied to the exact prompt that produced it.
 SYSTEM_PROMPT_VERSION = "v0.2-draft"
@@ -324,3 +337,119 @@ STEP 7 — REPORT
      is a useful sentence and an honest one. Confident wrong answers are the failure mode
      that matters here.
 """.strip()
+
+
+def _get_tool_function(tool_name: str):
+    """Dynamically resolve the tool function from wrappers or context."""
+    if hasattr(wrappers, tool_name):
+        return getattr(wrappers, tool_name)
+    if hasattr(context, tool_name):
+        return getattr(context, tool_name)
+    raise ValueError(f"Tool {tool_name} not found in wrappers or context.")
+
+
+def run_agent(qc: saqc.SaQC, max_steps: int = 25, log_dir: str = "logs") -> tuple[saqc.SaQC, pd.DataFrame | None, str]:
+    """Runs the ReAct loop to perform quality control on a SaQC object.
+    
+    Returns:
+        tuple containing:
+            - The final, mutated SaQC object
+            - The cleaned DataFrame (if export_clean_data was called), otherwise None
+            - The final plain text report from the agent
+    """
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    
+    messages = [
+        {"role": "user", "content": "Please perform quality control on this dataset."}
+    ]
+    
+    log_dir_path = Path(log_dir)
+    log_dir_path.mkdir(exist_ok=True, parents=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir_path / f"run_{timestamp}.jsonl"
+    
+    def _log_event(event: dict):
+        with open(log_path, "a") as f:
+            f.write(json.dumps(event, default=str) + "\n")
+            
+    _log_event({"event": "system_prompt", "content": SYSTEM_PROMPT, "version": SYSTEM_PROMPT_VERSION})
+    
+    current_qc = qc
+    clean_df = None
+    final_report = ""
+    
+    for step in range(max_steps):
+        _log_event({"event": "api_call", "step": step, "messages": messages})
+        
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20240620",
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=messages,
+            tools=TOOL_SCHEMAS,
+        )
+        
+        # log the raw response but convert it to dict for jsonl
+        _log_event({"event": "api_response", "step": step, "response": response.model_dump()})
+        
+        # Append the assistant's response to the conversation history
+        messages.append({"role": "assistant", "content": response.content})
+        
+        if response.stop_reason == "tool_use":
+            # Extract tool calls
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    tool_name = block.name
+                    tool_args = block.input
+                    
+                    try:
+                        func = _get_tool_function(tool_name)
+                        
+                        # Decide how to pass the data object based on where the function lives
+                        if hasattr(wrappers, tool_name):
+                            # wrappers mutate qc and take qc=
+                            result = func(qc=current_qc, **tool_args)
+                            if "qc" in result:
+                                current_qc = result.pop("qc") # update state
+                            if "df" in result:
+                                clean_df = result.pop("df")
+                        elif hasattr(context, tool_name):
+                            # context tools observe and take source=
+                            result = func(source=current_qc, **tool_args)
+                        else:
+                            raise ValueError(f"Unknown tool: {tool_name}")
+                            
+                        # Format the success result
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": json.dumps(result)
+                        })
+                        
+                    except Exception as e:
+                        # Feed the error back to the model
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": f"Error executing {tool_name}: {str(e)}",
+                            "is_error": True
+                        })
+            
+            if tool_results:
+                messages.append({"role": "user", "content": tool_results})
+                
+        elif response.stop_reason in ("end_turn", "stop_sequence"):
+            # Agent finished its reasoning and text generation
+            # Find the text content for the final report
+            for block in response.content:
+                if block.type == "text":
+                    final_report += block.text + "\n"
+            break
+            
+    else:
+        # Reached max_steps without breaking
+        _log_event({"event": "max_steps_reached", "step": max_steps})
+        final_report = "Agent reached the maximum tool call limit before completing."
+
+    return current_qc, clean_df, final_report
