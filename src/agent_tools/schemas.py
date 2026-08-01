@@ -199,12 +199,13 @@ _FLAG_PLATEAU = {
                 "default": "value",
             },
             "min_length": {
-                "type": ["string", "null"],
+                "type": "string",
                 "description": (
                     "Minimum plateau duration as a pandas offset string, e.g. '1h', '3h'. "
-                    "Must be set well below the true plateau length. Practical range: '1h'–'3h'."
+                    "Must be set well below the true plateau length. Practical range: '1h'–'3h'. "
+                    "Required by SaQC 2.8 — defaults to '1h' if you omit it, never null."
                 ),
-                "default": None,
+                "default": "1h",
             },
             "max_length": {
                 "type": ["string", "null"],

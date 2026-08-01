@@ -1,15 +1,18 @@
 """Tests for the agent ReAct loop and tool dispatch logic (B1 and B2)."""
 
 import json
-import sys
 from unittest.mock import MagicMock, patch
 
-# Mock saqc so we can test agent logic in any Python environment (e.g. without saqc 2.8)
-sys.modules["saqc"] = MagicMock()
-
+import numpy as np
 import pandas as pd
 import pytest
 import saqc
+
+# NOTE: do NOT put `sys.modules["saqc"] = MagicMock()` here. It was here to let these
+# tests run without saqc installed, but sys.modules is process-global and pytest imports
+# every test module into one process: the mock leaked into test_tools / test_context /
+# test_inject and turned 91 passing tests red, while each file still passed on its own.
+# saqc 2.8 is a pinned hard dependency of this project (CLAUDE.md §2), so use the real one.
 
 from src.agent import run_agent
 
@@ -141,8 +144,20 @@ def test_agent_tool_dispatch(mock_anthropic, tmp_path):
     assert last_msg["role"] == "user"
     assert len(last_msg["content"]) == 2 # 2 tool results
     
+    # call_1 is inspect_dataset, dispatched to wrappers with qc=. It should SUCCEED:
+    # the previous version of this test asserted is_error here, but that was the mocked
+    # saqc failing, not the dispatch working.
     t1_res = last_msg["content"][0]
     assert t1_res["type"] == "tool_result"
     assert t1_res["tool_use_id"] == "call_1"
-    assert t1_res["is_error"] is True
-    assert "Error executing inspect_dataset" in t1_res["content"]
+    assert "is_error" not in t1_res
+    assert json.loads(t1_res["content"])["tool"] == "inspect_dataset"
+
+    # call_2 is describe_point, which lives in context.py and is re-exported by wrappers.
+    # It observes only, so it returns a result without a qc object.
+    t2_res = last_msg["content"][1]
+    assert t2_res["tool_use_id"] == "call_2"
+    assert "is_error" not in t2_res
+    payload = json.loads(t2_res["content"])
+    assert payload["tool"] == "describe_point"
+    assert "reads_like" in payload

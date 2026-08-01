@@ -3,7 +3,8 @@
 Each function wraps a SaQC 2.8 method and returns the tool-result dict defined in
 CLAUDE.md §5. Utility (inspect_dataset, get_flag_summary, export_clean_data),
 detection (flag_range, flag_constants, flag_plateau, flag_spike_unilof, flag_zscore,
-flag_jumps, flag_nan), and action (impute_rolling) tools.
+flag_jumps, flag_nan), action (impute_rolling), and context (describe_point,
+describe_points -- thin pass-throughs to context.py, see §7.3) tools.
 
 NOTE: verify every SaQC method name/signature against the SaQC 2.8 API before use.
 
@@ -13,6 +14,7 @@ Implemented in Phase 2
 import pandas as pd
 import saqc
 
+from src.agent_tools import context
 from src.inspect_data import summarise_series, DATETIME_COL
 
 
@@ -76,13 +78,25 @@ def _build_result(
         pct_flagged = 0.0
         flagged_datetimes = []
 
+    # Rows flagged on this field by ANY call so far, not just this one. SaQC never
+    # re-flags a row a previous test already flagged, so `n_flagged` above counts only
+    # what THIS call added; without the running total, an agent that re-runs a detector
+    # with looser parameters cannot tell how much is flagged altogether (§7.1).
+    n_flagged_total = int((qc_output.flags[field] > 0).sum())
+
     msg = custom_msg or f"Flagged {n_flagged} values ({pct_flagged*100:.1f}%) using {tool_name}."
+    if custom_msg is None and n_flagged_total != n_flagged:
+        msg += (
+            f" These are rows not already flagged by an earlier call; "
+            f"{n_flagged_total} row(s) are now flagged on '{field}' in total."
+        )
 
     return {
         "tool": tool_name,
         "params": params,
         "n_flagged": n_flagged,
         "pct_flagged": pct_flagged,
+        "n_flagged_total": n_flagged_total,
         "flagged_datetimes": flagged_datetimes,
         "message": msg,
         "qc": qc_output  # Keep the qc object for the next steps
@@ -177,7 +191,7 @@ def flag_constants(qc: saqc.SaQC, field: str = "value", thresh=0.0, window=None,
     return _build_result("flag_constants", params, qc, qc_out, field)
 
 
-def flag_plateau(qc: saqc.SaQC, field: str = "value", min_length=None, max_length=None, min_jump=None, granularity=None) -> dict:
+def flag_plateau(qc: saqc.SaQC, field: str = "value", min_length="1h", max_length=None, min_jump=None, granularity=None) -> dict:
     """
     Flags a "plateau" - when the data suddenly jumps up, stays flat for a while, and then
     drops back down. This happens when debris gets stuck on the sensor temporarily.
@@ -192,7 +206,30 @@ def flag_plateau(qc: saqc.SaQC, field: str = "value", min_length=None, max_lengt
     if min_jump is not None: kwargs["min_jump"] = min_jump
     if granularity is not None: kwargs["granularity"] = granularity
 
-    qc_out = qc.flagPlateau(field, **kwargs)
+    # flagPlateau is the one §7 method that raises on perfectly ordinary input, and it
+    # is data-dependent rather than length-monotonic (§7.1): 'attempt to get argmin of
+    # an empty sequence' from _getAnomalyCenter, or a numpy window-shape error when the
+    # window outruns the array. One crashy detector must not sink the whole run, so the
+    # failure comes back as a normal result saying it found nothing and why.
+    try:
+        qc_out = qc.flagPlateau(field, **kwargs)
+    except ValueError as exc:
+        return {
+            "tool": "flag_plateau",
+            "params": params,
+            "n_flagged": 0,
+            "pct_flagged": 0.0,
+            "n_flagged_total": int((qc.flags[field] > 0).sum()),
+            "flagged_datetimes": [],
+            "message": (
+                f"flag_plateau could not run on this series and flagged nothing: {exc}. "
+                "This is a known SaQC 2.8 defect, not a statement about the data — it says "
+                "nothing about whether plateaus are present. Do not retry it with the same "
+                "parameters; rely on flag_constants for stuck-sensor detection instead."
+            ),
+            "failed": True,
+            "qc": qc,  # unchanged: nothing was flagged
+        }
     return _build_result("flag_plateau", params, qc, qc_out, field)
 
 
@@ -328,3 +365,73 @@ def impute_rolling(
     result["n_gaps_skipped_large"] = len(too_large_runs)
     result["gaps_summary"]         = gaps_summary
     return result
+
+
+# ---------------------------------------------------------------------------
+# Context tools (CLAUDE.md §7.3)
+#
+# Thin pass-throughs to src/agent_tools/context.py. The measurement lives there;
+# these exist so every tool the agent can call is reachable from one module with
+# one calling convention -- `qc` first, like every wrapper above. They OBSERVE:
+# nothing here flags or mutates, so the results carry no `qc` key and the caller's
+# SaQC object is unchanged (`inspect_dataset` sets that precedent in §5).
+#
+# Only the two aggregators are wrapped. The eight primitives behind them stay
+# library functions: nine near-identical tools would eat the 25-call cap, and
+# describe_point already returns all of them at once.
+# ---------------------------------------------------------------------------
+
+def describe_point(
+    qc: saqc.SaQC,
+    at: str,
+    field: str = "value",
+    n_before: int = 8,
+    n_after: int = 8,
+    window: str = "6h",
+    shift_window: str = "24h",
+) -> dict:
+    """Measure the shape of the series around ONE timestamp.
+
+    Answers the question a detector cannot: is this excursion real water or a
+    sensor artifact? Returns the eight nested measurement blocks from
+    :mod:`src.agent_tools.context` (slope, excursion, recovery, level_shift,
+    flatness, neighbourhood, gap, history) plus a ``reads_like`` hint.
+
+    Raises ValueError if *at* is not a timestamp in the series -- deliberately,
+    rather than rounding silently to a neighbour (§13).
+    """
+    return context.describe_point(
+        qc,
+        at,
+        field=field,
+        n_before=n_before,
+        n_after=n_after,
+        window=window,
+        shift_window=shift_window,
+    )
+
+
+def describe_points(
+    qc: saqc.SaQC,
+    ats: list[str],
+    field: str = "value",
+    max_points: int = 20,
+    window: str = "6h",
+) -> dict:
+    """Compact shape measurements for a LIST of timestamps -- e.g. a detector's output.
+
+    One row per timestamp (value, reads_like, robust_z, width_samples,
+    peak_sharpness, fall_rise_ratio, samples_to_recover, recovered) plus a tally
+    by label, so a whole detector result can be judged in a single call.
+
+    Timestamps beyond *max_points* are reported in ``n_truncated`` rather than
+    dropped silently; unresolvable ones land in ``errors`` instead of raising, so
+    one bad timestamp cannot sink the batch.
+    """
+    return context.describe_points(
+        qc,
+        ats,
+        field=field,
+        max_points=max_points,
+        window=window,
+    )
