@@ -95,6 +95,7 @@ deployment, Docker, CI beyond a basic test run).
 │   └── workbench/        # HUMAN-facing: run by a person; CLI/HTML/plot output
 │       ├── visualize.py  # series/overview plots
 │       ├── visualize_injected.py # plot injected datasets with anomaly labels
+│       ├── visualize_log.py # replay one logs/*.jsonl run: flags per iteration (§8)
 │       ├── param_sweep.py # sweep one param, score vs labels, plot (§7.2)
 │       ├── candidates.py # propose anomalies in a "clean" series for review (§9.1)
 │       └── review.py     # keyboard-driven labelling page + merge back to labels (§9.1)
@@ -227,7 +228,7 @@ Detection:
 | ------------------- | ---------------- | ---------------------------------------------------------- |
 | `flag_range`        | `flagRange`      | `min`, `max` (both default `None`)                          |
 | `flag_constants`    | `flagConstants`  | `thresh`, `window`, `min_periods=2` — both required          |
-| `flag_plateau`      | `flagPlateau`    | `min_length`, `max_length`, `min_jump`, `granularity`        |
+| `flag_plateau`      | `flagPlateau`    | `min_length` **required by SaQC** (wrapper defaults `'1h'`), `max_length`, `min_jump`, `granularity` |
 | `flag_spike_unilof` | `flagUniLOF`     | `n=20`, `thresh=None`, `density='auto'`, `slope_correct=True`|
 | `flag_zscore`       | `flagZScore`     | `method='standard'\|'modified'`, `window`, `thresh=3`        |
 | `flag_jumps`        | `flagJumps`      | `thresh`, `window` — both required                           |
@@ -235,6 +236,9 @@ Detection:
 
 Action: `impute_rolling` (`interpolateByRolling`; `window` required, `func='median'`,
 `min_periods=0`). There is no `correct_drift` wrapper — drift is removed (§9.2).
+
+Context: `describe_point`, `describe_points` — thin pass-throughs in `wrappers.py` to the
+§7.3 measurements. They observe only: no `qc` key in the result, caller's SaQC unchanged.
 
 `flag_plateau` is an addition the probe justified: `flagConstants` and `flagPlateau`
 detect **different** things and we want both (§7.1).
@@ -272,6 +276,15 @@ Probed via `scratchpad/probe_plateau_cost.py` on real turbidity:
   fails, the pool respawns forever, and it looks exactly like a hang — that cost an hour.
   **Run anything that touches `flagPlateau` from a real file or `python -m`.** From a file it
   is fast: 3.35 s on 21k rows.
+- `min_length` is **required** — omitting it raises `TypeError: missing a required argument`
+  before SaQC runs at all, so the wrapper defaults it to `'1h'` (§7.2) rather than `None`.
+- Short series raise a *second* `ValueError` (`window shape cannot be larger than input array
+  shape`, from numpy's stride tricks) — a 100-row toy series with `max_length='2h'` trips it.
+- **The guard is now implemented** (2026-07-31): `flag_plateau` catches `ValueError` and
+  returns a normal result dict with `n_flagged=0`, `failed=True`, the exception text, and the
+  **unchanged** `qc`. It had been promised in this file and in the tool schema for a while but
+  never written, so every crash reached the agent as a raw exception.
+  `tests/test_tools.py::test_flag_plateau_survives_its_own_crash` holds the line.
 
 **`flagZScore(method='modified')` needs `min_residuals` on quantised data.** In a window
 where the MAD is ~0, any wiggle scores an enormous modified z, so `thresh` stops doing
@@ -294,6 +307,23 @@ an existing flag, so diffing successive flag frames **undercounts** — a row bo
 attributed only to the first. For the §5 `flagged_datetimes` contract and `get_flag_summary`,
 read `qc._flags.history[field]`, whose `.hist` has one column per applied test and whose
 `.meta` carries each test's `func` name.
+
+**Flagging is additive: a re-run cannot un-flag, and its count is only what it added**
+(2026-07-31, measured on `03447687_l2`, first 8000 rows; the agent re-tunes detectors at run
+time (§8), so this governs what it can and cannot do).
+
+- A stricter second call **takes nothing back**. `flagUniLOF` at `thresh=1.1` (78 rows) then
+  at `thresh=3.0` leaves all 78 flagged and reports **0 new**. Tightening is not an undo, so
+  an agent must **start strict and loosen**; an over-flagged segment can only be handled with
+  a `"keep"` decision in the §5 flag log, never by re-running.
+- A re-run reports **only the rows it added**, since SaQC never re-flags an already-flagged
+  row. `_build_result` therefore also returns **`n_flagged_total`** — the union for that field
+  — and appends it to the message when the two differ. Compare *that* against the §9 sparsity
+  prior, not the per-call count.
+- A re-run is **not equivalent to a fresh run** at the new parameters: already-flagged rows
+  are filtered out of the input for later tests (SaQC's `dfilter`), so strict→loose ended at
+  70 flagged rows where a single loose run finds 78. Never report a re-run's count as what
+  that parameter would have found alone.
 
 **Index requirements.** The index **must be monotonic** — unsorted raises
 `ValueError: index values must be monotonic`, so sort on load. An **irregular** index is
@@ -396,6 +426,26 @@ The system prompt (in `src/agent.py`, versioned in git — commit changes with a
 the agent's role, the golden rules, the tool list, and that it must justify each action.
 Use the Anthropic Messages API multi-turn tool-use pattern (assistant emits tool_use →
 we run the tool → we return tool_result → loop).
+
+**Adaptive thinking is ON** (`thinking={"type": "adaptive"}`, 2026-08-01). Without it the
+log records only the prose the model writes for the reader, not its reasoning, and
+`src/workbench/visualize_log.py` has an empty thinking panel. Four things this pins down:
+
+- **Adaptive, never a fixed `budget_tokens`.** The fixed-budget form is deprecated on
+  `claude-sonnet-4-6` and *removed* (400) on 4.7 and later. Adaptive also enables
+  **interleaved** thinking automatically — the agent reasons *between* tool calls, which is
+  what makes the per-iteration trace worth reading. No beta header.
+- **`display` is deliberately unset.** It defaults to `summarized` on 4.6 and the parameter
+  only arrived with 4.7. If `MODEL` ever moves to 4.7+ the default flips to `omitted` and
+  the thinking text comes back **empty** — pass `display="summarized"` at the same time.
+- **`max_tokens` caps thinking + response together**, so it was raised 4096 → 16000. A run
+  that truncates mid-report is the symptom of setting this too low.
+- **Thinking blocks must be returned to the API unchanged** on the next turn. `agent.py`
+  appends the whole `response.content`, which is already correct — do not "optimise" it into
+  extracting just the text blocks, or the next request errors.
+
+The model id is a §2 golden rule and lives in one place, `agent.py::MODEL`. It had drifted to
+`claude-3-5-sonnet-20240620`, which predates adaptive thinking; that is fixed.
 
 ---
 

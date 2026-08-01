@@ -41,3 +41,7 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# Agent run artefacts (cleaned CSV + report). Regenerable by re-running the
+# agent; the JSONL log they came from is gitignored above.
+data/agent_runs/
