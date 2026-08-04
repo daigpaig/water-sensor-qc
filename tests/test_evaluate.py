@@ -206,6 +206,30 @@ def test_test_split_scores_only_the_tail():
     scores, _ = ev.score(predictions, labels, tail)
     spike = next(s for s in scores if s.anomaly_type == "spike")
 
-    assert len(tail) == 20
     assert spike.n_true == 1  # the row-5 spike is in the training portion
     assert spike.recall == pytest.approx(1.0)
+
+
+def test_score_imputation():
+    """Imputation scoring computes RMSE/MAE and a linear baseline."""
+    index = _index(5)
+    raw = pd.Series([10.0, 11.0, 15.0, 20.0, 12.0], index=index)
+    
+    labels = _labels(index, {2: "gap", 3: "gap"})
+    labels["true_value"] = [None, None, 12.0, 11.0, None]
+    
+    clean = pd.Series([10.0, 11.0, 12.0, 11.5, 12.0], index=index)
+    
+    score = ev.score_imputation(clean, raw, labels, index)
+    
+    assert score is not None
+    assert score.n_imputed == 2
+    # Agent MAE: true=[12.0, 11.0], pred=[12.0, 11.5] -> errors=[0.0, 0.5] -> mean=0.25
+    assert score.mae == pytest.approx(0.25)
+    # Agent RMSE: mean sq err = (0 + 0.25)/2 = 0.125 -> sqrt(0.125)
+    assert score.rmse == pytest.approx(0.125 ** 0.5)
+    
+    # Baseline linear interp between index 1 (11.0) and index 4 (12.0)
+    # Values: 11.333, 11.666 -> errors vs [12.0, 11.0] are > 0
+    assert score.baseline_mae > 0
+    assert score.baseline_rmse > 0

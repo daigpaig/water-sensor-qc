@@ -138,6 +138,41 @@ PYTHONPATH=. pytest tests/test_tools.py -v     # requires saqc==2.8 installed
 
 ---
 
+## Phase 3: Agent (CLI)
+
+The agent runs an autonomous ReAct loop on a dataset, deciding which tools to call, inspecting results, and deciding whether to keep or delete data. It tracks token usage and outputs the final cleaned CSV, decision flags, and a text report.
+
+```bash
+# Run the agent on a dataset (requires ANTHROPIC_API_KEY in .env)
+PYTHONPATH=. python -m src.agent data/injected/03447687/l1/03447687_l1.csv
+
+# View the tests for the agent loop and token tracking
+PYTHONPATH=. pytest tests/test_agent.py -v
+```
+
+---
+
+## Phase 4: Evaluation
+
+We evaluate the agent's performance by scoring its anomaly detection (F1) and gap imputation (RMSE/MAE) against synthetic labels.
+
+```bash
+# Score a specific agent run's log against the dataset
+PYTHONPATH=. python -m src.evaluate data/injected/03447687/l1/03447687_l1.csv \
+    --log logs/run_20260801_131008.jsonl \
+    --decisions data/injected/03447687/l1/03447687_l1_flags.json \
+    --clean data/injected/03447687/l1/03447687_l1_clean.csv
+
+# Run the fixed-pipeline "dumb" SaQC baseline for comparison
+PYTHONPATH=. python -m src.evaluate data/injected/03447687/l1/03447687_l1.csv --baseline
+
+# Run an ablation study (disabling specific tools)
+PYTHONPATH=. python -m src.workbench.ablation data/injected/03447687/l1/03447687_l1.csv \
+    --disable flag_spike_unilof impute_rolling
+```
+
+---
+
 ## Project layout
 
 ```
@@ -155,7 +190,7 @@ PYTHONPATH=. pytest tests/test_tools.py -v     # requires saqc==2.8 installed
 │       └── <gauge>/l<level>/   #   <name>.csv + <name>_labels.csv + <name>_manifest.json
 ├── src/                        # grouped by audience (CLAUDE.md §4)
 │   ├── inspect_data.py         # load, validate contracts, summarise — shared foundation
-│   ├── evaluate.py             # metrics, fixed-pipeline baseline, ablation  [stub]
+│   ├── evaluate.py             # metrics, fixed-pipeline baseline, ablation
 │   ├── agent.py                # ReAct loop + API logger
 │   ├── datasets/               # writes everything under data/
 │   │   ├── pull_usgs.py        # download APPROVED turbidity from USGS NWIS
@@ -169,7 +204,8 @@ PYTHONPATH=. pytest tests/test_tools.py -v     # requires saqc==2.8 installed
 │       ├── visualize_injected.py  # plot injected datasets with anomaly labels
 │       ├── param_sweep.py      # sweep one param, score vs labels (§7.2)
 │       ├── candidates.py       # propose candidate anomalies for human review
-│       └── review.py           # keyboard-driven HTML review + label merge
+│       ├── review.py           # keyboard-driven HTML review + label merge
+│       └── ablation.py         # run agent with disabled tools for ablation studies
 ├── app/
 │   └── streamlit_app.py        # Streamlit UI                                 [stub]
 ├── scratchpad/                 # one-off probe/tune scripts (not imported)
@@ -182,6 +218,7 @@ PYTHONPATH=. pytest tests/test_tools.py -v     # requires saqc==2.8 installed
 │   ├── test_pull_comparison.py
 │   ├── test_candidates.py
 │   ├── test_visualize_injected.py
+│   ├── test_evaluate.py
 │   └── test_agent.py           # ReAct loop + tool dispatch tests
 └── logs/                       # JSONL API logs (gitignored)
 ```
@@ -194,6 +231,6 @@ The project is built phase by phase:
 - [x] Phase 1 — Data + injection
 - [x] Phase 2 — Tools
 - [ ] Phase 3 — Agent (CLI)
-- [ ] Phase 4 — Evaluation
+- [x] Phase 4 — Evaluation
 - [ ] Phase 5 — UI
 - [ ] Phase 6 — Polish

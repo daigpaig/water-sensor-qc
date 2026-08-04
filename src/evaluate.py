@@ -65,8 +65,10 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
-from sklearn.metrics import precision_recall_fscore_support
+from sklearn.metrics import precision_recall_fscore_support, mean_squared_error, mean_absolute_error
+import saqc
 
 from src.inspect_data import DATETIME_COL
 
@@ -120,6 +122,16 @@ class TypeScore:
     precision: float
     recall: float
     f1: float
+
+
+@dataclass(frozen=True)
+class ImputationScore:
+    """Error metrics for imputed values."""
+    rmse: float
+    mae: float
+    baseline_rmse: float
+    baseline_mae: float
+    n_imputed: int
 
 
 # --------------------------------------------------------------------------- inputs
@@ -280,6 +292,149 @@ def score(
     return scores, macro_f1
 
 
+def score_imputation(
+    clean_series: pd.Series,
+    raw_series: pd.Series,
+    labels: pd.DataFrame,
+    index: pd.DatetimeIndex,
+) -> ImputationScore | None:
+    """Compute RMSE and MAE for imputed gaps vs the known true values,
+    compared to a simple linear-interpolation baseline.
+    """
+    clean = clean_series.reindex(index)
+    raw = raw_series.reindex(index)
+    lbl = labels.set_index(DATETIME_COL).reindex(index)
+
+    # We only score rows that were synthetically injected (so we have a true_value)
+    mask = (lbl["source"] == "injected") & lbl["true_value"].notna()
+    if not mask.any():
+        return None
+
+    y_true = lbl.loc[mask, "true_value"].astype(float)
+    y_pred = clean.loc[mask].astype(float)
+
+    # Compute a simple linear interpolation baseline on the same masked gaps
+    baseline_input = raw.copy()
+    baseline_input.loc[mask] = np.nan
+    baseline_pred = baseline_input.interpolate(method="linear").loc[mask].astype(float)
+
+    # Only score rows where the agent actually imputed a value
+    # (if they left it NaN, the error is technically infinite)
+    valid = y_pred.notna() & baseline_pred.notna()
+    if not valid.any():
+        return None
+
+    y_true_v = y_true[valid]
+    y_pred_v = y_pred[valid]
+    base_pred_v = baseline_pred[valid]
+
+    return ImputationScore(
+        rmse=float(mean_squared_error(y_true_v, y_pred_v)) ** 0.5,
+        mae=float(mean_absolute_error(y_true_v, y_pred_v)),
+        baseline_rmse=float(mean_squared_error(y_true_v, base_pred_v)) ** 0.5,
+        baseline_mae=float(mean_absolute_error(y_true_v, base_pred_v)),
+        n_imputed=int(valid.sum()),
+    )
+
+
+def baseline_predictions(series: pd.Series) -> dict[str, set]:
+    """Run a fixed sequence of SaQC methods as a dumb baseline.
+    
+    The agent should beat this ruleset. If it doesn't, we need to explain why.
+    """
+    df = series.to_frame(name="value")
+    qc = saqc.SaQC(df)
+    
+    # Same default parameters as a standard pipeline
+    qc = qc.flagRange("value", min=0, max=2000)
+    qc = qc.flagUniLOF("value", n=20, thresh=1.5)
+    qc = qc.flagConstants("value", window="6h", thresh=0.001)
+    qc = qc.flagJumps("value", thresh=5, window="1h")
+    qc = qc.flagNAN("value")
+    
+    return predictions_from_qc(qc)
+
+
+def format_imputation(score: ImputationScore | None) -> str:
+    """Render imputation metrics as a plain-text comparison."""
+    if score is None:
+        return "Imputation: No labelled synthetic gaps found to score."
+    
+    lines = [
+        "Imputation Error (vs True Value)",
+        "-" * 45,
+        f"Rows imputed   : {score.n_imputed:>6,}",
+        "",
+        f"               {'Agent':>10} {'Linear Base':>14}",
+        f"RMSE           : {score.rmse:>10.3f} {score.baseline_rmse:>14.3f}",
+        f"MAE            : {score.mae:>10.3f} {score.baseline_mae:>14.3f}",
+    ]
+    return "\n".join(lines)
+
+
+def report_decisions(
+    decisions: dict[pd.Timestamp, str],
+    labels: pd.DataFrame,
+    index: pd.DatetimeIndex,
+) -> str:
+    """Provide a detailed breakdown of agent decisions vs known true labels."""
+    lbl = labels.set_index(DATETIME_COL).reindex(index)
+    
+    lines = [
+        "Decision Quality Breakdown",
+        "-" * 60,
+    ]
+    
+    # We only care about rows the agent acted on (or kept)
+    decision_rows = lbl.loc[lbl.index.isin(decisions.keys())].copy()
+    if decision_rows.empty:
+        return "\n".join(lines) + "\nNo decisions recorded in this slice."
+        
+    correct_actions = 0
+    total_actions = len(decision_rows)
+    
+    # Tally up
+    for ts, row in decision_rows.iterrows():
+        action = decisions[ts]
+        is_anomaly = bool(row["is_anomaly"])
+        anomaly_type = str(row["anomaly_type"]) if is_anomaly else "real water"
+        
+        # Simple heuristic for correct action:
+        # If it's real water, it MUST be kept.
+        # If it's an anomaly, it should be deleted/corrected/imputed.
+        if not is_anomaly and action == "keep":
+            correct_actions += 1
+        elif is_anomaly and action in POSITIVE_ACTIONS:
+            correct_actions += 1
+            
+    lines.append(f"Total flags decided: {total_actions:,}")
+    lines.append(f"Correct decisions  : {correct_actions:,} ({correct_actions/total_actions*100:.1f}%)")
+    lines.append("")
+    
+    # Add a confusion matrix of (Is Anomaly) x (Action Taken)
+    lines.append(f"{'Action':<10} | {'On Anomaly (TP/FN)':<20} | {'On Real Water (FP/TN)':<20}")
+    lines.append("-" * 60)
+    
+    for action in ["delete", "correct", "impute", "keep", "other"]:
+        if action == "other":
+            mask = ~decision_rows.index.map(lambda t: decisions[t] in ["delete", "correct", "impute", "keep"])
+        else:
+            mask = decision_rows.index.map(lambda t: decisions[t] == action)
+            
+        if not mask.any():
+            continue
+            
+        on_anomaly = (mask & (decision_rows["is_anomaly"] == True)).sum()
+        on_real = (mask & (decision_rows["is_anomaly"] == False)).sum()
+        
+        label_a = "TP" if action in POSITIVE_ACTIONS else "FN"
+        label_r = "FP" if action in POSITIVE_ACTIONS else "TN"
+        
+        lines.append(f"{action:<10} | {on_anomaly:>6,} {label_a:<13} | {on_real:>6,} {label_r:<13}")
+        
+    return "\n".join(lines)
+
+
 def format_table(scores: list[TypeScore], macro_f1: float, scored_decisions: bool = False) -> str:
     """Render the scores as a plain-text table, with the §10 caveats attached."""
     mode = (
@@ -343,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("series", type=Path, help="Dataset CSV; labels are read from beside it.")
     parser.add_argument(
-        "--log", type=Path, required=True,
+        "--log", type=Path,
         help="Agent run log (logs/run_*.jsonl) whose flags should be scored.",
     )
     parser.add_argument(
@@ -354,10 +509,21 @@ def main(argv: list[str] | None = None) -> int:
              "measure of the agent.",
     )
     parser.add_argument(
+        "--clean", type=Path,
+        help="The agent's output CSV (*_clean.csv). Triggers imputation scoring.",
+    )
+    parser.add_argument(
+        "--baseline", action="store_true",
+        help="Compute and compare against a fixed-pipeline SaQC baseline.",
+    )
+    parser.add_argument(
         "--split", choices=["all", "test"], default="all",
         help="'test' scores only the held-out last 20%% (§10). Default: the whole series.",
     )
     args = parser.parse_args(argv)
+
+    if not args.log and not args.baseline:
+        parser.error("Must provide --log to score an agent run, or --baseline to score the baseline.")
 
     series = pd.read_csv(args.series, parse_dates=[DATETIME_COL]).sort_values(DATETIME_COL)
     index = pd.DatetimeIndex(series[DATETIME_COL])
@@ -365,16 +531,37 @@ def main(argv: list[str] | None = None) -> int:
         index = index[int(len(index) * (1 - TEST_FRACTION)):]
 
     labels = load_labels(args.series)
-    predictions = predictions_from_log(args.log)
-    decisions = load_decisions(args.decisions) if args.decisions else None
-    scores, macro_f1 = score(predictions, labels, index, decisions=decisions)
+    
+    if args.log:
+        predictions = predictions_from_log(args.log)
+        decisions = load_decisions(args.decisions) if args.decisions else None
+        scores, macro_f1 = score(predictions, labels, index, decisions=decisions)
 
-    print(f"series : {args.series.name}  ({len(index):,} rows scored, split={args.split})")
-    print(f"log    : {args.log.name}")
-    if decisions is not None:
-        print(f"flags  : {args.decisions.name}  ({len(decisions):,} decided rows)")
-    print()
-    print(format_table(scores, macro_f1, scored_decisions=decisions is not None))
+        print(f"series : {args.series.name}  ({len(index):,} rows scored, split={args.split})")
+        print(f"log    : {args.log.name}")
+        if decisions is not None:
+            print(f"flags  : {args.decisions.name}  ({len(decisions):,} decided rows)")
+        print()
+        print(format_table(scores, macro_f1, scored_decisions=decisions is not None))
+        
+        if decisions is not None:
+            print("\n" + report_decisions(decisions, labels, index))
+            
+        if args.clean:
+            clean_df = pd.read_csv(args.clean, parse_dates=[DATETIME_COL]).sort_values(DATETIME_COL)
+            clean_series = clean_df.set_index(DATETIME_COL)["value"]
+            raw_series = series.set_index(DATETIME_COL)["value"]
+            imp_score = score_imputation(clean_series, raw_series, labels, index)
+            print("\n" + format_imputation(imp_score))
+            
+    if args.baseline:
+        print("\n" + "=" * 60)
+        print("FIXED-PIPELINE BASELINE")
+        print("=" * 60)
+        base_preds = baseline_predictions(series.set_index(DATETIME_COL)["value"])
+        base_scores, base_f1 = score(base_preds, labels, index, decisions=None)
+        print(format_table(base_scores, base_f1, scored_decisions=False))
+
     return 0
 
 
