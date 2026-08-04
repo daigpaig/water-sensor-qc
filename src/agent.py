@@ -6,11 +6,22 @@ src/agent_tools/wrappers.py, and logs every API call to logs/*.jsonl. The versio
 system prompt lives here. See CLAUDE.md §8.
 
 Implemented in Phase 3 (see CLAUDE.md §12).
+
+CLI
+---
+    # run the agent on an injected dataset
+    python -m src.agent data/injected/03447687/l2/03447687_l2.csv
+
+    # specify an output directory (default: beside the input file)
+    python -m src.agent data/injected/03447687/l2/03447687_l2.csv --output-dir results/
 """
 
+import argparse
 import json
 import datetime
 import os
+import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import anthropic
@@ -33,6 +44,21 @@ MODEL = "claude-sonnet-4-6"
 # §8 report is long, and adaptive thinking now spends from the same budget. 4096
 # was enough before thinking was enabled and is not now.
 MAX_TOKENS = 16000
+
+# Sonnet 4.6 pricing (USD per million tokens) — update if the model changes.
+_COST_PER_M_INPUT = 3.0
+_COST_PER_M_OUTPUT = 15.0
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    """Token usage and cost for a completed agent run."""
+
+    steps: int
+    input_tokens: int
+    output_tokens: int
+    est_cost_usd: float
+    log_path: str
 
 SYSTEM_PROMPT = """
 You are a quality-control (QC) analyst for continuous water-quality sensor time series.
@@ -488,14 +514,19 @@ def _get_tool_function(tool_name: str):
     raise ValueError(f"Tool {tool_name} not found in wrappers or context.")
 
 
-def run_agent(qc: saqc.SaQC, max_steps: int = 25, log_dir: str = "logs") -> tuple[saqc.SaQC, pd.DataFrame | None, str]:
+def run_agent(
+    qc: saqc.SaQC,
+    max_steps: int = 25,
+    log_dir: str = "logs",
+) -> tuple[saqc.SaQC, pd.DataFrame | None, str, RunSummary]:
     """Runs the ReAct loop to perform quality control on a SaQC object.
-    
+
     Returns:
         tuple containing:
             - The final, mutated SaQC object
             - The cleaned DataFrame (if export_clean_data was called), otherwise None
             - The final plain text report from the agent
+            - A :class:`RunSummary` with token counts and estimated cost
     """
     # §2 golden rule: the key comes from .env, never from source. load_dotenv does
     # not overwrite a variable already exported in the shell, so an explicitly set
@@ -506,29 +537,34 @@ def run_agent(qc: saqc.SaQC, max_steps: int = 25, log_dir: str = "logs") -> tupl
             "ANTHROPIC_API_KEY is not set. Put it in .env (see .env.example)."
         )
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    
+
     messages = [
         {"role": "user", "content": "Please perform quality control on this dataset."}
     ]
-    
+
     log_dir_path = Path(log_dir)
     log_dir_path.mkdir(exist_ok=True, parents=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = log_dir_path / f"run_{timestamp}.jsonl"
-    
+
     def _log_event(event: dict):
         with open(log_path, "a") as f:
             f.write(json.dumps(event, default=str) + "\n")
-            
+
     _log_event({"event": "system_prompt", "content": SYSTEM_PROMPT, "version": SYSTEM_PROMPT_VERSION})
-    
+
     current_qc = qc
     clean_df = None
     final_report = ""
-    
+
+    # ---- token tracking (B3) ------------------------------------------------
+    total_input_tokens = 0
+    total_output_tokens = 0
+    completed_steps = 0
+
     for step in range(max_steps):
         _log_event({"event": "api_call", "step": step, "messages": messages})
-        
+
         response = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
@@ -547,13 +583,19 @@ def run_agent(qc: saqc.SaQC, max_steps: int = 25, log_dir: str = "logs") -> tupl
             messages=messages,
             tools=TOOL_SCHEMAS,
         )
-        
+
         # log the raw response but convert it to dict for jsonl
         _log_event({"event": "api_response", "step": step, "response": response.model_dump()})
-        
+
+        # Accumulate token usage from each API call
+        if hasattr(response, "usage") and response.usage is not None:
+            total_input_tokens += getattr(response.usage, "input_tokens", 0)
+            total_output_tokens += getattr(response.usage, "output_tokens", 0)
+        completed_steps = step + 1
+
         # Append the assistant's response to the conversation history
         messages.append({"role": "assistant", "content": response.content})
-        
+
         if response.stop_reason == "tool_use":
             # Extract tool calls
             tool_results = []
@@ -561,10 +603,10 @@ def run_agent(qc: saqc.SaQC, max_steps: int = 25, log_dir: str = "logs") -> tupl
                 if block.type == "tool_use":
                     tool_name = block.name
                     tool_args = block.input
-                    
+
                     try:
                         func = _get_tool_function(tool_name)
-                        
+
                         # Decide how to pass the data object based on where the function lives
                         if hasattr(wrappers, tool_name):
                             # wrappers mutate qc and take qc=
@@ -578,14 +620,14 @@ def run_agent(qc: saqc.SaQC, max_steps: int = 25, log_dir: str = "logs") -> tupl
                             result = func(source=current_qc, **tool_args)
                         else:
                             raise ValueError(f"Unknown tool: {tool_name}")
-                            
+
                         # Format the success result
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
                             "content": json.dumps(result)
                         })
-                        
+
                     except Exception as e:
                         # Feed the error back to the model
                         tool_results.append({
@@ -594,10 +636,10 @@ def run_agent(qc: saqc.SaQC, max_steps: int = 25, log_dir: str = "logs") -> tupl
                             "content": f"Error executing {tool_name}: {str(e)}",
                             "is_error": True
                         })
-            
+
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
-                
+
         elif response.stop_reason in ("end_turn", "stop_sequence"):
             # Agent finished its reasoning and text generation
             # Find the text content for the final report
@@ -605,10 +647,135 @@ def run_agent(qc: saqc.SaQC, max_steps: int = 25, log_dir: str = "logs") -> tupl
                 if block.type == "text":
                     final_report += block.text + "\n"
             break
-            
+
     else:
         # Reached max_steps without breaking
         _log_event({"event": "max_steps_reached", "step": max_steps})
         final_report = "Agent reached the maximum tool call limit before completing."
 
-    return current_qc, clean_df, final_report
+    # ---- run summary --------------------------------------------------------
+    est_cost = (
+        total_input_tokens * _COST_PER_M_INPUT / 1_000_000
+        + total_output_tokens * _COST_PER_M_OUTPUT / 1_000_000
+    )
+    summary = RunSummary(
+        steps=completed_steps,
+        input_tokens=total_input_tokens,
+        output_tokens=total_output_tokens,
+        est_cost_usd=round(est_cost, 4),
+        log_path=str(log_path),
+    )
+    _log_event({"event": "run_summary", **asdict(summary)})
+
+    return current_qc, clean_df, final_report, summary
+
+
+# --------------------------------------------------------------------------- CLI
+def _build_flags_json(
+    clean_df: pd.DataFrame | None,
+) -> list[dict]:
+    """Build the §5 flag log from the cleaned DataFrame.
+
+    Each row with a non-null ``flag`` column becomes one entry:
+    ``{datetime, flagged_by, action, reason}``.
+    The full action/reason structure depends on the agent's report, which is
+    unstructured text.  For now we record ``flagged_by`` (the tool name from the
+    ``flag`` column) and leave ``action``/``reason`` as placeholders that the
+    agent's report can be parsed into later.
+    """
+    if clean_df is None:
+        return []
+    entries: list[dict] = []
+    for _, row in clean_df.iterrows():
+        if pd.notna(row.get("flag")):
+            dt = row.get("datetime", row.name)
+            entries.append({
+                "datetime": str(dt),
+                "flagged_by": str(row["flag"]),
+                "action": "flag",
+                "reason": "",
+            })
+    return entries
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint: run the agent on a dataset and write output files."""
+    parser = argparse.ArgumentParser(
+        description="Run the QC agent on a water-quality time series.",
+    )
+    parser.add_argument(
+        "series", type=Path,
+        help="Path to the dataset CSV (must have datetime + value columns).",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=None,
+        help="Directory for output files. Default: same directory as the input CSV.",
+    )
+    parser.add_argument(
+        "--max-steps", type=int, default=25,
+        help="Maximum tool calls the agent may make (default: 25).",
+    )
+    parser.add_argument(
+        "--log-dir", type=str, default="logs",
+        help="Directory for JSONL run logs (default: logs/).",
+    )
+    args = parser.parse_args(argv)
+
+    # Resolve output directory
+    out_dir = args.output_dir or args.series.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = args.series.stem
+
+    # Load the series and create a SaQC object
+    from src.inspect_data import load_series  # local import to avoid circular
+    df = load_series(args.series)
+    data = df.set_index("datetime")
+    qc = saqc.SaQC(data)
+
+    print(f"Running agent on {args.series.name} ({len(df):,} rows)...", file=sys.stderr)
+
+    final_qc, clean_df, report, run_summary = run_agent(
+        qc, max_steps=args.max_steps, log_dir=args.log_dir,
+    )
+
+    # ---- write output files -------------------------------------------------
+    # 1. Cleaned CSV (§5 contract: datetime, value, flag)
+    clean_path = out_dir / f"{stem}_clean.csv"
+    if clean_df is not None:
+        out = clean_df.copy()
+        if out.index.name == "datetime" or "datetime" not in out.columns:
+            out = out.reset_index()
+        out.to_csv(clean_path, index=False)
+    else:
+        # Agent never called export_clean_data — write original with empty flag
+        fallback = df.copy()
+        fallback["flag"] = None
+        fallback.to_csv(clean_path, index=False)
+    print(f"  clean  -> {clean_path}", file=sys.stderr)
+
+    # 2. Flag log JSON (§5 contract)
+    flags_path = out_dir / f"{stem}_flags.json"
+    flags = _build_flags_json(clean_df)
+    flags_path.write_text(json.dumps(flags, indent=2, default=str))
+    print(f"  flags  -> {flags_path}  ({len(flags):,} entries)", file=sys.stderr)
+
+    # 3. Plain-language report
+    report_path = out_dir / f"{stem}_report.txt"
+    report_path.write_text(report)
+    print(f"  report -> {report_path}", file=sys.stderr)
+
+    # ---- token/cost summary to stderr ---------------------------------------
+    print(
+        f"\n[run_summary] {run_summary.steps} steps · "
+        f"{run_summary.input_tokens:,} in / {run_summary.output_tokens:,} out · "
+        f"~${run_summary.est_cost_usd:.2f} "
+        f"({MODEL} @ ${_COST_PER_M_INPUT}/${_COST_PER_M_OUTPUT} per M)",
+        file=sys.stderr,
+    )
+    print(f"  log    -> {run_summary.log_path}", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
