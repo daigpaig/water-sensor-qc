@@ -173,6 +173,24 @@ PYTHONPATH=. python -m src.workbench.ablation data/injected/03447687/l1/03447687
 
 ---
 
+## Phase 5: Streamlit UI
+
+Run the interactive web application to perform data QC without writing any code:
+
+```bash
+PYTHONPATH=. streamlit run app/streamlit_app.py
+```
+
+This will launch a browser window where you can:
+1. Upload a CSV time series
+2. Preview the summary statistics
+3. Run the Agent (using your API key or checking "Mock Mode" if you don't have one)
+4. View an interactive Plotly visualization of flagged anomalies
+5. Download the clean dataset and the JSON flag log
+
+
+---
+
 ## Project layout
 
 ```
@@ -207,7 +225,7 @@ PYTHONPATH=. python -m src.workbench.ablation data/injected/03447687/l1/03447687
 │       ├── review.py           # keyboard-driven HTML review + label merge
 │       └── ablation.py         # run agent with disabled tools for ablation studies
 ├── app/
-│   └── streamlit_app.py        # Streamlit UI                                 [stub]
+│   └── streamlit_app.py        # Streamlit UI
 ├── scratchpad/                 # one-off probe/tune scripts (not imported)
 ├── tests/
 │   ├── test_inspect_data.py
@@ -232,5 +250,6 @@ The project is built phase by phase:
 - [x] Phase 2 — Tools
 - [ ] Phase 3 — Agent (CLI)
 - [x] Phase 4 — Evaluation
-- [ ] Phase 5 — UI
-- [ ] Phase 6 — Polish
+- [x] Phase 5 — UI
+- [x] Phase 6 — Polish
+
