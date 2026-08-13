@@ -11,11 +11,15 @@ NOTE: verify every SaQC method name/signature against the SaQC 2.8 API before us
 Implemented in Phase 2
 """
 
+import json
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
 import saqc
 
 from src.agent_tools import context
-from src.inspect_data import summarise_series, DATETIME_COL
+from src.inspect_data import summarise_series, DATETIME_COL, ANOMALY_TYPES
 
 
 def _find_nan_runs(series: pd.Series) -> list[dict]:
@@ -46,6 +50,38 @@ def _find_nan_runs(series: pd.Series) -> list[dict]:
             "n_rows":      len(grp),
         })
     return runs
+
+
+# How many flagged timestamps a result may carry back to the agent. Measured on
+# 03447687_l1 (2026-08-10): the timestamp lists were 34% of a 149k-token request
+# — 8,900 stamps across five detectors, re-sent in full on every one of 15 turns,
+# and the run's input tokens were 88% of its $4.91 bill. The agent needs these to
+# pick points for describe_points, not to read exhaustively, so a sample serves the
+# same purpose. The sample is EVENLY SPACED, not the first N: a head would put
+# every inspected point in the first weeks of a two-year record.
+#
+# Raised 250 -> 1000 (2026-08-11) for two measured reasons. The cap cost recall:
+# flagUniLOF returned 290 candidates, so 40 were withheld, and 2 of the run's 9
+# missed spikes were rows the agent was never shown and therefore could not ask
+# about. And the 34% figure above predates prompt caching (§8) — a longer list is
+# now written once at 1.25x and read at ~0.1x per turn, so the marginal cost of the
+# extra 750 is a few cents across a run. 1000 clears every spike detector's output
+# whole (which is what matters: each of those timestamps is an individual decision)
+# while still capping flagNAN and flagPlateau, whose thousands of rows are read as
+# ranges rather than one at a time.
+MAX_FLAGGED_DATETIMES = 1000
+
+# Same reasoning for the per-gap list; a 1,168-gap record does not need to send
+# every gap to convey the distribution.
+MAX_GAPS_SUMMARY = 40
+
+
+def _sample_evenly(items: list, limit: int) -> list:
+    """Return at most *limit* items, evenly spaced across *items* (endpoints kept)."""
+    if len(items) <= limit:
+        return items
+    idx = np.linspace(0, len(items) - 1, limit).round().astype(int)
+    return [items[i] for i in dict.fromkeys(idx.tolist())]
 
 
 def _build_result(
@@ -91,13 +127,26 @@ def _build_result(
             f"{n_flagged_total} row(s) are now flagged on '{field}' in total."
         )
 
+    # Truncate loudly, never silently: an agent that thinks it received every flagged
+    # timestamp will write decision spans that miss thousands of rows (§5).
+    shown = _sample_evenly(flagged_datetimes, MAX_FLAGGED_DATETIMES)
+    if len(shown) < n_flagged:
+        msg += (
+            f" NOTE: showing {len(shown)} of {n_flagged} flagged timestamps, sampled"
+            " evenly across the record to keep the context affordable. The counts above"
+            " are exact and complete; the LIST is a sample. Use it to choose points to"
+            " inspect, and write decision spans that cover whole segments by time range"
+            " rather than enumerating the timestamps you were shown."
+        )
+
     return {
         "tool": tool_name,
         "params": params,
         "n_flagged": n_flagged,
         "pct_flagged": pct_flagged,
         "n_flagged_total": n_flagged_total,
-        "flagged_datetimes": flagged_datetimes,
+        "flagged_datetimes": shown,
+        "n_flagged_datetimes_shown": len(shown),
         "message": msg,
         "qc": qc_output  # Keep the qc object for the next steps
     }
@@ -143,13 +192,402 @@ def get_flag_summary(qc: saqc.SaQC, field: str = "value") -> dict:
     }
 
 
-def export_clean_data(qc: saqc.SaQC, field: str = "value") -> dict:
+# The §5 flag-log vocabulary. `undecided` is not one of the four actions the agent
+# may choose: it is what a flagged row gets when the agent recorded no decision for
+# it, written explicitly so the log distinguishes "the agent looked at this and kept
+# it" from "nobody ever adjudicated this". `evaluate.py` scores both as non-positive,
+# but only one of them is a defensible answer.
+DECISION_ACTIONS = ("delete", "correct", "keep", "impute")
+UNDECIDED = "undecided"
+
+# THE VERDICT IS THE RUN'S ANSWER (2026-08-13). A flag is a candidate; the verdict is
+# the agent saying "this row IS / IS NOT anomalous", and §10 scores precision/recall
+# against it. It used to be inferred from `action` — delete/correct/impute read as a
+# positive claim, keep as a rejection — which conflated the detection call with the
+# treatment call and left the agent no way to say "this is a real artifact I chose not
+# to touch". Stating it costs one field and makes the claim auditable.
+VERDICTS = ("anomaly", "normal")
+
+# The §6 type the agent assigns when its verdict is `anomaly`. Taken from the §5 label
+# vocabulary (minus the empty non-anomaly member) so the two cannot drift apart —
+# scoring compares this string against the label file's `anomaly_type` directly.
+VERDICT_ANOMALY_TYPES = tuple(sorted(ANOMALY_TYPES - {""}))
+
+# How far verdict and action may diverge (settled 2026-08-13).
+#
+#   normal  -> the action MUST be `keep`. Judging a value genuine and then deleting it
+#              is not a defensible pair, and allowing it would let a run score as a
+#              rejection while the value it "kept" is gone from the file.
+#   anomaly -> normally delete / correct / impute, but `keep` IS allowed when the agent
+#              says why the row cannot be treated. The case this exists for is a gap
+#              longer than any defensible imputation window: `gap` is the right verdict
+#              and leaving it NaN is the right action, and forcing consistency here
+#              would make the agent either lie about the verdict or impute a gap it
+#              had just judged unfillable.
+#
+# The asymmetry is the whole point: it is one-directional, so `normal` still means
+# exactly one thing, and detection recall is not quietly bought with untreated rows.
+UNTREATED_ANOMALY_ACTION = "keep"
+MIN_UNTREATED_REASON_CHARS = 20
+
+# How the agent rates its own call. `judgement-call` obliges it to write out the
+# reasoning; `clear` says the evidence was one-sided and a one-line reason suffices.
+DIFFICULTIES = ("clear", "judgement-call")
+
+# Where a row's explanation came from. The distinction matters because "the agent
+# reasoned about this point" and "a span covering half the record happened to include
+# it" produce identically-shaped log entries otherwise, and every run so far has had a
+# blanket absorb points the agent had measured.
+RATIONALE_SOURCES = (
+    "agent-deliberation",   # a judgement call, with the agent's reasoning attached
+    "agent-reason",         # a specific decision the agent called clear-cut
+    "blanket",              # swept up by a span covering a large share of all flags
+    "deterministic",        # code decided: imputed by the filler, or never adjudicated
+)
+
+# A span covering more than this share of all flagged rows is a blanket, not a verdict
+# about any particular row.
+BLANKET_SHARE = 0.20
+
+
+def _rationale(source: str, action: str, flagged_by: str, reason: str) -> str:
+    """One sentence saying why this row ended up as it did.
+
+    Deterministic for the cases where code knows the answer; the agent's own words
+    where it actually made a call. The point is that a reader never has to guess which
+    of the two they are looking at.
+    """
+    if source == "deterministic":
+        if action == "impute":
+            return (
+                f"Filled by impute_rolling. No judgement was recorded for this row — "
+                f"{_IMPUTE_FUNC} wrote a value here and that is what the log reflects."
+            )
+        return (
+            f"Flagged by {flagged_by}, but no decision span covered it, so the agent "
+            "never adjudicated this row. It counts as no claim either way."
+        )
+    if source == "blanket":
+        return (
+            f"Covered by a blanket '{action}' span rather than judged individually. "
+            f"The agent's stated grounds for the blanket: {reason or '(none given)'}"
+        )
+    return reason or f"Decided '{action}' with no reason recorded."
+
+def _validate_verdict(
+    decision: dict, action: str, reason: str, i: int
+) -> tuple[str, str]:
+    """Validate one decision's ``verdict`` / ``anomaly_type`` pair against *action*.
+
+    Returns the cleaned ``(verdict, anomaly_type)``; ``anomaly_type`` is ``""`` for a
+    ``normal`` verdict. Raises :class:`ValueError` with a message written for the agent
+    to act on, since a rejected export comes back to it as a tool error it can retry.
+    """
+    verdict = str(decision.get("verdict", "")).strip().lower()
+    if verdict not in VERDICTS:
+        raise ValueError(
+            f"decisions[{i}] has verdict={decision.get('verdict')!r}; must be one of "
+            f"{', '.join(VERDICTS)}. The verdict is this run's actual answer — whether "
+            "the segment IS anomalous — and it is what precision and recall are "
+            "measured against, so it cannot be left off."
+        )
+
+    anomaly_type = str(decision.get("anomaly_type", "")).strip().lower()
+    if verdict == "anomaly":
+        if anomaly_type not in VERDICT_ANOMALY_TYPES:
+            raise ValueError(
+                f"decisions[{i}] is verdict='anomaly' but anomaly_type="
+                f"{decision.get('anomaly_type')!r}; must be one of "
+                f"{', '.join(VERDICT_ANOMALY_TYPES)}. Name the failure you are claiming: "
+                "the type is scored against the labels as YOUR classification, not "
+                "inferred from whichever detector happened to fire."
+            )
+    else:
+        if anomaly_type:
+            raise ValueError(
+                f"decisions[{i}] is verdict='normal' but also carries anomaly_type="
+                f"{anomaly_type!r}. A segment judged genuine has no failure type — drop "
+                "the field, or change the verdict to 'anomaly' if you meant that."
+            )
+        # See UNTREATED_ANOMALY_ACTION: the one-directional half of the rule.
+        if action != UNTREATED_ANOMALY_ACTION:
+            raise ValueError(
+                f"decisions[{i}] is verdict='normal' but action={action!r}. A segment "
+                f"you judge genuine must be '{UNTREATED_ANOMALY_ACTION}' — deleting or "
+                "correcting a value you just called real water contradicts your own "
+                "verdict, and the cleaned file would not match what you claimed. If the "
+                "value IS wrong, set verdict='anomaly' with an anomaly_type."
+            )
+
+    if verdict == "anomaly" and action == UNTREATED_ANOMALY_ACTION:
+        # Allowed, but only as a stated choice. Without this the pair becomes the
+        # cost-free way to claim a detection while doing nothing about it.
+        if len(reason) < MIN_UNTREATED_REASON_CHARS:
+            raise ValueError(
+                f"decisions[{i}] claims an anomaly ({anomaly_type}) but keeps the value, "
+                f"with a `reason` of only {len(reason)} characters. That pair is allowed "
+                "— a gap longer than any defensible window is exactly it — but you must "
+                "say why the segment cannot be treated, not leave it blank."
+            )
+
+    return verdict, anomaly_type
+
+
+# A row flagged only by the imputer was, factually, imputed — there is nothing for the
+# agent to adjudicate, so it is not counted as undecided.
+_IMPUTE_FUNC = "interpolateByRolling"
+
+
+def _flagged_by_row(qc: saqc.SaQC, field: str) -> pd.Series:
+    """Map each flagged timestamp to the '+'-joined names of the tests that flagged it.
+
+    Read from the history rather than the flag frame: a row two tests both flagged
+    keeps only the first test's attribution in ``qc.flags`` (§7.1).
+    """
+    history = qc._flags.history[field]
+    names: dict[pd.Timestamp, list[str]] = {}
+    for col in history.hist.columns:
+        test_name = history.meta[col].get("func", col)
+        for stamp in history.hist.index[history.hist[col] > 0]:
+            names.setdefault(stamp, [])
+            if test_name not in names[stamp]:
+                names[stamp].append(test_name)
+    if not names:
+        return pd.Series(dtype=object)
+    return pd.Series(
+        {stamp: "+".join(tests) for stamp, tests in names.items()}
+    ).sort_index()
+
+
+def _build_flag_log(
+    qc: saqc.SaQC,
+    field: str,
+    decisions: list[dict] | None,
+) -> tuple[list[dict], dict]:
+    """Build the §5 flag log: one entry per flagged row, with the agent's decision.
+
+    *decisions* is the agent's list of ``{start, end, verdict, anomaly_type, action,
+    reason}`` spans (``end`` inclusive, defaulting to ``start``). A row no span covers
+    is written as ``undecided`` so the omission is visible rather than silently scoring
+    as a keep.
+
+    **``verdict`` is the answer; ``action`` is the treatment.** The two were one field
+    until 2026-08-13, with detection inferred from whether the action was destructive,
+    which meant the agent could not say "this is a real artifact I am not touching" and
+    every such row scored as a claim that the value was fine. They are now separate and
+    separately validated (:func:`_validate_verdict`).
+
+    **The NARROWEST span covering a row wins**, with author order breaking ties. It
+    used to be the first span listed, which quietly inverted the agent's own
+    reasoning: a run that judged one point a spike on measured evidence and then
+    swept up the remainder with a whole-series ``keep`` lost the specific verdict
+    whenever the catch-all happened to be listed first. Measured on
+    03447687_l1 (2026-08-11): a row read as ``reads_like=spike, robust_z=7.4,
+    width=3`` was recorded as ``keep``. A broad span is a statement about what is
+    left over, so it must lose to anything more specific no matter where it appears.
+
+    Returns the entries plus a stats dict for the tool result / message.
+    """
+    flagged_by = _flagged_by_row(qc, field)
+    stamps = pd.DatetimeIndex(flagged_by.index)
+
+    actions = pd.Series(index=stamps, dtype=object)
+    reasons = pd.Series("", index=stamps, dtype=object)
+    deliberations = pd.Series("", index=stamps, dtype=object)
+    sources = pd.Series("", index=stamps, dtype=object)
+    verdicts = pd.Series("", index=stamps, dtype=object)
+    anomaly_types = pd.Series("", index=stamps, dtype=object)
+
+    # Validate everything before applying anything, so a bad span late in the list
+    # cannot leave a half-written log behind.
+    spans: list[dict] = []
+    for i, decision in enumerate(decisions or []):
+        if not isinstance(decision, dict):
+            raise ValueError(f"decisions[{i}] is not an object with start/action/reason.")
+        action = str(decision.get("action", "")).strip().lower()
+        if action not in DECISION_ACTIONS:
+            raise ValueError(
+                f"decisions[{i}] has action={decision.get('action')!r}; "
+                f"must be one of {', '.join(DECISION_ACTIONS)}."
+            )
+        try:
+            start = pd.Timestamp(decision["start"])
+            end = pd.Timestamp(decision.get("end") or decision["start"])
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ValueError(f"decisions[{i}] has an unparseable start/end: {exc}") from exc
+        if end < start:
+            raise ValueError(f"decisions[{i}] ends ({end}) before it starts ({start}).")
+
+        difficulty = str(decision.get("difficulty", "clear")).strip().lower()
+        if difficulty not in DIFFICULTIES:
+            raise ValueError(
+                f"decisions[{i}] has difficulty={decision.get('difficulty')!r}; "
+                f"must be one of {', '.join(DIFFICULTIES)}."
+            )
+        deliberation = str(decision.get("deliberation", "")).strip()
+        # A judgement call without its reasoning is the thing this field exists to
+        # prevent, so it fails loudly (§13) rather than recording an empty rationale.
+        if difficulty == "judgement-call" and len(deliberation) < 40:
+            raise ValueError(
+                f"decisions[{i}] is marked difficulty='judgement-call' but its "
+                f"`deliberation` is missing or too short ({len(deliberation)} chars). "
+                "A judgement call must carry the reasoning behind it: what the numbers "
+                "said, what you weighed against what, and what would have changed your "
+                "mind. Mark it 'clear' only if the evidence was genuinely one-sided."
+            )
+
+        reason = str(decision.get("reason", "")).strip()
+        verdict, anomaly_type = _validate_verdict(decision, action, reason, i)
+
+        spans.append({
+            "start": start, "end": end, "action": action, "order": i,
+            "reason": reason, "verdict": verdict, "anomaly_type": anomaly_type,
+            "difficulty": difficulty, "deliberation": deliberation,
+        })
+
+    unmatched: list[str] = []
+    # Narrowest first, ties broken by the order the agent wrote them (the index keeps
+    # the sort stable and explicit). A row is then claimed by the most specific span
+    # that covers it, whatever position the catch-all occupies.
+    for span in sorted(spans, key=lambda s: (s["end"] - s["start"], s["order"])):
+        within = (stamps >= span["start"]) & (stamps <= span["end"])
+        if not within.any():
+            # Reported only when the span matches NO flagged row at all — a mistyped
+            # timestamp. A broad span whose rows were all claimed by narrower ones is
+            # doing exactly its job and must not be flagged as an error.
+            unmatched.append(
+                f"{span['start'].isoformat()}–{span['end'].isoformat()} ({span['action']})"
+            )
+            continue
+        covered = within & actions.isna().to_numpy()
+        if not covered.any():
+            continue
+        actions[covered] = span["action"]
+        reasons[covered] = span["reason"]
+        deliberations[covered] = span["deliberation"]
+        verdicts[covered] = span["verdict"]
+        anomaly_types[covered] = span["anomaly_type"]
+        # A span sweeping up a large share of everything flagged is a statement about
+        # the remainder, not a judgement about any particular row — and telling the two
+        # apart per row is the whole point of recording a source. Every run so far has
+        # had one of these absorb points the agent had actually measured.
+        blanket = int(within.sum()) > BLANKET_SHARE * max(len(stamps), 1)
+        sources[covered] = (
+            "blanket" if blanket
+            else "agent-deliberation" if span["deliberation"]
+            else "agent-reason"
+        )
+
+    # A row the imputer FILLED is `impute`, full stop — that is a fact about what
+    # happened to the data, not a verdict the agent can override. In particular a
+    # broad catch-all `keep` span (which is what an agent naturally writes to sweep
+    # up its remaining spike/jump flags) otherwise swallows every filled gap in its
+    # time range and records "left untouched" on rows whose value was replaced.
+    # Measured on 03447687_l1, 2026-08-10: one such span mislabelled 3,429 filled
+    # rows as `keep` and took gap F1 from 1.0 to 0.
+    #
+    # An explicit delete/correct still wins: choosing to act further on a filled
+    # value is a real decision, where "keep" on it is simply false.
+    filled = flagged_by.str.contains(_IMPUTE_FUNC, regex=False).to_numpy()
+    overridden = filled & actions.isin(["keep"]).to_numpy()
+    imputed_rows = filled & (actions.isna().to_numpy() | overridden)
+    actions[imputed_rows] = "impute"
+    undecided_rows = actions.isna().to_numpy()
+    actions = actions.fillna(UNDECIDED)
+    n_keep_overridden = int(overridden.sum())
+    sources[imputed_rows] = "deterministic"
+    sources[undecided_rows] = "deterministic"
+
+    # A row the filler wrote a value into was missing, and §5 is explicit that every
+    # missing run is a gap — so the verdict here is a fact about the data, not a call
+    # the agent has to make. It follows the action for the same reason the action is
+    # forced above: leaving these blank would let a run impute 3,403 rows and record
+    # no claim about any of them.
+    verdicts[imputed_rows] = "anomaly"
+    anomaly_types[imputed_rows] = "gap"
+    # Nobody adjudicated these, which is neither "anomaly" nor "normal" (§10 scores it
+    # as no claim in either direction). Naming it keeps a forgotten segment visible
+    # instead of letting it read as a considered "normal".
+    verdicts[undecided_rows] = UNDECIDED
+    anomaly_types[undecided_rows] = ""
+
+    entries = []
+    for i, stamp in enumerate(stamps):
+        source = sources.iloc[i] or "deterministic"
+        entries.append({
+            "datetime": stamp.strftime("%Y-%m-%dT%H:%M:%S"),
+            "flagged_by": flagged_by.loc[stamp],
+            # The run's answer for this row, and what §10 scores. `action` says what
+            # was done to the value; `verdict` says what the agent concluded it IS.
+            "verdict": verdicts.iloc[i],
+            "anomaly_type": anomaly_types.iloc[i],
+            "action": actions.loc[stamp],
+            "reason": reasons.loc[stamp],
+            # Where the explanation comes from, so a reader can tell a considered call
+            # from a blanket or from something code decided. See RATIONALE_SOURCES.
+            "rationale_source": source,
+            "rationale": _rationale(
+                source, actions.loc[stamp], flagged_by.loc[stamp], reasons.loc[stamp]
+            ),
+            "deliberation": deliberations.iloc[i],
+        })
+    stats = {
+        "n_entries": len(entries),
+        "n_undecided": int((actions == UNDECIDED).sum()),
+        "n_keep_rewritten_to_impute": n_keep_overridden,
+        "n_by_verdict": {
+            verdict: int((verdicts == verdict).sum())
+            for verdict in (*VERDICTS, UNDECIDED)
+            if (verdicts == verdict).any()
+        },
+        "n_by_anomaly_type": {
+            anomaly_type: int((anomaly_types == anomaly_type).sum())
+            for anomaly_type in VERDICT_ANOMALY_TYPES
+            if (anomaly_types == anomaly_type).any()
+        },
+        # verdict='anomaly' + action='keep': allowed, but it is the pair that claims a
+        # detection without touching the value, so the count is surfaced rather than
+        # buried in the per-row entries.
+        "n_anomalies_left_untreated": int(
+            ((verdicts == "anomaly") & (actions == UNTREATED_ANOMALY_ACTION)).sum()
+        ),
+        "n_by_action": {
+            action: int((actions == action).sum())
+            for action in (*DECISION_ACTIONS, UNDECIDED)
+            if (actions == action).any()
+        },
+        "n_by_rationale_source": {
+            source: sum(1 for e in entries if e["rationale_source"] == source)
+            for source in RATIONALE_SOURCES
+            if any(e["rationale_source"] == source for e in entries)
+        },
+        "decisions_matching_no_flagged_row": unmatched,
+    }
+    return entries, stats
+
+
+def export_clean_data(
+    qc: saqc.SaQC,
+    field: str = "value",
+    decisions: list[dict] | None = None,
+    output_dir: str | Path | None = None,
+    stem: str | None = None,
+) -> dict:
     """
     Takes the final, cleaned data and gives it back as a simple spreadsheet-like format,
-    marking which points were flagged by the tools.
+    marking which points were flagged by the tools, and writes the §5 flag log.
+
+    *decisions* is the agent's per-segment verdict list — ``{start, end, verdict,
+    anomaly_type, action, reason}`` — and is what turns a pile of flags into an answer:
+    `evaluate.py` scores a flagged row as a positive claim only where the agent said
+    ``verdict='anomaly'``, so a run that exports without decisions scores as if it
+    claimed nothing.
+
+    *output_dir* and *stem* are supplied by the runner, not by the agent (they are
+    absent from the tool schema): given both, the flag log is written to
+    ``<output_dir>/<stem>_flags.json``. Without them the entries are returned only.
     """
     df = qc.data.to_pandas()
-    flags = qc.flags[field]
 
     # Contract: 'flag' column naming the action, if any
     # Since saqc just returns float flags, we can map > 0 to 'flagged'
@@ -163,12 +601,71 @@ def export_clean_data(qc: saqc.SaQC, field: str = "value") -> dict:
         mask = history.hist[col] > 0
         df.loc[mask, 'flag'] = test_name
 
+    entries, stats = _build_flag_log(qc, field, decisions)
+
+    flags_path = None
+    if output_dir is not None and stem is not None:
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        flags_path = out_dir / f"{stem}_flags.json"
+        flags_path.write_text(json.dumps(entries, indent=2))
+        flags_path = str(flags_path)
+
+    msg = (
+        f"Data exported. Flag log holds {stats['n_entries']} flagged row(s). "
+        f"VERDICTS (this is what the run is scored on): {stats['n_by_verdict']}"
+        + (f", by type {stats['n_by_anomaly_type']}" if stats["n_by_anomaly_type"] else "")
+        + f". Actions taken: {stats['n_by_action']}."
+    )
+    if flags_path:
+        msg += f" Written to {flags_path}."
+    if stats["n_anomalies_left_untreated"]:
+        msg += (
+            f" NOTE: {stats['n_anomalies_left_untreated']} row(s) are called anomalous but"
+            " kept as recorded. That is a legitimate pair for something you cannot treat"
+            " (a gap longer than any defensible window); check it is what you meant on"
+            " every one of them, since it claims the detection without changing the value."
+        )
+    if stats["n_undecided"]:
+        msg += (
+            f" WARNING: {stats['n_undecided']} flagged row(s) carry NO decision and are"
+            " recorded as verdict 'undecided' — they count as no claim in either"
+            " direction when this run is scored, so they are neither a detection nor a"
+            " rejection. Call export_clean_data again with a `decisions` entry covering"
+            " every flagged segment (each with a verdict, an action and a reason)."
+        )
+    blanket = stats["n_by_rationale_source"].get("blanket", 0)
+    if blanket:
+        msg += (
+            f" NOTE: {blanket} flagged row(s) were swept up by a blanket span rather than"
+            " judged individually — including any you measured. If you inspected a point"
+            " and formed a view about it, give it its own span so the record shows that,"
+            " rather than letting a catch-all speak for it."
+        )
+    if stats["n_keep_rewritten_to_impute"]:
+        msg += (
+            f" NOTE: {stats['n_keep_rewritten_to_impute']} row(s) you marked 'keep' were"
+            " filled by impute_rolling and are recorded as 'impute' — their value was"
+            " replaced, so 'keep' would misdescribe the file. If you meant to sweep up"
+            " only your spike/jump flags, narrow that span so it does not span the gaps."
+        )
+    if stats["decisions_matching_no_flagged_row"]:
+        msg += (
+            " WARNING: these decision spans matched no flagged row (wrong timestamp, or"
+            " already covered by an earlier span): "
+            + "; ".join(stats["decisions_matching_no_flagged_row"])
+            + "."
+        )
+
     return {
         "tool": "export_clean_data",
-        "params": {"field": field},
-        "message": "Data exported.",
+        "params": {"field": field, "n_decisions": len(decisions or [])},
+        "message": msg,
+        "flags_path": flags_path,
+        **stats,
         "qc": qc,
-        "df": df
+        "df": df,
+        "flags": entries,
     }
 
 
@@ -307,9 +804,24 @@ def impute_rolling(
 
     # --- 2. Call SaQC's interpolateByRolling ---
     # flag=25 (DOUBTFUL) so imputed rows appear in the flag history (§7.1).
+    #
+    # dfilter=np.inf is load-bearing. SaQC masks every row whose flag is >= `dfilter`
+    # before a function runs, and the default masks BAD — so a row an earlier detector
+    # flagged looks MISSING to the imputer, which fills it, silently replacing a real
+    # reading that was never absent. Measured on 03447687_l1 (2026-08-10): 1,879 rows
+    # that were never NaN were rewritten with a rolling median, 1,866 of them ordinary
+    # water and 13 of them injected anomalies the agent consequently never judged.
+    # It also corrupted three separate measurements — evaluate.py's spike precision,
+    # and the `missed` counts on both audit pages — because an overwritten row carries
+    # `action=impute` and reads as a successful gap fill.
+    #
+    # np.inf means nothing is masked, so the imputer sees the real data and fills only
+    # genuine NaN. Verified in scratchpad/probe_impute_dfilter.py: a flagged spike
+    # survives untouched while a real gap is still filled.
     pre_nans = int(pre_series.isna().sum())
     qc_out   = qc.interpolateByRolling(
-        field, window=window, func=func, min_periods=min_periods, flag=25
+        field, window=window, func=func, min_periods=min_periods, flag=25,
+        dfilter=np.inf,
     )
     post_series = qc_out.data.to_pandas()[field]
     post_nans   = int(post_series.isna().sum())
@@ -363,7 +875,15 @@ def impute_rolling(
     result["n_gaps_total"]         = len(nan_runs)
     result["n_gaps_filled"]        = len(fillable_runs)
     result["n_gaps_skipped_large"] = len(too_large_runs)
-    result["gaps_summary"]         = gaps_summary
+    # Longest gaps first, then capped: which gaps were too long to fill is the decision
+    # this list informs, and those are exactly the ones at the top.
+    by_length = sorted(gaps_summary, key=lambda g: g["n_rows"], reverse=True)
+    result["gaps_summary"]         = by_length[:MAX_GAPS_SUMMARY]
+    if len(by_length) > MAX_GAPS_SUMMARY:
+        result["message"] += (
+            f" NOTE: gaps_summary lists the {MAX_GAPS_SUMMARY} longest of"
+            f" {len(by_length)} gaps; the counts above cover all of them."
+        )
     return result
 
 
@@ -385,8 +905,10 @@ def describe_point(
     qc: saqc.SaQC,
     at: str,
     field: str = "value",
-    n_before: int = 8,
-    n_after: int = 8,
+    # 45 min, matching context.slope_context — the scale at which the fall/rise ratio
+    # separates a flush event from an artifact (it inverts past ~90 min).
+    n_before: int = 3,
+    n_after: int = 3,
     window: str = "6h",
     shift_window: str = "24h",
 ) -> dict:
@@ -415,7 +937,7 @@ def describe_points(
     qc: saqc.SaQC,
     ats: list[str],
     field: str = "value",
-    max_points: int = 20,
+    max_points: int = 100,
     window: str = "6h",
 ) -> dict:
     """Compact shape measurements for a LIST of timestamps -- e.g. a detector's output.
@@ -427,6 +949,15 @@ def describe_points(
     Timestamps beyond *max_points* are reported in ``n_truncated`` rather than
     dropped silently; unresolvable ones land in ``errors`` instead of raising, so
     one bad timestamp cannot sink the batch.
+
+    ``max_points`` was 20 until 2026-08-11, and that default — not the call budget,
+    not any property of the data — was what limited a run to inspecting 80 of 290
+    spike candidates: the agent filled the advertised batch size exactly, four times,
+    and 5 of its 9 missed spikes were candidates it was shown but could never ask
+    about. A row costs ~340 characters (~85 tokens), so 100 points is ~8.5k tokens
+    in one result, written once and thereafter read from cache (§8). Raise it further
+    for a detector that returns more; the cap exists to keep one call bounded, not to
+    ration inspection.
     """
     return context.describe_points(
         qc,

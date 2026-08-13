@@ -37,9 +37,17 @@ EXPECTED_TOOLS = {
     "flag_zscore",
     "flag_jumps",
     "flag_nan",
-    # Context (the two aggregators from context.py; its primitives stay library-only)
+    # Context — the two aggregators, plus the primitives that answer the §6
+    # decisions the aggregate blurs: width, recovery time, level shift, and local
+    # noise (the one that measures the STRETCH rather than the point). The other
+    # four primitives stay library-only; describe_point already returns them all.
     "describe_point",
     "describe_points",
+    "slope_context",
+    "excursion_context",
+    "recovery_context",
+    "level_shift_context",
+    "noise_context",
     # Action
     "impute_rolling",
 }

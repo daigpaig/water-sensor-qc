@@ -67,6 +67,33 @@ def gap_series() -> pd.Series:
     return s
 
 
+@pytest.fixture
+def noisy_stretch_series() -> pd.Series:
+    """Calm everywhere except rows 200-260, where the sensor thrashes.
+
+    The stretch carries no anomaly at all — it is the same water, measured badly —
+    so every detector hit inside it is a false positive. This is the fixture for
+    the failure noise_context exists to prevent: judged one point at a time
+    against the record's scale, each of these rows looks extreme.
+    """
+    rng = np.random.default_rng(7)
+    s = _calm()
+    s.iloc[200:260] += rng.normal(0, 1.0, 60)      # 20x the baseline noise sd
+    return s
+
+
+@pytest.fixture
+def accelerating_ramp_series() -> pd.Series:
+    """A smooth, quickening rise — real water moving fast, not a noisy sensor.
+
+    Variable in the same sample-to-sample sense as the noisy stretch, but the
+    moves are all in one direction, which is what ``variation_kind`` separates.
+    """
+    s = _calm()
+    s.iloc[200:260] += np.linspace(0, 1, 60) ** 2 * 40
+    return s
+
+
 # ---------------------------------------------------------------------------
 # Input plumbing
 # ---------------------------------------------------------------------------
@@ -190,6 +217,58 @@ def test_neighbourhood_stats_excludes_the_point_from_its_own_reference(spike_ser
     assert r["percentile_in_window"] == 100.0
 
 
+def test_noise_context_calm_stretch_leaves_a_spike_standing_out(spike_series):
+    """In calm surroundings the spike is exactly what it looks like."""
+    r = ctx.noise_context(spike_series, spike_series.index[200])
+    assert r["noise_ratio"] < 3                       # its neighbours are quiet
+    assert r["point_step_sigmas_local"] > 5           # it is not
+    assert r["point_unremarkable_here"] is False
+    assert r["noise_regime"] in ("quiet", "typical")
+
+
+def test_noise_context_flags_a_point_that_is_typical_for_its_noisy_stretch(
+    noisy_stretch_series,
+):
+    """The whole point of the tool: this row is extreme by the RECORD's scale and
+    unremarkable by its own neighbourhood's."""
+    r = ctx.noise_context(noisy_stretch_series, noisy_stretch_series.index[230])
+    assert r["noise_ratio"] > 3
+    assert r["noise_regime"] in ("elevated", "severe")
+    assert r["point_step_sigmas_local"] < 5
+    assert r["point_unremarkable_here"] is True
+    # The two denominators must actually disagree, or the tool has added nothing.
+    assert r["point_step_sigmas_global"] > 3 * r["point_step_sigmas_local"]
+    assert r["variation_kind"] == "noise-like"
+
+
+def test_noise_context_separates_a_fast_rise_from_a_noisy_sensor(
+    accelerating_ramp_series,
+):
+    """Busy for a different reason: the moves are directional, so it is real water."""
+    r = ctx.noise_context(accelerating_ramp_series, accelerating_ramp_series.index[240])
+    assert r["variation_kind"] == "directional"
+    assert r["turning_fraction"] < 0.35
+
+
+def test_noise_context_bounds_the_noisy_episode(noisy_stretch_series):
+    """The episode bounds are what let a run write ONE decision span (§5)."""
+    r = ctx.noise_context(noisy_stretch_series, noisy_stretch_series.index[230])
+    start = pd.Timestamp(r["episode_start"])
+    end = pd.Timestamp(r["episode_end"])
+    assert start <= noisy_stretch_series.index[230] <= end
+    # Bounded by the stretch it describes, not the whole record.
+    assert start >= noisy_stretch_series.index[0]
+    assert end <= noisy_stretch_series.index[-1]
+    assert r["episode_hours"] > 0
+
+
+def test_noise_context_reports_a_quiet_record_as_quiet(spike_series):
+    """No episode is reported when nothing is elevated — no false alarm."""
+    r = ctx.noise_context(spike_series, spike_series.index[50])
+    assert r["point_unremarkable_here"] is False
+    assert r["episode_start"] is None
+
+
 def test_gap_context_inside_and_beside_a_gap(gap_series):
     inside = ctx.gap_context(gap_series, gap_series.index[205])
     assert inside["is_missing"] is True
@@ -233,6 +312,35 @@ def test_describe_point_reads_like(request, fixture_name, position, expected):
     assert r["reads_like_reason"]
 
 
+def test_describe_point_does_not_call_a_noisy_stretch_a_spike(noisy_stretch_series):
+    """The guard that stops one noisy hour being reported as many sensor failures.
+
+    Without it every one of these rows reads 'spike' — narrow, and far from the
+    local median by the record's scale — and a run deletes them one by one.
+    Measured on real data, the guard drops 34.6% of the wrong 'spike' hints on
+    detector false positives and costs 3.0% of the right ones on true spikes
+    (scratchpad/probe_noise_reads_like.py).
+    """
+    labels = [
+        ctx.describe_point(noisy_stretch_series, noisy_stretch_series.index[i])["reads_like"]
+        for i in range(215, 250)
+    ]
+    assert "noisy-stretch" in labels
+    assert labels.count("spike") < labels.count("noisy-stretch")
+
+    # ...and it must not disarm the spike label where the surroundings ARE calm.
+    calm = ctx.describe_point(noisy_stretch_series, noisy_stretch_series.index[100])
+    assert calm["reads_like"] != "noisy-stretch"
+
+
+def test_describe_points_carries_the_noise_columns(noisy_stretch_series):
+    """Triage is where a noisy stretch is visible — one row cannot show it."""
+    stamps = [noisy_stretch_series.index[i] for i in (215, 225, 235, 245)]
+    rows = ctx.describe_points(noisy_stretch_series, stamps)["points"]
+    assert all("noise_ratio" in r and "step_sigmas_local" in r for r in rows)
+    assert all(r["noise_ratio"] > 3 for r in rows)
+
+
 def test_describe_point_is_json_serialisable(spike_series):
     r = ctx.describe_point(spike_series, spike_series.index[200])
     json.dumps(r)          # raises if any numpy scalar or Timestamp leaked through
@@ -249,6 +357,7 @@ def test_every_context_keeps_its_key_set_on_a_nan_point(gap_series):
         ctx.level_shift_context,
         ctx.flatness_context,
         ctx.neighbourhood_stats,
+        ctx.noise_context,
         ctx.gap_context,
         ctx.historical_context,
     ):

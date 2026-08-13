@@ -20,22 +20,33 @@ one multi-class problem, because the detectors genuinely overlap.
 *action*, and the rows it touches were imputed, not detected. Counting them would
 score gap detection twice.
 
-**A flag is a candidate; a decision is the answer.** Scoring raw flags is wrong
-for an agent: §6 requires it to flag a suspicious excursion, inspect it, and
-*keep* it if it turns out to be real water. Counting that kept row as a false
-positive punishes exactly the behaviour the project wants. So when a decision log
-is supplied, a row counts as predicted-anomalous only if the agent **acted** on
-it (:data:`POSITIVE_ACTIONS` — ``delete``/``correct``); a flagged row it decided
-to ``keep`` is a rejected candidate and scores as a true negative.
+**A flag is a candidate; the VERDICT is the answer.** Scoring raw flags is wrong
+for an agent: §6 requires it to flag a suspicious excursion, inspect it, and keep
+it if it turns out to be real water. Counting that kept row as a false positive
+punishes exactly the behaviour the project wants. Since 2026-08-13 the agent says
+so outright — every decision carries ``verdict`` (``anomaly``/``normal``) and,
+when anomalous, the ``anomaly_type`` it is claiming — and that is what is scored:
 
-    labelled anomaly + deleted  -> TP        labelled anomaly + kept -> FN
-    real water + kept           -> TN        real water + deleted    -> FP
+    labelled anomaly + called anomaly -> TP   labelled anomaly + called normal -> FN
+    real water + called normal        -> TN   real water + called anomaly      -> FP
 
 That last cell is the expensive one (§1: removing real data is worse than leaving
-a flagged point in place), and only decision-aware scoring can see it at all.
+a flagged point in place), and only verdict-aware scoring can see it at all.
 
-Without a decision log the functions fall back to scoring flags, and the table
-says so in its header — treat those numbers as detector reach, not agent quality.
+The **type** also comes from the agent rather than from :data:`TOOL_TO_TYPE`. A
+row ``flagJumps`` found but the agent classified as a spike counts as a spike
+claim, because classifying it is the agent's job; grading it on the detector's
+guess measures the detector.
+
+Two fallbacks exist, and the table header always says which path ran:
+
+* a flag log written before ``verdict`` existed is scored on the old inference —
+  a row counts as claimed only where the agent ``delete``/``correct``/``impute``d
+  it (:data:`POSITIVE_ACTIONS`), with the type from ``TOOL_TO_TYPE``. That reads
+  an untreatable-but-correctly-identified anomaly as a rejection, which is the
+  asymmetry the verdict field was added to remove.
+* with no flag log at all, raw flags are scored — detector reach, not agent
+  quality.
 
 Two of the four numbers are also not comparable to the others, and the printed
 table says so:
@@ -207,12 +218,80 @@ def predictions_from_log(log_path: Path) -> dict[str, set]:
     return out
 
 
+def predictions_from_flag_log(path: Path) -> dict[str, set]:
+    """Typed predictions from a §5 flag log (``*_flags.json``).
+
+    **Prefer this over :func:`predictions_from_log`.** Since 2026-08-10 a detector
+    returns at most ``MAX_FLAGGED_DATETIMES`` timestamps — an evenly-spaced *sample*,
+    because the full lists were 34% of the agent's context and its cost is dominated
+    by input tokens (§8). The run log therefore no longer contains every flagged row,
+    and scoring it undercounts every detector's reach. The flag log does: it carries
+    one entry per flagged row, with the ``+``-joined names of the tests that flagged it.
+
+    A row is predicted as every type its flagging tests map to, since one row can be
+    flagged by several detectors (§5).
+    """
+    entries = json.loads(path.read_text())
+    if not isinstance(entries, list):
+        raise ValueError(f"{path} is not a §5 flag log (expected a JSON list).")
+
+    out: dict[str, set] = {t: set() for t in SCORED_TYPES}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        stamp = pd.to_datetime(entry.get("datetime"), errors="coerce")
+        if pd.isna(stamp):
+            continue
+        for func in str(entry.get("flagged_by", "")).split("+"):
+            anomaly_type = TOOL_TO_TYPE.get(func.strip())
+            if anomaly_type is not None:
+                out[anomaly_type].add(stamp)
+    return out
+
+
+def log_flag_lists_are_truncated(log_path: Path) -> bool:
+    """True if any tool result in *log_path* reports a sampled timestamp list.
+
+    The wrappers say so in the result dict (``n_flagged_datetimes_shown`` below
+    ``n_flagged``), which is what makes the undercount detectable rather than silent.
+    """
+    for line in log_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") != "api_call":
+            continue
+        for message in event.get("messages") or []:
+            if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+                continue
+            for block in message["content"]:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                try:
+                    result = json.loads(block["content"])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(result, dict):
+                    continue
+                shown = result.get("n_flagged_datetimes_shown")
+                if shown is not None and shown < (result.get("n_flagged") or 0):
+                    return True
+    return False
+
+
 def load_decisions(path: Path) -> dict[pd.Timestamp, str]:
     """Load a §5 flag log (``*_flags.json``) as ``timestamp -> action``.
 
-    The contract is a list of ``{datetime, flagged_by, action, reason}``. A row
-    appearing twice keeps the stronger verdict: acting on a value beats keeping
-    it, so one detector's ``delete`` is not undone by another's ``keep``.
+    The contract is a list of ``{datetime, flagged_by, verdict, anomaly_type,
+    action, reason}``. A row appearing twice keeps the stronger action: acting on
+    a value beats keeping it, so one detector's ``delete`` is not undone by
+    another's ``keep``.
+
+    This reads the *treatment*, which is what :func:`report_decisions` grades.
+    Detection scoring reads :func:`load_verdicts` instead.
     """
     entries = json.loads(path.read_text())
     if not isinstance(entries, list):
@@ -232,16 +311,75 @@ def load_decisions(path: Path) -> dict[pd.Timestamp, str]:
     return decisions
 
 
+def load_verdicts(path: Path) -> dict[pd.Timestamp, str] | None:
+    """Load a §5 flag log as ``timestamp -> anomaly_type the agent claimed``.
+
+    **This is the run's answer** (§5, 2026-08-13). The agent states a ``verdict``
+    of ``anomaly`` or ``normal`` per segment, and an ``anomaly_type`` with it when
+    the verdict is ``anomaly``; the returned mapping holds only the anomalous
+    rows, so a timestamp's absence means "not claimed", whether the agent judged
+    it normal or never adjudicated it.
+
+    Returns ``None`` for a log written before verdicts existed, so the caller can
+    fall back to inferring the claim from the action. Old logs stay scoreable, but
+    the two paths are not the same measurement and the printed table says which
+    one ran.
+    """
+    entries = json.loads(path.read_text())
+    if not isinstance(entries, list):
+        raise ValueError(f"{path} is not a §5 flag log (expected a JSON list).")
+
+    if not any(isinstance(e, dict) and "verdict" in e for e in entries):
+        return None
+
+    verdicts: dict[pd.Timestamp, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        stamp = pd.to_datetime(entry.get("datetime"), errors="coerce")
+        if pd.isna(stamp):
+            continue
+        if str(entry.get("verdict", "")).strip().lower() != "anomaly":
+            continue
+        anomaly_type = str(entry.get("anomaly_type", "")).strip().lower()
+        if anomaly_type in SCORED_TYPES:
+            verdicts[stamp] = anomaly_type
+    return verdicts
+
+
+def predictions_from_verdicts(verdicts: dict[pd.Timestamp, str]) -> dict[str, set]:
+    """Typed predictions straight from the agent's stated verdicts.
+
+    The type comes from the agent, not from :data:`TOOL_TO_TYPE`. That is the
+    point: a row ``flagJumps`` found but the agent classified as a spike is scored
+    as a spike claim, because the classification is the agent's job and grading it
+    on the detector's guess measures the detector instead.
+
+    A row therefore predicts exactly ONE type here, where flag-derived predictions
+    can predict several — the agent commits to one answer per segment.
+    """
+    out: dict[str, set] = {t: set() for t in SCORED_TYPES}
+    for stamp, anomaly_type in verdicts.items():
+        out[anomaly_type].add(stamp)
+    return out
+
+
 def apply_decisions(
     predictions: dict[str, set],
     decisions: dict[pd.Timestamp, str],
 ) -> dict[str, set]:
     """Narrow flagged rows to the ones the agent actually acted on.
 
-    A flagged row the agent decided to ``keep`` is dropped from the predictions:
-    it was a candidate the agent considered and rejected, so it should score as a
-    true negative, not a false positive. A flagged row with **no** decision is
-    also dropped — an undecided flag is not a claim the agent ever made.
+    The **fallback** path, for flag logs written before the ``verdict`` field
+    existed: there, whether the agent claimed a row was anomalous can only be
+    inferred from whether it acted on the value. A flagged row it decided to
+    ``keep`` is dropped from the predictions — a candidate considered and
+    rejected, scoring as a true negative rather than a false positive — and a row
+    with no decision is dropped too, an undecided flag being no claim at all.
+
+    The inference is imperfect in one direction, which is why the verdict field
+    replaced it: an anomaly the agent identified correctly but could not treat
+    reads here as a rejection. Prefer :func:`predictions_from_verdicts`.
     """
     return {
         anomaly_type: {t for t in stamps if decisions.get(t) in POSITIVE_ACTIONS}
@@ -435,14 +573,28 @@ def report_decisions(
     return "\n".join(lines)
 
 
-def format_table(scores: list[TypeScore], macro_f1: float, scored_decisions: bool = False) -> str:
+def format_table(
+    scores: list[TypeScore],
+    macro_f1: float,
+    scored_decisions: bool = False,
+    scored_verdicts: bool = False,
+) -> str:
     """Render the scores as a plain-text table, with the §10 caveats attached."""
-    mode = (
-        "scoring DECISIONS — a flagged row the agent kept counts as a true negative"
-        if scored_decisions
-        else "scoring FLAGS — no decision log, so rows the agent inspected and KEPT\n"
-        "         still count against precision (see below)"
-    )
+    if scored_verdicts:
+        mode = (
+            "scoring VERDICTS — the agent's own answer: which segments it called\n"
+            "         anomalous, and which type it called them. This is the run."
+        )
+    elif scored_decisions:
+        mode = (
+            "scoring ACTIONS — no verdicts in this log, so the claim is inferred from\n"
+            "         whether the agent acted on the value (pre-2026-08-13 log)"
+        )
+    else:
+        mode = (
+            "scoring FLAGS — no decision log, so rows the agent inspected and KEPT\n"
+            "         still count against precision (see below)"
+        )
     lines = [
         f"mode   : {mode}",
         "",
@@ -468,12 +620,29 @@ def format_table(scores: list[TypeScore], macro_f1: float, scored_decisions: boo
             "               much the detectors reached for, not how often the agent was",
             "               wrong. Pass --decisions <flags.json> to score properly.",
         ]
+    elif not scored_verdicts:
+        lines += [
+            "  INFERRED     this log predates the `verdict` field, so a row counts as a",
+            "  claims       claim only where the agent DELETED / CORRECTED / IMPUTED it.",
+            "               An anomaly it identified correctly but chose not to treat",
+            "               reads here as a rejection, and the type comes from whichever",
+            "               detector fired rather than from the agent. Re-run the agent",
+            "               to get verdict-scored numbers.",
+        ]
     lines += [
         "  gap          flagNAN finds exactly the NaN rows the labels were built",
         "               from, so this is near-free and inflates macro-F1.",
-        "  level_shift  labels cover a whole injected window while flagJumps marks",
-        "               its edge — row recall cannot be high here (§9.1).",
     ]
+    if scored_verdicts:
+        lines += [
+            "  level_shift  labels cover a whole injected window; the agent must claim",
+            "               the window, not just the step edge, to score recall on it.",
+        ]
+    else:
+        lines += [
+            "  level_shift  labels cover a whole injected window while flagJumps marks",
+            "               its edge — row recall cannot be high here (§9.1).",
+        ]
     absent = [s.anomaly_type for s in scores if s.n_true == 0]
     if absent:
         lines.append(
@@ -533,16 +702,48 @@ def main(argv: list[str] | None = None) -> int:
     labels = load_labels(args.series)
     
     if args.log:
-        predictions = predictions_from_log(args.log)
         decisions = load_decisions(args.decisions) if args.decisions else None
-        scores, macro_f1 = score(predictions, labels, index, decisions=decisions)
+        verdicts = load_verdicts(args.decisions) if args.decisions else None
+        truncated = log_flag_lists_are_truncated(args.log)
+
+        # The flag log holds every flagged row; the run log holds only the sample the
+        # agent was shown (§5). Score the complete source whenever it is available.
+        if verdicts is not None:
+            # The agent said what each segment IS. Score that, and nothing else.
+            predictions = predictions_from_verdicts(verdicts)
+            source = f"agent verdicts in {args.decisions.name}"
+            scores, macro_f1 = score(predictions, labels, index, decisions=None)
+        elif args.decisions:
+            predictions = predictions_from_flag_log(args.decisions)
+            source = f"flag log ({args.decisions.name}), typed by detector"
+            scores, macro_f1 = score(predictions, labels, index, decisions=decisions)
+        else:
+            predictions = predictions_from_log(args.log)
+            source = f"run log ({args.log.name})"
+            scores, macro_f1 = score(predictions, labels, index, decisions=None)
 
         print(f"series : {args.series.name}  ({len(index):,} rows scored, split={args.split})")
         print(f"log    : {args.log.name}")
+        print(f"flagged rows read from: {source}")
+        if truncated and not args.decisions:
+            print(
+                "\n  *** WARNING: this run's log carries SAMPLED timestamp lists, so the\n"
+                "      numbers below undercount every detector — they are not a measure of\n"
+                "      the run. Pass --decisions <flags.json> to score the complete set. ***"
+            )
         if decisions is not None:
             print(f"flags  : {args.decisions.name}  ({len(decisions):,} decided rows)")
+        if verdicts is not None:
+            print(
+                f"verdicts: {len(verdicts):,} row(s) the agent CALLED anomalous, of "
+                f"{len(decisions or {}):,} flagged"
+            )
         print()
-        print(format_table(scores, macro_f1, scored_decisions=decisions is not None))
+        print(format_table(
+            scores, macro_f1,
+            scored_decisions=decisions is not None,
+            scored_verdicts=verdicts is not None,
+        ))
         
         if decisions is not None:
             print("\n" + report_decisions(decisions, labels, index))

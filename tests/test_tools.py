@@ -173,6 +173,239 @@ def test_a_stricter_rerun_cannot_take_flags_back():
 
 
 # ---------------------------------------------------------------------------
+# export_clean_data and the §5 flag log
+# ---------------------------------------------------------------------------
+
+def _flagged_qc():
+    """A toy series with a spike flagged and a gap flagged + partly imputed."""
+    qc = wrappers.flag_spike_unilof(_toy_qc(), field="value", thresh=1.5)["qc"]
+    qc = wrappers.flag_nan(qc, field="value")["qc"]
+    return qc
+
+
+def test_export_writes_the_flag_log_with_the_agents_decisions(tmp_path):
+    """§5: export_clean_data is what turns flags into `{datetime, flagged_by, action, reason}`."""
+    qc = _flagged_qc()
+    spike_at = qc.data.to_pandas().index[50]
+
+    result = wrappers.export_clean_data(
+        qc,
+        decisions=[
+            {"start": str(spike_at), "verdict": "anomaly", "anomaly_type": "spike",
+             "action": "delete", "reason": "robust_z 40, 1 sample wide"},
+            {"start": "2024-01-01T20:00:00", "end": "2024-01-01T21:00:00",
+             "verdict": "anomaly", "anomaly_type": "gap",
+             "action": "impute", "reason": "5-sample gap, well under max_gap"},
+        ],
+        output_dir=tmp_path,
+        stem="toy_l1",
+    )
+
+    written = tmp_path / "toy_l1_flags.json"
+    assert result["flags_path"] == str(written)
+    entries = json.loads(written.read_text())
+
+    assert entries == result["flags"]
+    assert {e["action"] for e in entries} <= {"delete", "impute", "keep", "correct", "undecided"}
+    by_stamp = {e["datetime"]: e for e in entries}
+    deleted = by_stamp[spike_at.strftime("%Y-%m-%dT%H:%M:%S")]
+    assert deleted["action"] == "delete"
+    assert deleted["reason"].startswith("robust_z")
+    assert "flagUniLOF" in deleted["flagged_by"]
+    assert sum(e["action"] == "impute" for e in entries) == 5   # the whole NaN run
+    assert result["n_undecided"] == 0
+    assert result["decisions_matching_no_flagged_row"] == []
+
+
+def test_export_marks_flagged_rows_the_agent_never_judged_as_undecided(tmp_path):
+    """A flag with no decision must not pass silently as a deliberate keep.
+
+    `evaluate.apply_decisions` scores an undecided row as no claim either way, so the
+    only defence against a run that flags everything and concludes nothing is that the
+    export says so — loudly, in the message the agent reads.
+    """
+    result = wrappers.export_clean_data(_flagged_qc(), output_dir=tmp_path, stem="toy_l1")
+
+    entries = json.loads((tmp_path / "toy_l1_flags.json").read_text())
+    assert entries, "a flagged series must not produce an empty flag log"
+    assert all(e["action"] == wrappers.UNDECIDED for e in entries)
+    assert result["n_undecided"] == len(entries)
+    assert "WARNING" in result["message"] and "undecided" in result["message"]
+
+
+def test_export_reports_a_decision_that_matched_no_flagged_row(tmp_path):
+    """A mistyped timestamp is a silent loss of a verdict unless it is reported back."""
+    result = wrappers.export_clean_data(
+        _flagged_qc(),
+        decisions=[{"start": "2024-06-01T00:00:00", "verdict": "normal",
+                    "action": "keep", "reason": "storm"}],
+        output_dir=tmp_path,
+        stem="toy_l1",
+    )
+
+    assert len(result["decisions_matching_no_flagged_row"]) == 1
+    assert "matched no flagged row" in result["message"]
+
+
+def test_export_rejects_an_action_outside_the_contract():
+    """§13: fail loudly rather than write a log evaluate.py cannot read."""
+    with pytest.raises(ValueError, match="delete"):
+        wrappers.export_clean_data(
+            _flagged_qc(),
+            decisions=[{"start": "2024-01-01T12:30:00", "verdict": "anomaly",
+                        "anomaly_type": "spike", "action": "flag", "reason": "x"}],
+        )
+
+
+def test_export_without_an_output_path_writes_nothing(tmp_path):
+    """The runner owns the path; ablation and tests call the tool with no output at all."""
+    result = wrappers.export_clean_data(_flagged_qc())
+
+    assert result["flags_path"] is None
+    assert result["flags"]
+    assert not list(tmp_path.iterdir())
+
+
+# ---------------------------------------------------------------------------
+# The verdict: the agent's actual answer, separate from the treatment (§5, §10)
+# ---------------------------------------------------------------------------
+
+def test_the_verdict_is_recorded_per_row_and_carries_the_agents_own_type():
+    """§10 scores the verdict, so it must reach the log intact and typed by the AGENT.
+
+    The type deliberately does not come from `flagged_by`: a row flagUniLOF found but
+    the agent classified as a plateau is a plateau claim, because classifying it is
+    the agent's job and grading it on the detector's guess measures the detector.
+    """
+    qc = _flagged_qc()
+    idx = qc.data.to_pandas().index
+    spike_at = str(idx[50])
+
+    result = wrappers.export_clean_data(qc, decisions=[
+        {"start": str(idx[0]), "end": str(idx[-1]), "verdict": "normal",
+         "action": "keep", "reason": "storm limb, 14 samples wide"},
+        {"start": spike_at, "verdict": "anomaly", "anomaly_type": "plateau",
+         "action": "delete", "reason": "flagged by UniLOF but 9 samples unchanged"},
+    ])
+
+    entry = next(e for e in result["flags"]
+                 if e["datetime"] == pd.Timestamp(spike_at).strftime("%Y-%m-%dT%H:%M:%S"))
+    assert entry["verdict"] == "anomaly"
+    assert entry["anomaly_type"] == "plateau"      # the agent's call, not flagUniLOF's
+    assert "flagUniLOF" in entry["flagged_by"]
+
+    assert result["n_by_verdict"]["anomaly"] >= 1
+    assert result["n_by_verdict"]["normal"] > 0
+    assert result["n_by_anomaly_type"]["plateau"] == 1
+    assert "VERDICTS" in result["message"]
+
+
+def test_a_normal_verdict_may_not_delete_the_value():
+    """Calling a value real water and then removing it is not a defensible pair.
+
+    Enforced one-directionally (wrappers.UNTREATED_ANOMALY_ACTION): if this were
+    allowed, a run could score as having REJECTED a candidate while the value it
+    claimed to keep is gone from the exported file.
+    """
+    qc = _flagged_qc()
+    at = str(qc.data.to_pandas().index[50])
+
+    for action in ("delete", "correct", "impute"):
+        with pytest.raises(ValueError, match="verdict='normal'"):
+            wrappers.export_clean_data(qc, decisions=[
+                {"start": at, "verdict": "normal", "action": action, "reason": "storm"},
+            ])
+
+
+def test_an_anomaly_may_be_left_untreated_if_the_agent_says_why():
+    """The one allowed divergence: a gap too long for any defensible fill window.
+
+    Forcing consistency here would make the agent either lie about the verdict or
+    impute a gap it had just judged unfillable, so `anomaly` + `keep` is legal — but
+    only as a stated choice, since the pair claims a detection without touching the
+    value.
+    """
+    qc = _flagged_qc()
+    at = str(qc.data.to_pandas().index[50])
+
+    with pytest.raises(ValueError, match="cannot be treated"):
+        wrappers.export_clean_data(qc, decisions=[
+            {"start": at, "verdict": "anomaly", "anomaly_type": "gap",
+             "action": "keep", "reason": "too long"},          # no real justification
+        ])
+
+    result = wrappers.export_clean_data(qc, decisions=[
+        {"start": at, "verdict": "anomaly", "anomaly_type": "gap", "action": "keep",
+         "reason": "47-sample outage, longer than any window I could defend; left NaN"},
+    ])
+    entry = next(e for e in result["flags"]
+                 if e["datetime"] == pd.Timestamp(at).strftime("%Y-%m-%dT%H:%M:%S"))
+    assert (entry["verdict"], entry["action"]) == ("anomaly", "keep")
+    assert result["n_anomalies_left_untreated"] == 1
+    assert "kept as recorded" in result["message"]
+
+
+def test_export_rejects_a_decision_with_no_verdict_or_a_bad_one():
+    """§13: the verdict is the answer, so an export cannot quietly omit it."""
+    qc = _flagged_qc()
+    at = str(qc.data.to_pandas().index[50])
+
+    with pytest.raises(ValueError, match="verdict"):
+        wrappers.export_clean_data(qc, decisions=[
+            {"start": at, "action": "delete", "reason": "spike"},           # missing
+        ])
+    with pytest.raises(ValueError, match="verdict"):
+        wrappers.export_clean_data(qc, decisions=[
+            {"start": at, "verdict": "suspicious", "action": "delete", "reason": "x"},
+        ])
+    with pytest.raises(ValueError, match="anomaly_type"):
+        wrappers.export_clean_data(qc, decisions=[
+            {"start": at, "verdict": "anomaly", "action": "delete", "reason": "x"},
+        ])
+    with pytest.raises(ValueError, match="anomaly_type"):
+        wrappers.export_clean_data(qc, decisions=[
+            {"start": at, "verdict": "anomaly", "anomaly_type": "drift",     # §9.2
+             "action": "delete", "reason": "x"},
+        ])
+    with pytest.raises(ValueError, match="no failure type"):
+        wrappers.export_clean_data(qc, decisions=[
+            {"start": at, "verdict": "normal", "anomaly_type": "spike",
+             "action": "keep", "reason": "x"},
+        ])
+
+
+def test_an_imputed_row_is_recorded_as_a_gap_the_agent_found():
+    """A filled row was missing, and §5 says every missing run is a gap.
+
+    That is a fact about the data rather than a call the agent makes, so the verdict
+    follows the forced `impute` action. Leaving it blank would let a run fill 3,403
+    rows and record no claim about any of them.
+    """
+    qc = wrappers.flag_nan(_toy_qc(), field="value")["qc"]
+    qc = wrappers.impute_rolling(qc, field="value", window="6h", func="median")["qc"]
+
+    result = wrappers.export_clean_data(qc)      # no decisions at all
+    filled = [e for e in result["flags"] if "interpolateByRolling" in e["flagged_by"]]
+
+    assert filled
+    assert all(e["verdict"] == "anomaly" and e["anomaly_type"] == "gap" for e in filled)
+
+
+def test_an_undecided_row_is_neither_a_detection_nor_a_rejection():
+    """`undecided` is a third verdict the agent may not choose (§5).
+
+    It must not read as a considered "normal": one is a judgement, the other is a row
+    nobody looked at, and §10 scores it as no claim in either direction.
+    """
+    result = wrappers.export_clean_data(_flagged_qc())     # nothing adjudicated
+
+    assert all(e["verdict"] == wrappers.UNDECIDED for e in result["flags"])
+    assert all(e["anomaly_type"] == "" for e in result["flags"])
+    assert result["n_by_verdict"][wrappers.UNDECIDED] == len(result["flags"])
+    assert "anomaly" not in result["n_by_verdict"]
+
+
+# ---------------------------------------------------------------------------
 # Context tools (CLAUDE.md §7.3)
 # ---------------------------------------------------------------------------
 
@@ -222,3 +455,279 @@ def test_describe_point_rejects_a_timestamp_outside_the_series():
     qc = _toy_qc()
     with pytest.raises(ValueError):
         wrappers.describe_point(qc, at="1999-01-01T00:00:00", field="value")
+
+
+def test_a_broad_keep_span_cannot_relabel_rows_the_imputer_filled(tmp_path):
+    """A filled row is 'impute' even under a catch-all 'keep' — the value was replaced.
+
+    Measured on a real run (03447687_l1, 2026-08-10): the agent swept up its
+    remaining spike/jump flags with one whole-series 'keep' span, which also covered
+    every gap the imputer had filled. The log then said "left untouched" about 3,429
+    rows whose values had been rewritten, and gap F1 fell from 1.0 to 0.
+    """
+    qc = wrappers.flag_nan(_toy_qc(), field="value")["qc"]
+    qc = wrappers.impute_rolling(qc, field="value", window="6h", func="median")["qc"]
+    idx = qc.data.to_pandas().index
+
+    result = wrappers.export_clean_data(
+        qc,
+        decisions=[{
+            "start": str(idx[0]), "end": str(idx[-1]), "verdict": "normal",
+            "action": "keep", "reason": "catch-all: everything else is genuine water",
+        }],
+        output_dir=tmp_path,
+        stem="toy_l1",
+    )
+
+    entries = json.loads((tmp_path / "toy_l1_flags.json").read_text())
+    filled = [e for e in entries if "interpolateByRolling" in e["flagged_by"]]
+    assert filled, "the toy gap should have been filled"
+    assert all(e["action"] == "impute" for e in filled)
+    assert result["n_keep_rewritten_to_impute"] == len(filled)
+    assert "recorded as 'impute'" in result["message"]
+
+
+def test_an_explicit_delete_still_wins_over_the_impute_default(tmp_path):
+    """Acting further on a filled value is a real decision; only 'keep' is false."""
+    qc = wrappers.flag_nan(_toy_qc(), field="value")["qc"]
+    qc = wrappers.impute_rolling(qc, field="value", window="6h", func="median")["qc"]
+    filled_at = next(
+        e["datetime"] for e in wrappers.export_clean_data(qc)["flags"]
+        if "interpolateByRolling" in e["flagged_by"]
+    )
+
+    result = wrappers.export_clean_data(
+        qc,
+        decisions=[{"start": filled_at, "verdict": "anomaly", "anomaly_type": "gap",
+                    "action": "delete", "reason": "fill is unreliable"}],
+    )
+
+    entry = next(e for e in result["flags"] if e["datetime"] == filled_at)
+    assert entry["action"] == "delete"
+
+
+# ---------------------------------------------------------------------------
+# Payload size (context cost)
+# ---------------------------------------------------------------------------
+
+def test_flagged_datetimes_are_sampled_not_truncated_to_the_head():
+    """A detector must not send thousands of timestamps back on every turn.
+
+    Measured on 03447687_l1 (2026-08-10): the timestamp lists were 34% of a 149k-token
+    request and input tokens were 88% of the run's cost. The sample must be spread
+    across the record — a head would put every point the agent inspects in the first
+    weeks of a two-year series.
+    """
+    n = wrappers.MAX_FLAGGED_DATETIMES * 4
+    idx = pd.date_range("2024-01-01", periods=n, freq="15min")
+    rng = np.random.default_rng(7)
+    v = 10 + rng.normal(0, 0.05, n)
+    v[::2] = 60.0                                   # flag roughly half the series
+    qc = saqc.SaQC(pd.DataFrame({"value": v}, index=idx))
+
+    result = wrappers.flag_range(qc, field="value", min=0, max=50)
+
+    assert result["n_flagged"] > wrappers.MAX_FLAGGED_DATETIMES
+    assert len(result["flagged_datetimes"]) <= wrappers.MAX_FLAGGED_DATETIMES
+    assert result["n_flagged_datetimes_shown"] == len(result["flagged_datetimes"])
+    # Loudly, or the agent writes decisions that silently miss thousands of rows.
+    assert "showing" in result["message"] and str(result["n_flagged"]) in result["message"]
+    # Spread, not a head: the sample must reach the end of the record.
+    shown = pd.DatetimeIndex(result["flagged_datetimes"])
+    assert shown.max() > idx[int(n * 0.9)]
+
+
+def test_a_short_flag_list_is_returned_whole():
+    """The cap must not cost anything on the ordinary case."""
+    result = wrappers.flag_nan(_toy_qc(), field="value")
+
+    assert result["n_flagged"] == 5
+    assert len(result["flagged_datetimes"]) == 5
+    assert "showing" not in result["message"]
+
+
+def test_a_specific_decision_beats_a_broad_catch_all_whatever_the_order(tmp_path):
+    """The narrowest span covering a row wins, not the first one listed.
+
+    Measured on 03447687_l1 (2026-08-11): the agent measured a point, read
+    `reads_like=spike, robust_z=7.4, width=3`, wrote a `delete` for it, and the log
+    recorded `keep` — because a whole-series catch-all appeared earlier in the list
+    and first-covering-span-wins handed it the row. A broad span is a statement about
+    what is left over; it must lose to anything more specific.
+    """
+    qc = _flagged_qc()
+    idx = qc.data.to_pandas().index
+    spike_at = str(idx[50])
+
+    result = wrappers.export_clean_data(
+        qc,
+        decisions=[
+            # Catch-all FIRST — the ordering that used to silently win.
+            {"start": str(idx[0]), "end": str(idx[-1]), "verdict": "normal",
+             "action": "keep", "reason": "everything else is genuine water"},
+            {"start": spike_at, "verdict": "anomaly", "anomaly_type": "spike",
+             "action": "delete", "reason": "robust_z 7.4, width 3"},
+        ],
+    )
+
+    entry = next(e for e in result["flags"]
+                 if e["datetime"] == pd.Timestamp(spike_at).strftime("%Y-%m-%dT%H:%M:%S"))
+    assert entry["action"] == "delete"
+    assert "7.4" in entry["reason"]
+    # The catch-all still does its job on every row the specific span did not claim.
+    assert result["n_by_action"]["keep"] > 0
+
+
+def test_a_broad_span_whose_rows_are_all_claimed_is_not_reported_as_unmatched(tmp_path):
+    """Only a span matching NO flagged row is an error worth telling the agent about."""
+    qc = _flagged_qc()
+    idx = qc.data.to_pandas().index
+
+    result = wrappers.export_clean_data(
+        qc,
+        decisions=[
+            {"start": str(idx[0]), "end": str(idx[-1]), "verdict": "normal",
+             "action": "keep", "reason": "rest"},
+            {"start": str(idx[50]), "verdict": "anomaly", "anomaly_type": "spike",
+             "action": "delete", "reason": "spike"},
+            {"start": "2019-01-01T00:00:00", "verdict": "normal",
+             "action": "keep", "reason": "typo, matches nothing"},
+        ],
+    )
+
+    unmatched = result["decisions_matching_no_flagged_row"]
+    assert len(unmatched) == 1 and "2019" in unmatched[0]
+
+
+def test_slope_ratio_separates_a_flush_event_from_an_artifact():
+    """The fall/rise ratio must be measured at the scale the decay happens on.
+
+    A small first-flush event and a debris strike are both 1-3 samples wide and the
+    flush often has the HIGHER robust_z, so width and z cannot tell them apart. What
+    separates them is that the flush decays over 3-5 samples while the artifact snaps
+    back. That only shows at a ~45-minute window: past ~90 min the decay is over, the
+    window fills with flat surroundings, and the ordering reverses (CLAUDE.md §7.3).
+    """
+    idx = pd.date_range("2024-01-01", periods=200, freq="15min")
+    base = 10 + np.zeros(200)
+
+    flush = base.copy()
+    flush[100:106] = [40.0, 28.0, 21.0, 16.0, 13.0, 11.0]   # one-sample rise, long decay
+    artifact = base.copy()
+    artifact[100] = 40.0                                     # rises and snaps back
+
+    def ratio(values, n):
+        qc = saqc.SaQC(pd.DataFrame({"value": values}, index=idx))
+        return wrappers.describe_point(
+            qc, at=str(idx[100]), n_before=n, n_after=n
+        )["slope"]["fall_rise_ratio"]
+
+    # At the default 45-minute window the flush is clearly gentler on the way down.
+    assert ratio(flush, 3) < 0.8 < ratio(artifact, 3)
+    # And the compact row the agent actually reads carries it.
+    qc = saqc.SaQC(pd.DataFrame({"value": flush}, index=idx))
+    row = wrappers.describe_points(qc, ats=[str(idx[100])])["points"][0]
+    assert row["fall_rise_ratio"] < 0.8
+    assert row["samples_to_recover"] >= 3
+
+
+def test_a_judgement_call_must_carry_its_reasoning(tmp_path):
+    """Marking a decision 'judgement-call' obliges the agent to show its working."""
+    qc = _flagged_qc()
+    at = str(qc.data.to_pandas().index[50])
+
+    with pytest.raises(ValueError, match="judgement-call"):
+        wrappers.export_clean_data(qc, decisions=[
+            {"start": at, "verdict": "anomaly", "anomaly_type": "spike",
+             "action": "delete", "reason": "spike",
+             "difficulty": "judgement-call"},          # no deliberation
+        ])
+
+    ok = wrappers.export_clean_data(qc, decisions=[
+        {"start": at, "verdict": "anomaly", "anomaly_type": "spike",
+         "action": "delete", "reason": "spike",
+         "difficulty": "judgement-call",
+         "deliberation": "Width 1 and robust_z 14 say artifact, but the fall decays over "
+                         "3 samples which argues flush. Deleted because the recovery is "
+                         "within noise; a 5-sample decay would have changed my mind."},
+    ])
+    entry = next(e for e in ok["flags"]
+                 if e["datetime"] == pd.Timestamp(at).strftime("%Y-%m-%dT%H:%M:%S"))
+    assert entry["rationale_source"] == "agent-deliberation"
+    assert "changed my mind" in entry["deliberation"]
+
+
+def test_a_blanket_span_is_labelled_as_one_and_reported(tmp_path):
+    """A span covering most of the flags speaks for the remainder, not for any one row.
+
+    Every run so far had one of these absorb points the agent had actually measured,
+    and the log could not distinguish that from a considered call (§5).
+    """
+    qc = _flagged_qc()
+    idx = qc.data.to_pandas().index
+
+    result = wrappers.export_clean_data(qc, decisions=[
+        {"start": str(idx[0]), "end": str(idx[-1]), "verdict": "normal",
+         "action": "keep", "reason": "the rest"},
+        {"start": str(idx[50]), "verdict": "anomaly", "anomaly_type": "spike",
+         "action": "delete", "reason": "robust_z 40, width 1"},
+    ])
+
+    by_source = result["n_by_rationale_source"]
+    assert by_source.get("blanket", 0) > 0
+    assert by_source.get("agent-reason", 0) == 1
+    assert "blanket" in result["message"]
+
+    blanketed = next(e for e in result["flags"] if e["rationale_source"] == "blanket")
+    assert "blanket" in blanketed["rationale"]
+    # And a row nothing covered says so in its own words rather than looking decided.
+    plain = wrappers.export_clean_data(qc)["flags"][0]
+    assert plain["rationale_source"] == "deterministic"
+    assert "never adjudicated" in plain["rationale"]
+
+
+def test_decision_audit_does_not_hide_an_overwritten_anomaly_as_a_success():
+    """An anomaly the imputer overwrote is a miss, and must not be filed as `imputed`.
+
+    On 03447687_l1 the page reported missed=0 while 10 injected spikes and 3 level
+    shifts carried action=impute — overwritten by interpolateByRolling (the §7.1
+    dfilter bug) before the agent judged them. Folding those into `imputed` made a
+    silent failure look like successful gap-filling.
+    """
+    from src.workbench.decision_audit import categorise, UNHANDLED_ANOMALY
+
+    assert categorise("impute", "gap", flagged=True) == "imputed"
+    assert categorise("impute", "spike", flagged=True) == "overwritten-anomaly"
+    assert categorise("impute", "", flagged=True) == "overwritten-water"
+    assert categorise("keep", "spike", flagged=True) == "missed"
+    assert categorise("keep", "gap", flagged=True) == "left-missing"
+    assert categorise("", "spike", flagged=False) == "undetected"
+    assert categorise("delete", "", flagged=True) == "wrongly-deleted"
+
+    # The three ways an anomaly can go unhandled must all be counted as such.
+    assert set(UNHANDLED_ANOMALY) == {"missed", "overwritten-anomaly", "undetected"}
+
+
+def test_impute_rolling_does_not_overwrite_a_flagged_reading():
+    """The imputer must fill genuine gaps only, never a row a detector flagged.
+
+    SaQC masks rows whose flag is >= `dfilter` before a function runs, so without
+    dfilter=inf an already-flagged reading looks missing to the imputer and gets
+    replaced by a rolling median. Measured on 03447687_l1 (2026-08-10): 1,887 real
+    readings silently rewritten, and 13 injected anomalies never judged because the
+    overwrite gave them action=impute (§7.1).
+    """
+    idx = pd.date_range("2024-01-01", periods=60, freq="15min")
+    values = 10 + np.zeros(60)
+    values[20] = 80.0            # a real reading a detector will flag
+    values[40:43] = np.nan       # a genuine gap
+
+    qc = saqc.SaQC(pd.DataFrame({"value": values}, index=idx))
+    qc = wrappers.flag_range(qc, field="value", min=0, max=50)["qc"]
+    result = wrappers.impute_rolling(qc, field="value", window="3h", func="median")
+
+    got = result["qc"].data.to_pandas()["value"]
+    assert got.iloc[20] == 80.0, "the flagged reading was overwritten by the imputer"
+    assert got.iloc[40:43].notna().all(), "the genuine gap was not filled"
+    # The imputer's own flag history must now count only what it actually filled.
+    assert result["n_flagged"] == result["n_imputed"] == 3

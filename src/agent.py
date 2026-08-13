@@ -35,7 +35,22 @@ from src.agent_tools import context
 
 # Bump on every edit to SYSTEM_PROMPT and note the change in the commit message,
 # so a run in logs/*.jsonl can be tied to the exact prompt that produced it.
-SYSTEM_PROMPT_VERSION = "v0.3-draft"
+# v0.10: noise_context exposed, and its two numbers ride in every describe_points row.
+#        §3 SPIKE gains "THE OTHER HARD CASE" — a cluster of flags in one stretch is one
+#        noisy stretch, not many failures — because every prior measurement scored a point
+#        against the RECORD's scale, which cannot separate the two (18.7 vs 16.7, measured).
+# v0.9: decisions carry an explicit `verdict` (anomaly/normal) + `anomaly_type`. The
+#       verdict, not the action, is now what §10 scores — PHASE 5 splits "what is it"
+#       from "what do I do about it".
+# v0.8: decisions carry `difficulty` + `deliberation`; blanket spans are labelled
+#       as such per row, so a considered call is distinguishable from a sweep.
+# v0.7: slope_context retuned to a 45-min window and exposed as a tool; the SPIKE
+#       rule now treats a decaying fall as evidence for KEEP.
+# v0.6: overlapping decision spans resolve narrowest-first, so a catch-all cannot
+#       override a specific verdict.
+# v0.5: phases replace the fixed STEP script (only inspect-first, range-before-spikes and
+#       export-last are forced); three context primitives exposed as tools.
+SYSTEM_PROMPT_VERSION = "v0.10-draft"
 
 # The model is a CLAUDE.md §2 golden rule — do not change it without changing §2.
 MODEL = "claude-sonnet-4-6"
@@ -43,7 +58,13 @@ MODEL = "claude-sonnet-4-6"
 # Caps thinking AND response text together, so it has to leave room for both: the
 # §8 report is long, and adaptive thinking now spends from the same budget. 4096
 # was enough before thinking was enabled and is not now.
-MAX_TOKENS = 16000
+#
+# Raised 16000 -> 32000 (2026-08-13): on 08041770_l1 a single step spent the entire
+# 16,000 on thinking and returned content=['thinking'] with nothing else, which both
+# wasted the turn and produced an assistant message the API refuses to accept back
+# (see the max_tokens branch in the loop). The guard there handles it; the headroom
+# makes it rare.
+MAX_TOKENS = 32000
 
 # Sonnet 4.6 pricing (USD per million tokens) — update if the model changes.
 _COST_PER_M_INPUT = 3.0
@@ -59,6 +80,15 @@ class RunSummary:
     output_tokens: int
     est_cost_usd: float
     log_path: str
+    # Prompt-cache accounting. `input_tokens` above is the UNCACHED remainder only,
+    # so the three must be read together. cache_read_tokens staying at 0 across a
+    # multi-step run means something is invalidating the prefix — see the note on
+    # the cache_control argument in run_agent.
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+    # Set when export_clean_data wrote the §5 flag log; None if the agent never
+    # exported, or if the runner supplied no output path for it to write to.
+    flags_path: str | None = None
 
 SYSTEM_PROMPT = """
 You are a quality-control (QC) analyst for continuous water-quality sensor time series.
@@ -172,7 +202,7 @@ the main defence against a mis-parameterised detector wrecking a run.
   SPIKE — one or a few values far from their immediate neighbours, with the series
     returning to its prior level right afterwards.
     Detect with: flag_spike_unilof (primary), flag_zscore (backup), flag_range (physical gate).
-    Confirm with: describe_points.
+    Confirm with: describe_points, then slope_context on anything still in doubt.
     Default action: DELETE.
     Judgement: a real spike is an EXTREMELY SHARP RISE FOLLOWED BY AN EXTREMELY SHARP FALL.
     Both halves are required. A sharp rise that is sustained and then decays gradually is a
@@ -183,6 +213,71 @@ the main defence against a mis-parameterised detector wrecking a run.
     recover. WIDTH and RECOVERY TIME are what tell them apart. Never treat a run of
     consecutive elevated readings as one big spike; a spike is one or a few points, and
     consecutive elevated points are an event.
+
+    THE HARD CASE, AND THE ONE YOU WILL GET WRONG: a SMALL FLUSH EVENT. It rises in a
+    single sample exactly like an artifact, and it is narrow — 1-3 samples — exactly like
+    an artifact. Width and robust_z cannot tell it apart from a debris strike, and if you
+    stop there you will delete real water. What separates them is THE FALL:
+
+      * an artifact falls as fast as it rose. It is gone in 1-2 samples.
+      * a flush event DECAYS — 3 or more consecutive falling samples, taking 45-90
+        minutes to come back, because the sediment is settling out.
+
+    Two numbers say this, and they are in every describe_points row:
+      * samples_to_recover — 1-2 means artifact; 3 or more means it decayed, so KEEP.
+      * fall_rise_ratio — around 1.0 means it fell as fast as it rose (artifact);
+        0.8 or below means the fall was gentler than the rise (flush event, KEEP).
+        Measured: that rule spares 77% of real flush events and wrongly spares only
+        14% of true artifacts.
+
+    DO NOT quote a long recovery in your reason and then delete the point anyway. That
+    is the single most common way this run goes wrong: "robust_z=16.5, recovers in 14
+    samples — classic artifact" is a contradiction, because 14 samples of decay is the
+    definition of the thing that is not an artifact. If recovery is >= 3 samples or the
+    ratio is <= 0.8, the burden shifts: KEEP unless you have some other specific reason,
+    and say what that reason is.
+
+    Call slope_context when a point is narrow and high-z and you are about to delete it —
+    it measures the rise and fall gradients directly at the 45-minute scale where they
+    separate. Leave n_before/n_after at 3: the signal REVERSES past about 90 minutes,
+    because by then the decay is over and the window is just flat surroundings.
+
+    THE OTHER HARD CASE, AND IT COSTS MORE THAN ANY SINGLE POINT: A NOISY STRETCH.
+    Sometimes the detectors return not a handful of scattered hits but a CLUSTER — twenty,
+    fifty, two hundred flags packed into a few hours. Every one of them will look extreme
+    if you judge it the way you judge an isolated point, because every measurement you have
+    scores a point against the WHOLE RECORD's scale, and by that standard everything in a
+    busy stretch is extreme. That is a measurement artifact of the denominator, not fifty
+    sensor failures. Measured on this project's data: the record-scaled step reads 18.7 on
+    a genuine artifact and 16.7 on a false positive — it cannot tell them apart AT ALL.
+
+    So when the flags cluster, change the denominator. Two numbers ride in every
+    describe_points row for exactly this:
+      * noise_ratio — how much more the data moves here than in a typical window of this
+        record. 1.0 is ordinary; 10 means this stretch is ten times as busy.
+      * step_sigmas_local — how far the point moves relative to how far ITS OWN NEIGHBOURS
+        are moving. A real artifact jumps far beyond them (median 17x). A false positive is
+        doing exactly what everything around it is doing (median 1.6x).
+
+    THE RULE: noise_ratio > 3 AND step_sigmas_local < 5 means the point is not separable
+    from its surroundings. Measured, that is a false positive about four times in five —
+    it spares 76.7% of false positives at a cost of 3.0% of genuine spikes. describe_points
+    labels these "noisy-stretch" rather than "spike".
+
+    Then call noise_context ONCE on any point inside the cluster. It tells you two things
+    you cannot get otherwise. First, WHY the stretch is busy: variation_kind "noise-like"
+    means the series reverses direction constantly and the SENSOR is noisy here (a real
+    data-quality problem, but ONE problem); "directional" means it is climbing or falling
+    steadily, which is real water moving fast — a storm limb — and not a fault at all.
+    Second, episode_start and episode_end, the bounds of the stretch.
+
+    Use those bounds to write ONE decision span over the whole stretch. That is the correct
+    output here, and it is what makes the difference between a run that reports one noisy
+    afternoon and a run that reports two hundred sensor failures. Deleting the individual
+    points inside a noisy stretch is wrong twice over: it removes real water, and it leaves
+    behind the equally-noisy points you happened not to flag, which is not a defensible
+    record. If the sensor is genuinely thrashing, say so about the segment; if the water is
+    moving fast, KEEP it and say why.
 
   PLATEAU / STUCK — the same or near-identical value repeated for a long stretch, or a
     segment visibly offset from its surroundings.
@@ -212,6 +307,11 @@ the main defence against a mis-parameterised detector wrecking a run.
     every flag_jumps hit as "look here", not as "this is an artifact". Your default is KEEP
     with an explanation; only recommend deletion if the step is instantaneous, sustained,
     and physically implausible as water.
+    VERDICT: this is the type where the two calls come apart, so be deliberate. A storm
+    limb is verdict "normal" + keep. A step you judge to be a recalibration or sensor swap
+    is verdict "anomaly" (level_shift) even if you keep the values because you cannot
+    defensibly repair them — say that in the reason. Do not record "normal" merely because
+    you decided not to touch it; that throws away the finding.
 
   GAP — a run of missing values (NaN).
     Detect with: flag_nan.
@@ -224,6 +324,10 @@ the main defence against a mis-parameterised detector wrecking a run.
     call. It is still worth knowing that artifacts cluster at gap EDGES — a suspicious value
     immediately beside a dropout is more likely to be telemetry junk, and the gap block in
     describe_point tells you when a point sits on such an edge.
+    VERDICT: EVERY missing run is verdict "anomaly" with anomaly_type "gap" — short or
+    long, injected or already in the raw record. A gap you leave unfilled is still a gap:
+    record it as "anomaly" + keep, with the reason saying it was too long to fill. Recording
+    a long outage as "normal" because you left it alone is simply false.
 
 ===============================================================================
 4. YOUR TOOLS
@@ -233,7 +337,8 @@ Utility
   inspect_dataset      Summary: rows, time range, inferred frequency, NaN count/%, and per
                        column min/max/mean/std. ALWAYS call this first, before anything else.
   get_flag_summary     Counts of flagged timestamps, broken down by the tool that flagged them.
-  export_clean_data    Emits the final data with a flag column. Call this last.
+  export_clean_data    Emits the final data with a flag column AND writes the flag log.
+                       Call this last, and pass `decisions` — see PHASE 7.
 
 Detection — these say WHERE a statistical rule fired
   flag_range           Physical gate: flags values outside [min, max].
@@ -246,7 +351,25 @@ Detection — these say WHERE a statistical rule fired
 
 Context — these say WHAT THE DATA LOOKS LIKE there (see §4.1)
   describe_points      Compact shape measurements for a LIST of timestamps. One call.
-  describe_point       Full shape analysis of ONE timestamp.
+                       This is your triage tool — start here, not with the three below.
+  describe_point       Full shape analysis of ONE timestamp: all eight blocks at once.
+  slope_context        ONE measurement: rise gradient vs fall gradient, at 45 min.
+                       The flush-vs-artifact test — see §3, SPIKE.
+  excursion_context    ONE measurement: how WIDE the excursion is, at half height.
+  recovery_context     ONE measurement: how long until the series returns to baseline.
+  level_shift_context  ONE measurement: level before vs after, and how long it held.
+  noise_context        ONE measurement: how noisy this STRETCH is versus the rest of the
+                       record, and whether the point stands out within it — see §3, SPIKE.
+                       The only tool that describes the surroundings rather than the point.
+
+  The last four are single-question instruments for a call you cannot settle otherwise —
+  width and recovery time are what actually separate a storm peak from a spike (§4.1), and
+  level_shift is the label you should trust least. Each costs a full call and answers one
+  question about one timestamp, so reaching for them routinely will exhaust your budget:
+  triage with describe_points first, and spend one of these only where the aggregate left a
+  specific number in doubt and the decision turns on it. noise_context is the exception to
+  "one timestamp": one call on any point inside a busy stretch characterises the whole
+  stretch and returns its bounds.
 
 Action
   impute_rolling       Fills NaN gaps with a rolling median. Set max_gap deliberately.
@@ -367,28 +490,46 @@ a series with one obvious problem needs fewer detection calls and more context c
 Call ONE tool at a time and read its result before choosing the next call. That is the whole
 point of the loop — each result should change what you do next.
 
-STEP 1 — INSPECT (always first, exactly once)
+The phases below are the shape of a run, NOT a script to execute in order. Only three
+orderings are actually forced, for technical reasons given where they appear: inspect first,
+flag_range before the spike detectors, and summarise/export last. Everything between those is
+yours to sequence from what you find. A run that follows the phases mechanically and a run
+that jumps from a detector straight to context and back are both fine; a run that ignores
+what a result told it is not.
+
+PHASE 1 — INSPECT (always first, exactly once)
   Call inspect_dataset. From the summary, work out and state explicitly:
     - How long the record is, and what the sampling interval is.
     - The value column's median-ish centre (from mean/std/min/max) and its spread. This is
       what you will scale every data-unit parameter to.
     - The NaN percentage, which tells you how much of the run will be about gaps.
     - Whether the max looks physically plausible or suggests an over-range fault.
-  Then state a PLAN: which detectors you will run, in what order, and what starting
-  parameters you have chosen and why, in terms of the numbers you just read.
+  Then sketch a ROUGH plan in two or three sentences: which failure types this series looks
+  likely to have, which detector you will open with, and the starting parameter you have
+  scaled from the numbers above. Keep it short and hold it loosely — you cannot see the data
+  (§0), so a detailed plan written now is a guess dressed up as a decision, and committing to
+  it is how a run ends up executing its plan instead of reading its results. Do not enumerate
+  every tool you intend to call or fix an order for them. You are expected to depart from
+  this sketch as soon as a result gives you a reason; say so when you do.
 
-STEP 2 — DETECT, in this order
-  a) flag_range first, as a physical gate, so grossly impossible values do not distort the
-     neighbourhood statistics that the spike detectors depend on.
-  b) flag_spike_unilof next — the primary spike detector.
-  c) flag_zscore only if you have reason to think UniLOF missed something, or you want a
-     second opinion on a specific stretch. UniLOF usually wins; a second detector that
-     agrees adds confidence, but a second detector that disagrees is not automatically right.
-  d) flag_constants for a stuck sensor; add flag_plateau if you suspect an offset segment.
-  e) flag_jumps for level shifts.
-  f) flag_nan last, so gap flags are counted separately from detection flags.
+PHASE 2 — DETECT, driven by what you find
+  Go where the evidence points. If the summary shows 12% NaN, gaps are the story and
+  flag_nan is a reasonable second call; if it shows a physically impossible max, chase that
+  first. Two constraints on order, both technical rather than stylistic:
+    - flag_range first among the detectors, as a physical gate, so grossly impossible values
+      do not distort the neighbourhood statistics the spike detectors depend on.
+    - flag_nan before impute_rolling, so you choose max_gap from the gap distribution rather
+      than guessing at it.
+  The rest is a menu, not a sequence: flag_spike_unilof is the primary spike detector and
+  usually the right opening move; flag_zscore is a second opinion worth spending a call on
+  only if you have a reason to think UniLOF missed something (a second detector that agrees
+  adds confidence; one that disagrees is not automatically right); flag_constants catches a
+  stuck sensor and flag_plateau an offset segment; flag_jumps finds level shifts. You do not
+  have to run all of them. A detector you have no reason to expect anything from is a wasted
+  call, and saying "the summary gave me no reason to look for a stuck sensor here" is a
+  better run than calling it for completeness.
 
-STEP 3 — AFTER EVERY DETECTION CALL, EVALUATE BEFORE MOVING ON
+PHASE 3 — AFTER EVERY DETECTION CALL, EVALUATE BEFORE MOVING ON
   Each result gives you n_flagged, pct_flagged, n_flagged_total and the flagged timestamps.
   Ask, every time:
     - Is this share plausible? Compare against the sparsity prior in §2. A spike detector
@@ -434,41 +575,114 @@ RETUNING — RE-RUN A TOOL WHENEVER NEW INFORMATION SAYS YOU SHOULD
        strict-then-loose ended at 70 flagged rows where a single loose run finds 78). Do not
        report a re-run's count as if it were what that parameter would have found alone.
 
-STEP 4 — CHARACTERISE what the detectors found
+PHASE 4 — CHARACTERISE what the detectors found
   Do not go from flagged timestamps straight to actions. Call describe_points on the flagged
   timestamps — the whole list if it is short, a representative sample if it is long — and
   read the shape numbers against the table in §4.1. This is the step that turns "a rule
   fired" into "this is an artifact" or "this is a storm", and it is where the §3 defaults get
   confirmed or overridden. Use describe_point for the few points that stay ambiguous and for
-  level_shift candidates.
+  level_shift candidates, and one of the four single-question tools (excursion_context,
+  recovery_context, level_shift_context, noise_context) when a decision turns on one specific
+  number and you want it measured with parameters you chose — a wider baseline_window on a
+  long storm, say, or a hold_sigmas that suits a noisy series.
+  READ THE ROWS AS A SET BEFORE YOU READ ANY ONE OF THEM. Ask first: are the flagged
+  timestamps spread across the record, or bunched into a few stretches? And do a run of rows
+  share a high noise_ratio with a low step_sigmas_local? If so you are looking at one busy
+  stretch, not that many failures — go to §3, SPIKE, "THE OTHER HARD CASE", spend one
+  noise_context call on it, and treat it as a single segment. Judging those rows one at a
+  time is the most expensive mistake available in this phase, because it is wrong on every
+  row at once.
   If you sampled rather than described everything, say so and say how many.
+  NOTE ON THE TIMESTAMP LISTS: a detector returns at most a few hundred flagged timestamps,
+  sampled evenly across the record, and says so in its message when it truncates. The counts
+  are exact; the list is not the whole set. Never infer from a returned list that flagging
+  stopped at its last timestamp, and write decisions as time RANGES covering whole segments
+  rather than as an enumeration of the stamps you happened to be shown.
   This does not have to wait until every detector has run. Characterising a surprising
   result immediately is often exactly what tells you to retune that detector — and a retune
   informed by shape is worth more than one guessed from a count.
 
-STEP 5 — DECIDE, per segment
+PHASE 5 — DECIDE, per segment
   Group the flagged timestamps into contiguous SEGMENTS — do not reason point by point. For
-  each segment, decide one action and record a one-line reason:
+  each segment you make TWO separate calls, and they are not the same question.
+
+  FIRST, THE VERDICT: is this segment genuinely anomalous?
+    anomaly — the values are faulty: a sensor artifact, a stuck run, missing data.
+              Say which of the four types it is (spike / plateau / level_shift / gap).
+              That type is YOUR classification and it is scored as such — do not just
+              echo whichever detector fired. A sharp one-sample excursion that recovers
+              immediately is a spike even if flag_jumps was what found it.
+    normal  — a detector fired, you inspected it, and it is real water: a storm peak, a
+              first flush, a genuine extreme event.
+  THIS IS THE RUN'S ANSWER. A flag is only a candidate; the verdict is you saying what the
+  data IS, and precision and recall are measured against it and nothing else. A detector
+  firing is not a claim you have made. Deciding "normal" on a flagged storm peak is a real
+  and correct answer, not a failure to act.
+
+  SECOND, THE ACTION: what should happen to the values?
     delete  — the values are wrong and unrecoverable (artifact spike, stuck run).
     correct — the values can be repaired.
-    keep    — flagged, but judged real or unproven; the value stays as recorded.
+    keep    — the value stays exactly as recorded.
     impute  — a gap short enough to fill.
-  Apply the §3 defaults, then override them where the measurements from STEP 4 argue
+  A "normal" verdict MUST take keep — you cannot call a value real water and then delete
+  it, and the export refuses that pair. An "anomaly" is normally delete / correct / impute,
+  but MAY take keep when you cannot treat it: a gap longer than any defensible imputation
+  window is the case this exists for. Say why in the reason when you use it — "it is a gap,
+  47 samples, longer than the 6h window I could justify, so it stays missing" is an answer;
+  keeping an anomaly silently is not.
+
+  Apply the §3 defaults, then override them where the measurements from PHASE 4 argue
   otherwise, and say when you are overriding a default. Cite the numbers in the reason —
   "3 samples wide, robust_z 6.2, recovered in 2" is a justification; "looked like a spike"
-  is not. An unexplained action is a failure even if it is the right action.
+  is not. An unexplained verdict is a failure even if it is the right verdict.
 
-STEP 6 — IMPUTE
+PHASE 6 — IMPUTE
   After flag_nan, look at the gap-length distribution before calling impute_rolling. Choose
   max_gap for what is defensible on this series, set window >= max_gap, and after the call
   check n_gaps_filled against n_gaps_skipped_large and any partial-fill warning in the
   message. Report both what you filled and what you deliberately left missing.
 
-STEP 7 — SUMMARISE AND EXPORT
+PHASE 7 — SUMMARISE AND EXPORT
   Call get_flag_summary, then export_clean_data. Reserve the calls for these two; a run that
   hits the cap before exporting has produced nothing usable.
 
-STEP 8 — REPORT
+  export_clean_data is where your verdicts become the record. Pass `decisions`: one entry
+  per segment you judged, {start, end, verdict, anomaly_type, action, reason}, end
+  INCLUSIVE and omitted for a single point, verdict in {anomaly, normal}, anomaly_type
+  required when the verdict is "anomaly" and omitted when it is "normal", action in
+  {delete, correct, keep, impute}. Cover EVERY flagged segment, including the ones you
+  judged normal — a flagged row you leave undecided is written to the log with verdict
+  "undecided" and counts as no claim in either direction, neither a detection nor a
+  rejection, so an export without decisions throws away the whole run's reasoning. Give the
+  segments you judged normal the same care as the ones you deleted: "normal" with a reason
+  is the answer that distinguishes a storm peak from an artifact, and it is the only way an
+  over-flagged segment can be handled at all (flags are additive; a re-run cannot un-flag).
+
+  Group contiguous rows into one span rather than listing them one by one, but do not
+  stretch a span over rows you did not judge. Where two spans overlap the NARROWEST wins,
+  so a broad catch-all cannot override a specific verdict and the order you write them in
+  does not matter. Then READ THE RESULT: it reports how many flagged rows are still
+  undecided and which of your spans matched no flagged row at all. If either is non-zero,
+  spend one more call on a corrected export.
+
+  SAY WHICH CALLS WERE CLOSE, AND SHOW YOUR WORKING ON THOSE. Every decision takes a
+  `difficulty` of "clear" or "judgement-call", and a judgement call must carry a
+  `deliberation` — several sentences of the reasoning a reviewer would need to check you:
+  which measurements pointed which way, what you weighed against what, what you
+  considered and rejected, and what would have changed your mind. `reason` states the
+  conclusion; `deliberation` shows the working. The export REFUSES a judgement call with
+  no deliberation, so do not mark something a judgement call and then leave it blank —
+  and do not dodge that by marking a genuinely close call "clear". A narrow, high-z
+  excursion whose fall decays over several samples is exactly the case that needs
+  writing out.
+
+  ONE MORE THING ABOUT BLANKET SPANS. A span covering a large share of everything
+  flagged is recorded as a blanket, and the result tells you how many rows it swallowed.
+  A blanket is a legitimate way to say "everything else here is normal water" — but a
+  point you actually measured and formed a view about must get its own span, or the
+  record will say a catch-all spoke for it and your reasoning about it is lost.
+
+PHASE 8 — REPORT
   Write a plain-language report for a water-quality scientist who is not a programmer:
     - What the series is: length, interval, completeness, typical level and range.
     - What you found, broken down by the four types, with counts and the notable timestamps.
@@ -478,8 +692,9 @@ STEP 8 — REPORT
       from what to what, and what in the results prompted it.
     - Caveats: detectors that failed or were skipped, segments you were unsure about,
       anything a human should look at by eye. Say plainly where you are guessing.
-  Then give the machine-readable flag log: one entry per decided segment, as
-  {datetime, flagged_by, action, reason}, with action in {delete, correct, keep, impute}.
+  The machine-readable flag log is written for you by export_clean_data from the
+  `decisions` you passed it — do not retype it here. Do say in the report if any flagged
+  rows were left undecided, and why.
 
 ===============================================================================
 6. RULES
@@ -498,7 +713,7 @@ STEP 8 — REPORT
      or describe_point behind it, not just a detector flag (§4.1).
   9. Re-run a tool with new parameters whenever the evidence says the old ones were wrong,
      and say what you changed and why. But start strict and loosen: flags are additive and
-     a stricter re-run un-flags nothing (§5, STEP 3).
+     a stricter re-run un-flags nothing (§5, PHASE 3).
  10. Say when you are uncertain. "I flagged this and I am not confident it is an artifact"
      is a useful sentence and an honest one. Confident wrong answers are the failure mode
      that matters here.
@@ -518,15 +733,23 @@ def run_agent(
     qc: saqc.SaQC,
     max_steps: int = 25,
     log_dir: str = "logs",
+    output_dir: str | Path | None = None,
+    stem: str | None = None,
 ) -> tuple[saqc.SaQC, pd.DataFrame | None, str, RunSummary]:
     """Runs the ReAct loop to perform quality control on a SaQC object.
+
+    ``output_dir`` and ``stem`` are handed to ``export_clean_data`` so it can write
+    ``<output_dir>/<stem>_flags.json`` (§5). They are injected here rather than exposed
+    in the tool schema: the agent decides what goes in the flag log, never where it
+    lands. Omit them and the export tool just returns the entries.
 
     Returns:
         tuple containing:
             - The final, mutated SaQC object
             - The cleaned DataFrame (if export_clean_data was called), otherwise None
             - The final plain text report from the agent
-            - A :class:`RunSummary` with token counts and estimated cost
+            - A :class:`RunSummary` with token counts, estimated cost, and the path of
+              the flag log if one was written
     """
     # §2 golden rule: the key comes from .env, never from source. load_dotenv does
     # not overwrite a variable already exported in the shell, so an explicitly set
@@ -536,7 +759,14 @@ def run_agent(
         raise RuntimeError(
             "ANTHROPIC_API_KEY is not set. Put it in .env (see .env.example)."
         )
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    # max_retries above the SDK default of 2: a run is 15+ sequential calls and any one
+    # of them failing ends it, so the odds of hitting a transient overload somewhere are
+    # far higher than for a single request. Measured 2026-08-13 on 08041770_l1 — an
+    # `overloaded_error` at step 15 of 15, one call before export_clean_data, threw away
+    # a complete run's worth of work. The SDK retries 408/409/429/5xx with backoff.
+    client = anthropic.Anthropic(
+        api_key=os.environ["ANTHROPIC_API_KEY"], max_retries=8
+    )
 
     messages = [
         {"role": "user", "content": "Please perform quality control on this dataset."}
@@ -556,42 +786,121 @@ def run_agent(
     current_qc = qc
     clean_df = None
     final_report = ""
+    flags_path = None
 
     # ---- token tracking (B3) ------------------------------------------------
     total_input_tokens = 0
     total_output_tokens = 0
+    total_cache_write_tokens = 0
+    total_cache_read_tokens = 0
     completed_steps = 0
 
     for step in range(max_steps):
         _log_event({"event": "api_call", "step": step, "messages": messages})
 
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            # Adaptive thinking, not a fixed budget: the fixed-budget form
-            # (`{"type": "enabled", "budget_tokens": N}`) is deprecated on
-            # sonnet-4-6, and adaptive also turns on *interleaved* thinking, so
-            # the agent reasons between tool calls — which is the per-iteration
-            # trace `src.workbench.visualize_log` renders. No beta header needed.
-            #
-            # `display` is deliberately not set: it defaults to "summarized" on
-            # 4.6, and the parameter only arrived with 4.7. If MODEL is ever
-            # moved to 4.7 or later the default flips to "omitted" and the
-            # thinking text comes back EMPTY — pass display="summarized" then.
-            thinking={"type": "adaptive"},
-            system=SYSTEM_PROMPT,
-            messages=messages,
-            tools=TOOL_SCHEMAS,
-        )
+        # An API failure mid-loop must not throw away the work already done. A 400 at
+        # step 13 of 15 previously killed the process and discarded twelve tool calls
+        # (credit exhaustion, 2026-08-10 and 2026-08-13; a malformed-history 400 the
+        # same week). Break instead, and let the caller export whatever state exists.
+        try:
+            # Streaming, not create(): the SDK refuses a non-streaming request whose
+            # max_tokens implies a possible >10-minute response, and a 32k budget is
+            # over that line (ValueError: "Streaming is required for operations that
+            # may take longer than 10 minutes", 2026-08-13). Streaming also removes the
+            # idle-connection timeout that forced the old 16k cap in the first place.
+            # get_final_message() returns the same object create() did, so everything
+            # downstream — content, stop_reason, usage, model_dump — is unchanged.
+            with client.messages.stream(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                # Adaptive thinking, not a fixed budget: the fixed-budget form
+                # (`{"type": "enabled", "budget_tokens": N}`) is deprecated on
+                # sonnet-4-6, and adaptive also turns on *interleaved* thinking, so
+                # the agent reasons between tool calls — which is the per-iteration
+                # trace `src.workbench.visualize_log` renders. No beta header needed.
+                #
+                # `display` is deliberately not set: it defaults to "summarized" on
+                # 4.6, and the parameter only arrived with 4.7. If MODEL is ever
+                # moved to 4.7 or later the default flips to "omitted" and the
+                # thinking text comes back EMPTY — pass display="summarized" then.
+                thinking={"type": "adaptive"},
+                # Prompt caching. Measured on the 2026-08-10 run: 88% of the bill was
+                # input tokens, cache_read_input_tokens was 0 on every step, and the
+                # conversation is re-sent in full each turn — the exact shape caching
+                # exists for. Top-level cache_control auto-places the breakpoint on the
+                # last cacheable block, which is the multi-turn pattern: each turn caches
+                # the conversation so far, the next turn reads it at ~0.1x.
+                #
+                # This only works because the prefix is byte-stable: `tools` renders
+                # first and TOOL_SCHEMAS is a fixed list, `system` renders second and
+                # SYSTEM_PROMPT is a module constant with no timestamp or run id in it.
+                # Interpolating anything per-run into either would silently invalidate
+                # the whole cache — check cache_read_input_tokens in the run summary if
+                # you ever touch them.
+                cache_control={"type": "ephemeral"},
+                system=SYSTEM_PROMPT,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+            ) as stream:
+                response = stream.get_final_message()
+        except anthropic.APIError as exc:
+            # Reaching here means the SDK already exhausted `max_retries` on anything
+            # retryable, so this is terminal for the run either way. Say which kind it
+            # was: a transient overload that outlasted the retries is worth re-running,
+            # a 400 or auth failure is not, and the report is the only place a reader
+            # finds out.
+            transient = isinstance(
+                exc, (anthropic.RateLimitError, anthropic.InternalServerError,
+                      anthropic.APIConnectionError)
+            ) or "overloaded" in str(exc).lower()
+            _log_event({"event": "api_error", "step": step, "transient": transient,
+                        "error": f"{type(exc).__name__}: {exc}"})
+            final_report = (
+                f"Run stopped at step {step}: the Anthropic API returned "
+                f"{type(exc).__name__}: {exc}. Everything decided before this point "
+                "stands; nothing after it was attempted."
+                + (" This looks transient and survived the client's retries — the same "
+                   "run is worth attempting again." if transient else
+                   " This is not a transient failure; re-running unchanged will not help.")
+            )
+            break
 
         # log the raw response but convert it to dict for jsonl
         _log_event({"event": "api_response", "step": step, "response": response.model_dump()})
 
-        # Accumulate token usage from each API call
+        # Accumulate token usage from each API call. With caching on, input_tokens is
+        # only the UNCACHED remainder — the cache fields carry the rest, at different
+        # prices — so all three are tracked separately or the cost is under-reported.
         if hasattr(response, "usage") and response.usage is not None:
             total_input_tokens += getattr(response.usage, "input_tokens", 0)
             total_output_tokens += getattr(response.usage, "output_tokens", 0)
+            total_cache_write_tokens += getattr(
+                response.usage, "cache_creation_input_tokens", 0
+            ) or 0
+            total_cache_read_tokens += getattr(
+                response.usage, "cache_read_input_tokens", 0
+            ) or 0
         completed_steps = step + 1
+
+        # A turn that ran out of budget mid-thought cannot be appended: its content is
+        # a lone `thinking` block, and the API rejects an assistant message whose last
+        # block is `thinking` — so the NEXT call 400s and the run dies with a message
+        # that says nothing about the real cause. Seen on 08041770_l1 (2026-08-13):
+        # step 14 returned stop_reason=max_tokens with output_tokens=16000 and content
+        # ['thinking'], having spent the whole budget reasoning. `max_tokens` was
+        # handled by neither branch below, so the truncated turn went onto the history
+        # and killed the run. Stop cleanly instead and let the caller write what exists.
+        if response.stop_reason == "max_tokens":
+            _log_event({
+                "event": "max_tokens_truncation", "step": step,
+                "content_types": [b.type for b in response.content],
+            })
+            final_report = (
+                f"Run stopped at step {step}: the model reached the {MAX_TOKENS:,}-token "
+                "per-turn limit mid-thought and produced no usable output for that turn. "
+                "Everything up to this point stands; nothing after it was decided."
+            )
+            break
 
         # Append the assistant's response to the conversation history
         messages.append({"role": "assistant", "content": response.content})
@@ -609,12 +918,23 @@ def run_agent(
 
                         # Decide how to pass the data object based on where the function lives
                         if hasattr(wrappers, tool_name):
+                            if tool_name == "export_clean_data":
+                                # Where the flag log is written is the runner's business,
+                                # not the model's — so these are injected, not in the schema.
+                                tool_args = {
+                                    **tool_args, "output_dir": output_dir, "stem": stem,
+                                }
                             # wrappers mutate qc and take qc=
                             result = func(qc=current_qc, **tool_args)
                             if "qc" in result:
                                 current_qc = result.pop("qc") # update state
                             if "df" in result:
                                 clean_df = result.pop("df")
+                            # The flag log can run to thousands of rows; the file and the
+                            # counts in `message` are what the agent needs, not the payload.
+                            result.pop("flags", None)
+                            if result.get("flags_path"):
+                                flags_path = result["flags_path"]
                         elif hasattr(context, tool_name):
                             # context tools observe and take source=
                             result = func(source=current_qc, **tool_args)
@@ -654,8 +974,12 @@ def run_agent(
         final_report = "Agent reached the maximum tool call limit before completing."
 
     # ---- run summary --------------------------------------------------------
+    # Cache reads bill at ~0.1x the input rate, cache writes at ~1.25x (5-minute TTL,
+    # which is what top-level cache_control uses by default).
     est_cost = (
         total_input_tokens * _COST_PER_M_INPUT / 1_000_000
+        + total_cache_write_tokens * _COST_PER_M_INPUT * 1.25 / 1_000_000
+        + total_cache_read_tokens * _COST_PER_M_INPUT * 0.10 / 1_000_000
         + total_output_tokens * _COST_PER_M_OUTPUT / 1_000_000
     )
     summary = RunSummary(
@@ -664,6 +988,9 @@ def run_agent(
         output_tokens=total_output_tokens,
         est_cost_usd=round(est_cost, 4),
         log_path=str(log_path),
+        flags_path=flags_path,
+        cache_write_tokens=total_cache_write_tokens,
+        cache_read_tokens=total_cache_read_tokens,
     )
     _log_event({"event": "run_summary", **asdict(summary)})
 
@@ -674,14 +1001,13 @@ def run_agent(
 def _build_flags_json(
     clean_df: pd.DataFrame | None,
 ) -> list[dict]:
-    """Build the §5 flag log from the cleaned DataFrame.
+    """Fallback §5 flag log, built from the cleaned DataFrame alone.
 
-    Each row with a non-null ``flag`` column becomes one entry:
-    ``{datetime, flagged_by, action, reason}``.
-    The full action/reason structure depends on the agent's report, which is
-    unstructured text.  For now we record ``flagged_by`` (the tool name from the
-    ``flag`` column) and leave ``action``/``reason`` as placeholders that the
-    agent's report can be parsed into later.
+    ``export_clean_data`` writes the real log — with the agent's action and reason per
+    segment — and this is only reached when the agent never called it, or called it
+    before the runner supplied an output path. There are no decisions to recover here,
+    so every entry is ``undecided``: honest about the fact that nothing was adjudicated,
+    and scored as no claim rather than as a silent ``keep``.
     """
     if clean_df is None:
         return []
@@ -692,7 +1018,9 @@ def _build_flags_json(
             entries.append({
                 "datetime": str(dt),
                 "flagged_by": str(row["flag"]),
-                "action": "flag",
+                "verdict": wrappers.UNDECIDED,
+                "anomaly_type": "",
+                "action": wrappers.UNDECIDED,
                 "reason": "",
             })
     return entries
@@ -736,6 +1064,7 @@ def main(argv: list[str] | None = None) -> int:
 
     final_qc, clean_df, report, run_summary = run_agent(
         qc, max_steps=args.max_steps, log_dir=args.log_dir,
+        output_dir=out_dir, stem=stem,
     )
 
     # ---- write output files -------------------------------------------------
@@ -753,11 +1082,20 @@ def main(argv: list[str] | None = None) -> int:
         fallback.to_csv(clean_path, index=False)
     print(f"  clean  -> {clean_path}", file=sys.stderr)
 
-    # 2. Flag log JSON (§5 contract)
-    flags_path = out_dir / f"{stem}_flags.json"
-    flags = _build_flags_json(clean_df)
-    flags_path.write_text(json.dumps(flags, indent=2, default=str))
-    print(f"  flags  -> {flags_path}  ({len(flags):,} entries)", file=sys.stderr)
+    # 2. Flag log JSON (§5 contract). export_clean_data writes it, with the agent's
+    #    action + reason per segment; this only covers the case where it never ran.
+    if run_summary.flags_path:
+        n_entries = len(json.loads(Path(run_summary.flags_path).read_text()))
+        print(f"  flags  -> {run_summary.flags_path}  ({n_entries:,} entries)", file=sys.stderr)
+    else:
+        flags_path = out_dir / f"{stem}_flags.json"
+        flags = _build_flags_json(clean_df)
+        flags_path.write_text(json.dumps(flags, indent=2, default=str))
+        print(
+            f"  flags  -> {flags_path}  ({len(flags):,} entries, all UNDECIDED — the "
+            "agent never exported, so no actions were recorded)",
+            file=sys.stderr,
+        )
 
     # 3. Plain-language report
     report_path = out_dir / f"{stem}_report.txt"
@@ -768,10 +1106,19 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"\n[run_summary] {run_summary.steps} steps · "
         f"{run_summary.input_tokens:,} in / {run_summary.output_tokens:,} out · "
+        f"cache {run_summary.cache_read_tokens:,} read / "
+        f"{run_summary.cache_write_tokens:,} written · "
         f"~${run_summary.est_cost_usd:.2f} "
         f"({MODEL} @ ${_COST_PER_M_INPUT}/${_COST_PER_M_OUTPUT} per M)",
         file=sys.stderr,
     )
+    if run_summary.steps > 1 and run_summary.cache_read_tokens == 0:
+        print(
+            "  WARNING: zero cache reads across a multi-step run — something is "
+            "invalidating the prompt prefix (a timestamp or run id in the system "
+            "prompt, or a tool list that changes between calls).",
+            file=sys.stderr,
+        )
     print(f"  log    -> {run_summary.log_path}", file=sys.stderr)
 
     return 0

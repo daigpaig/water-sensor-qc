@@ -133,7 +133,7 @@ def test_impute_counts_as_acting_on_a_gap():
     assert gap.f1 == pytest.approx(1.0)
 
 
-def test_load_decisions_keeps_the_stronger_verdict(tmp_path):
+def test_load_decisions_keeps_the_stronger_action(tmp_path):
     """One tool's delete must not be undone by another tool's keep on the same row."""
     path = tmp_path / "x_flags.json"
     path.write_text(json.dumps([
@@ -142,6 +142,90 @@ def test_load_decisions_keeps_the_stronger_verdict(tmp_path):
         {"datetime": "2024-01-01T00:30:00", "flagged_by": "flagJumps",
          "action": "keep", "reason": "storm limb"},
     ]))
+    assert ev.load_decisions(path) == {pd.Timestamp("2024-01-01T00:30:00"): "delete"}
+
+
+# ---------------------------------------------------------------------------
+# Verdict-based scoring: the agent's own answer (§5, §10)
+# ---------------------------------------------------------------------------
+
+def _verdict_log(tmp_path, entries: list[dict]):
+    path = tmp_path / "v_flags.json"
+    path.write_text(json.dumps(entries))
+    return path
+
+
+def test_verdicts_are_read_as_the_agents_claim_not_the_detectors():
+    """The type comes from the agent, so a misattributed detector cannot cost it a hit.
+
+    flagJumps firing on a one-sample excursion that the agent (correctly) calls a
+    spike is a SPIKE claim. Under the old TOOL_TO_TYPE path the same row scored as a
+    level_shift prediction and a spike miss — grading the detector, not the agent.
+    """
+    index = _index()
+    labels = _labels(index, {4: "spike"})
+
+    predictions = ev.predictions_from_verdicts({index[4]: "spike"})
+    scores, _ = ev.score(predictions, labels, index)
+
+    spike = next(s for s in scores if s.anomaly_type == "spike")
+    shift = next(s for s in scores if s.anomaly_type == "level_shift")
+    assert spike.f1 == pytest.approx(1.0)
+    assert shift.n_pred == 0
+
+
+def test_a_normal_verdict_is_a_rejection_not_a_prediction(tmp_path):
+    """Inspecting a storm peak and calling it real water must not cost precision."""
+    path = _verdict_log(tmp_path, [
+        {"datetime": "2024-01-01T00:30:00", "flagged_by": "flagUniLOF",
+         "verdict": "normal", "anomaly_type": "", "action": "keep", "reason": "storm"},
+        {"datetime": "2024-01-01T01:00:00", "flagged_by": "flagUniLOF",
+         "verdict": "anomaly", "anomaly_type": "spike", "action": "delete", "reason": "z=9"},
+    ])
+
+    verdicts = ev.load_verdicts(path)
+
+    assert verdicts == {pd.Timestamp("2024-01-01T01:00:00"): "spike"}
+    assert ev.predictions_from_verdicts(verdicts)["spike"] == {
+        pd.Timestamp("2024-01-01T01:00:00")
+    }
+
+
+def test_an_anomaly_kept_untreated_still_counts_as_a_detection(tmp_path):
+    """The asymmetry the verdict field exists for (§5, wrappers.UNTREATED_ANOMALY_ACTION).
+
+    A gap too long to fill is `anomaly` + `keep`. The old action-based inference read
+    that as a rejection and scored it a false negative, so the agent was punished for
+    correctly identifying something it was right not to touch.
+    """
+    path = _verdict_log(tmp_path, [
+        {"datetime": "2024-01-01T01:15:00", "flagged_by": "flagNAN",
+         "verdict": "anomaly", "anomaly_type": "gap", "action": "keep",
+         "reason": "47-sample outage, longer than any window I could defend"},
+    ])
+    stamp = pd.Timestamp("2024-01-01T01:15:00")
+
+    assert ev.load_verdicts(path) == {stamp: "gap"}
+    # The old path, for contrast: `keep` is not a POSITIVE_ACTION, so the row vanishes.
+    assert ev.apply_decisions({"gap": {stamp}}, ev.load_decisions(path))["gap"] == set()
+
+
+def test_an_undecided_verdict_claims_nothing(tmp_path):
+    """Neither a detection nor a rejection — a row nobody adjudicated (§5)."""
+    path = _verdict_log(tmp_path, [
+        {"datetime": "2024-01-01T00:30:00", "flagged_by": "flagUniLOF",
+         "verdict": "undecided", "anomaly_type": "", "action": "undecided", "reason": ""},
+    ])
+    assert ev.load_verdicts(path) == {}
+
+
+def test_a_log_without_verdicts_falls_back_instead_of_failing(tmp_path):
+    """Pre-2026-08-13 flag logs stay scoreable; None is the signal to infer from actions."""
+    path = _verdict_log(tmp_path, [
+        {"datetime": "2024-01-01T00:30:00", "flagged_by": "flagUniLOF",
+         "action": "delete", "reason": "no verdict field in this log"},
+    ])
+    assert ev.load_verdicts(path) is None
     assert ev.load_decisions(path) == {pd.Timestamp("2024-01-01T00:30:00"): "delete"}
 
 

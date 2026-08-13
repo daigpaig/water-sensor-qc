@@ -96,6 +96,8 @@ deployment, Docker, CI beyond a basic test run).
 │       ├── visualize.py  # series/overview plots
 │       ├── visualize_injected.py # plot injected datasets with anomaly labels
 │       ├── visualize_log.py # replay one logs/*.jsonl run: flags per iteration (§8)
+│       ├── spike_audit.py # one run's SPIKE decisions case by case, with evidence (§10.1)
+│       ├── decision_audit.py # click ANY point: what happened to it and why (§10.1)
 │       ├── param_sweep.py # sweep one param, score vs labels, plot (§7.2)
 │       ├── candidates.py # propose anomalies in a "clean" series for review (§9.1)
 │       └── review.py     # keyboard-driven labelling page + merge back to labels (§9.1)
@@ -111,6 +113,8 @@ deployment, Docker, CI beyond a basic test run).
 │   ├── tune_candidates.py     # picks the §9.1 proposal thresholds
 │   ├── tune_spike_recall.py   # sweeps the §9.1 spike params for >=95% recall
 │   ├── probe_candidate_recall.py # candidates.py recall vs the injected labels
+│   ├── tune_noise_context.py  # picks the §7.4 noise window + rule thresholds
+│   ├── probe_noise_reads_like.py # the §7.4 noisy-stretch guard's hit rates
 │   └── tune_zscore.py         # flagZScore min_residuals on quantised data (§7.1)
 └── logs/                 # JSONL API logs (gitignored)
 ```
@@ -120,7 +124,13 @@ deployment, Docker, CI beyond a basic test run).
 
 - **`src/agent_tools/`** — what the agent calls. Every function here returns the §5
   tool-result dict and is described by a schema in `schemas.py`. Adding a tool means
-  touching both files. Nothing here prints, plots, or writes to `data/`.
+  touching both files. Nothing here prints or plots. **One exception to "writes nothing":
+  `export_clean_data` writes the §5 flag log** (2026-08-10) — it is the tool that *is* the
+  export step, and the log has to be assembled from the agent's `decisions` argument at
+  the moment it is passed. The path is not the agent's to choose: `output_dir`/`stem` are
+  injected by the runner in `agent.py`'s dispatch and are deliberately **absent from the
+  tool schema**, so the model decides what goes in the log and never where it lands. Given
+  neither, the tool writes nothing and returns the entries only.
 - **`src/workbench/`** — what a *person* runs. Free to emit CLIs, HTML pages, and Plotly
   figures; bound by no result-dict contract. These are how we tune and audit (§7.2, §9.1),
   not part of an agent run.
@@ -183,11 +193,87 @@ longer emitted; drift is removed and this file existed only to feed `correctDrif
 }
 ```
 
+**`flagged_datetimes` is a SAMPLE, not the whole set** (2026-08-10). It is capped at
+`wrappers.MAX_FLAGGED_DATETIMES` (250) and **evenly spaced across the record** — a head would
+put every point the agent inspects in the first weeks of a two-year series. `n_flagged` /
+`n_flagged_total` stay exact; `n_flagged_datetimes_shown` says how many came back, and the
+`message` says so loudly whenever it truncates, because an agent that believes it received
+every timestamp writes decision spans that silently miss thousands of rows. Same for
+`impute_rolling`'s `gaps_summary`, capped at 40 and sorted longest-first (which gaps were too
+long to fill is the decision it informs). Measured justification in §8.
+
 **Cleaned output** (`*_clean.csv`): `datetime`, `value` (corrected/imputed; deleted values
 as NaN or removed per config), plus a `flag` column naming the action, if any.
 
 **Flag log** (`*_flags.json`): a list of
-`{ "datetime": "...", "flagged_by": "<tool>", "action": "delete|correct|keep|impute", "reason": "<short text>" }`.
+`{ "datetime": "...", "flagged_by": "<tool>", "verdict": "anomaly|normal", "anomaly_type": "spike|plateau|level_shift|gap", "action": "delete|correct|keep|impute", "reason": "<short text>" }`,
+**one entry per flagged row**, written by `export_clean_data` (§4) from the `decisions`
+the agent passes it — a list of
+`{start, end (inclusive, optional), verdict, anomaly_type, action, reason}` spans,
+narrowest covering span wins. Details the contract above did not say:
+
+- `flagged_by` is **`+`-joined** when several tests flagged the same row (`flagUniLOF+flagRange`),
+  read from the history, because `qc.flags` attributes such a row to the first test only (§7.1).
+- **Each entry also carries `rationale`, `rationale_source` and `deliberation`** (2026-08-11).
+  `rationale_source` is one of `agent-deliberation` (a close call, with the agent's reasoning
+  attached), `agent-reason` (a specific decision it judged clear-cut), `blanket` (swept up by a
+  span covering >20% of all flagged rows — `wrappers.BLANKET_SHARE`), or `deterministic` (code
+  decided: filled by the imputer, or never adjudicated). This exists because the first three
+  produce identically-shaped entries otherwise, and **every run so far has had a blanket absorb
+  points the agent had actually measured** — the log could not show that. `rationale` is a
+  sentence a reader can act on; for the deterministic cases it is generated in code.
+- **A decision marked `difficulty: "judgement-call"` MUST carry a `deliberation`** and
+  `export_clean_data` raises without one (§13, fail loudly). `reason` states the conclusion;
+  `deliberation` shows the working — what pointed which way, what was weighed, what would have
+  changed the agent's mind. This is the §1 requirement that the tool explain itself, made
+  enforceable rather than aspirational.
+- **`action` has a fifth value, `undecided`** (2026-08-10), which the agent may *not* choose:
+  it is what a flagged row gets when no decision covered it. §10 scores an undecided row and a
+  `normal` row identically (neither is a positive claim), but they are not the same thing —
+  one is a judgement, the other is a row nobody looked at — and writing them the same way hides
+  a run that flagged 2,595 rows and concluded nothing. `verdict` carries the same third value
+  for the same reason. The tool's result and `message` report `n_undecided` and any decision
+  span that matched **no** flagged row (a mistyped timestamp), so the agent can spend one more
+  call fixing it.
+
+### 5.1 `verdict` is the run's answer; `action` is the treatment (2026-08-13)
+
+**Detection metrics are scored on `verdict`, not on `action`.** Until this date the two were
+one field: §10 inferred the claim from whether the action was destructive
+(`delete`/`correct`/`impute` = "the agent says this is an anomaly"). That conflated two
+genuinely different questions and cost real recall — a gap correctly identified but too long
+to fill defensibly was recorded `keep`, and scored as the agent claiming the data was fine.
+
+- **`verdict`** ∈ `anomaly` | `normal` (+ `undecided`, code-assigned). The agent's claim about
+  what the data **is**. This and nothing else is what precision/recall measure.
+- **`anomaly_type`** — required when `verdict='anomaly'`, forbidden otherwise, drawn from
+  `inspect_data.ANOMALY_TYPES` so it cannot drift from the label vocabulary. It is **the
+  agent's classification, scored as such**: a row `flagJumps` found but the agent calls a spike
+  is a spike claim. Typing predictions by *which detector fired* (`evaluate.TOOL_TO_TYPE`)
+  measures the detector, not the agent, and remains only as the fallback for older logs.
+- **`action`** ∈ `delete` | `correct` | `keep` | `impute`. Unchanged, and still what
+  `report_decisions` grades.
+
+**Consistency is enforced one-directionally** (`wrappers._validate_verdict`), because the two
+directions are not symmetric:
+
+- `verdict='normal'` **must** take `action='keep'`. Calling a value real water and then
+  deleting it is not a defensible pair, and allowing it would let a run score as having
+  *rejected* a candidate whose value is gone from the exported file.
+- `verdict='anomaly'` normally takes `delete`/`correct`/`impute` but **may** take `keep`,
+  provided the `reason` says why the segment cannot be treated (≥20 chars, enforced). The
+  case this exists for is a gap longer than any defensible imputation window: forcing
+  consistency there would make the agent either lie about the verdict or impute a gap it had
+  just judged unfillable. `n_anomalies_left_untreated` surfaces the count, since the pair
+  claims a detection without touching the value.
+
+A row the imputer filled gets `verdict='anomaly', anomaly_type='gap'` deterministically, for
+the same reason its `action` is forced to `impute`: §5 says every missing run is a gap, so
+this is a fact about the data rather than a call the agent makes.
+
+**Every flagged row needs a decision or the run scores as if it claimed nothing.** §10 counts
+only `verdict='anomaly'` as a positive claim, so an export without `decisions` produces a log
+that is syntactically valid and evidentially empty.
 
 ---
 
@@ -220,7 +306,9 @@ written** — `scratchpad/probe_saqc.py` prints each signature and runs each on 
 before changing a wrapper. Signatures below are abridged to the parameters we pass.
 
 Utility: `inspect_dataset` (summary: rows, time range, inferred frequency, NaN count/%,
-per-column min/max/mean/std), `get_flag_summary` (counts by tool), `export_clean_data`.
+per-column min/max/mean/std), `get_flag_summary` (counts by tool), `export_clean_data`
+(`decisions` — the agent's per-segment verdicts; emits the cleaned frame **and writes the §5
+flag log**).
 
 Detection:
 
@@ -239,6 +327,11 @@ Action: `impute_rolling` (`interpolateByRolling`; `window` required, `func='medi
 
 Context: `describe_point`, `describe_points` — thin pass-throughs in `wrappers.py` to the
 §7.3 measurements. They observe only: no `qc` key in the result, caller's SaQC unchanged.
+The five exposed primitives (`slope_context`, `excursion_context`, `recovery_context`,
+`level_shift_context`, `noise_context`) have no wrapper at all — `agent.py` resolves them
+straight out of `context.py`, so a schema is the whole of what exposing one costs (§7.3).
+`noise_context` answers a different question from the rest: not "what shape is this point"
+but "how noisy is this STRETCH, and does the point stand out within it" (§7.4).
 
 `flag_plateau` is an addition the probe justified: `flagConstants` and `flagPlateau`
 detect **different** things and we want both (§7.1).
@@ -292,6 +385,20 @@ anything. On 11501000 (turbidity quantised to 0.1 NTU) it flagged ~195 segments 
 `thresh=30` just as at `thresh=6`. `min_residuals` sets a floor in **data units** and fixes
 it: at 3 robust step-sigmas the same series drops to 7 segments while the other two gauges
 barely move. Scale it to the series, never hard-code it (`scratchpad/tune_zscore.py`).
+
+**`interpolateByRolling` overwrites already-flagged readings unless you pass
+`dfilter=np.inf`** (fixed 2026-08-13). SaQC masks every row whose flag is >= `dfilter`
+before a function runs, and the default masks BAD — so a row an earlier detector flagged
+looks *missing* to the imputer, which fills it, silently replacing a reading that was
+never absent. Measured on 03447687_l1: **1,887 real readings rewritten with a rolling
+median**, 1,866 of them ordinary water and 13 injected anomalies the agent therefore
+never judged. It corrupted three separate measurements before anyone noticed, because an
+overwritten row carries `action=impute` and reads as a successful gap fill: `evaluate.py`
+reported spike precision 0.061 where 261 of its 277 "spike predictions" were overwrites
+rather than agent decisions, and both audit pages reported `missed=0` while ten spikes
+sat unjudged. With `dfilter=np.inf` the same sequence overwrites **0** rows and the
+imputer's `n_flagged` finally equals its `n_imputed`. `scratchpad/probe_impute_dfilter.py`
+reproduces both behaviours; a test holds the line.
 
 **`interpolateByRolling` will half-fill a gap.** It fills only where the rolling window finds
 context, so a window narrower than the gap leaves the gap **partly** filled rather than
@@ -369,11 +476,25 @@ under-powered, so treat those two rows as guidance-to-flag, not tuned optima.
 Detectors say **where** a rule fired; they cannot say **whether it is real water**, which is
 the §6 decision the agent actually has to make. `context.py` closes that gap: given one
 timestamp it measures the shape around it and returns JSON-serialisable dicts. Nothing in it
-flags or mutates — it observes. Eight primitives (`slope_context`, `excursion_context`,
+flags or mutates — it observes. Nine primitives (`slope_context`, `excursion_context`,
 `recovery_context`, `level_shift_context`, `flatness_context`, `neighbourhood_stats`,
-`gap_context`, `historical_context`) plus two aggregators, `describe_point` and
-`describe_points`. **Only the aggregators get schemas** — nine near-identical tools would
-eat the 25-call cap; the primitives stay library functions.
+`noise_context`, `gap_context`, `historical_context`) plus two aggregators, `describe_point`
+and `describe_points`. **The two aggregators and five primitives get schemas** — the other
+four stay library functions, because eleven near-identical tools would eat the 25-call cap
+and `describe_point` already returns all nine blocks at once.
+
+The exposed primitives are `excursion_context`, `recovery_context` and `level_shift_context`
+(2026-08-10), `slope_context` (2026-08-11, retuned to 45 min) and `noise_context`
+(2026-08-13, §7.4): **width and recovery time are what
+actually separate a storm peak from a spike** (the measured table below), and `level_shift` is
+the weakest `reads_like` label, so the agent needs to interrogate it directly rather than trust
+the hint. Exposing them costs nothing but a schema — `agent.py`'s dispatch already resolves any
+`context.py` function by name and passes `source=`, so **a primitive needs no wrapper**; add
+its schema to `schemas.py::TOOL_SCHEMAS` and it is callable. They are single-question
+instruments: one call, one timestamp, one measurement, so the prompt tells the agent to triage
+with `describe_points` first and spend one of these only where a decision turns on a specific
+number. `noise_context` is the exception to "one timestamp": one call anywhere inside a busy
+stretch characterises the whole stretch and returns its bounds.
 
 Every threshold is in **robust sigmas of the series**, floored by the series-wide robust
 first-difference scale, because a windowed MAD collapses to 0 on quantised turbidity and
@@ -389,13 +510,36 @@ as truth; `scratchpad/demo_point_context.py` reproduces the table):**
 | samples to recover | 2 | 12–30 | 1 | 1 |
 | `step_sharpness` | 5–10 | 0.6 | 1.2 | 0.5 |
 
-- **The rise-vs-fall gradient ratio does NOT work — do not rediscover this.** The intuition
-  (storms recede gradually, spikes are symmetric) fails on this data: injected upward spikes
-  and genuine storm peaks sit at median `fall_rise_ratio` 1.00 vs 0.97 at a 2 h window, and
-  overlap just as badly at 1 h, 6 h and 24 h, with or without the point excluded from the
-  fits. A storm's asymmetry is an **event-scale** property (rise in hours, recession over
-  days), not a local gradient either side of one sample. `slope_context` is kept for shape
-  and direction; **width and recovery time are what actually separate them.**
+- **The rise-vs-fall gradient ratio DOES work — but only at a 45-minute window, and the
+  signal reverses if you widen it.** This entry previously said the ratio was useless and
+  told you not to rediscover it. That was wrong, and the way it was wrong is worth keeping:
+  the original measurement compared injected spikes against **storm peaks** at a **2 h**
+  window and found 1.00 vs 0.97. Both choices hid the effect. Re-measured 2026-08-11 on the
+  population that actually causes false positives — 31 **small flush events** (rows a run
+  deleted that the labels call normal water, verified against the raw approved base) vs 14
+  confirmed injected spikes — with `n_before`/`n_after` swept:
+
+  | window | flush median | artifact median | separation |
+  | --- | ---: | ---: | ---: |
+  | 2 samples (30 min) | 0.58 | 0.99 | 0.56 |
+  | **3 samples (45 min)** | **0.75** | **0.99** | **0.84** |
+  | 4 samples (60 min) | 0.83 | 1.00 | 0.71 |
+  | 6 samples (90 min) | 1.11 | 0.98 | 0.42 |
+  | 8 samples (120 min) | 1.24 | 0.99 | 0.34 |
+  | 12 samples (180 min) | 1.43 | 0.93 | 0.27 |
+
+  (Separation is P(artifact ratio > flush ratio); 0.5 is a coin flip.) A flush rises in one
+  sample and decays over 3–5, so at 45 minutes its fall is visibly gentler than its rise.
+  Past ~90 minutes the decay is over, the window fills with flat surroundings, and the
+  **ordering flips** — which is exactly what makes this look like noise if you only sample a
+  few wide windows. `slope_context`'s default is therefore **3 samples**, and so is
+  `describe_point`'s, so the compact `describe_points` row carries a usable ratio.
+  `scratchpad/tune_slope_window.py` reproduces the sweep.
+- **Width and robust_z cannot separate a small flush from an artifact** — this is why the
+  ratio matters. Both are 1–3 samples wide, and the flush often has the *higher* z (measured:
+  a flush at robust_z 21.8 against an artifact at 14.1). Width and recovery remain the right
+  test for a **storm peak**, which is genuinely 7–25 samples wide; they are the wrong test for
+  the small events that produce most of the false positives.
 - **Recovery must be anchored at the excursion's onset, not at the point.** Mid-storm, the
   six hours before the *point* are already storm, so a point-anchored baseline reports an
   instant recovery for an event nowhere near over. `recovery_context(anchor='excursion')`
@@ -403,12 +547,80 @@ as truth; `scratchpad/demo_point_context.py` reproduces the table):**
 - **`reads_like` is a hint, not a verdict**, and it is deliberately conservative. Measured
   hit rates: spike 87/120 with 11 storm-peak false positives and 0 on normal rows; plateau
   exact; gap exact; **level_shift weak (6/9 onsets, 6 storm-peak FP)** — the same wall §9.1
-  hit from a different direction, so treat that label as "look here".
+  hit from a different direction, so treat that label as "look here". (The spike branch was
+  since guarded by `noise_context` and now also emits `noisy-stretch` — see §7.4 for the
+  re-measured rates.)
 - **Level shift is measured as a duration, not a persistence ratio**, because §9 injects
   bounded 4–24 h windows rather than permanent steps; a "does it hold forever" test would
   score every injected shift as transient. (The window was 6–72 h when this was measured;
   shortened 2026-07-31 with the frequency cut, so shifts are now shorter than the durations
   the table above was calibrated on — expect the weak level_shift hit rate to be no better.)
+
+### 7.4 `noise_context` — the denominator was wrong (2026-08-13)
+
+**Every measurement in §7.3 scores one point against a *record-wide* scale.** So a point
+reads as extreme whether its neighbours are flat or thrashing, and in a busy stretch the
+spike detectors fire on dozens of points that each look extreme by that standard. Runs were
+deleting them as dozens of separate sensor failures. They are one stretch, and the right
+output is one decision about the stretch.
+
+`noise_context` measures the **surroundings** rather than the point. Two numbers carry it:
+`noise_ratio` (the window's robust first-difference scale ÷ the record-typical window's) and
+`point_step_sigmas_local` (the point's own largest single-sample move ÷ that *local* scale).
+
+**Measured** (`scratchpad/tune_noise_context.py`; 4 datasets across all three gauges,
+injected labels as truth). 168 injected spikes a `flagUniLOF(thresh=1.5)` run found, 662
+**false positives** from the same run — points it flagged that the labels call normal water,
+i.e. the population that motivated this — and 1600 ordinary normal rows. Medians:
+
+| metric | true spike | false positive | normal | separation |
+| --- | ---: | ---: | ---: | ---: |
+| `noise_ratio` | 1.2 | 11.3 | 1.0 | 0.91 (inverted) |
+| `point_step_sigmas_local` | 17.1 | 1.6 | 1.1 | **0.87** |
+| `point_step_sigmas_global` | 18.7 | 16.7 | 1.0 | 0.53 |
+| `turning_fraction` | 0.55 | 0.27 | 0.55 | 0.77 |
+
+**Read the third row first.** The measurement the agent already had — `slope_context`'s
+`delta_before_sigmas`, scaled by the record step sigma — reads 18.7 on a real spike and 16.7
+on a false positive. It cannot tell them apart at all. Rescaling the *same* move against the
+local neighbourhood gives 17.1 vs 1.6. The information was always there; the denominator was
+wrong. Rules, as what they buy and cost:
+
+| spare the point when… | FPs spared | spikes lost |
+| --- | ---: | ---: |
+| `point_step_sigmas_local < 5` | 83.1% | 16.7% |
+| `noise_ratio > 5` | 70.7% | 7.1% |
+| **`noise_ratio > 3` and `step_sigmas_local < 5`** | **76.7%** | **3.0%** |
+
+- **The window is ±90 min and that is the peak — do not widen it.** Swept, the combined rule
+  spares 83.7 / 76.7 / 72.4 / 61.0% of FPs at 6.5 / 3.0 / 1.2 / 2.4% of true spikes at
+  ±1 / 1.5 / 2 / 3 h. Widen it and the window fills with calm surroundings, the local scale
+  collapses back toward the record scale, and the measurement degrades into the global one it
+  exists to replace. It is therefore **not** passed `describe_point`'s `window`.
+- **`turning_fraction` splits the two ways a stretch can be busy, and they need different
+  decisions.** It is the share of samples where the series reverses direction: white noise
+  reverses about half the time (a thrashing sensor — and also a calm baseline, both ≈0.55),
+  a storm limb climbing steadily almost never does (≈0.27). High `noise_ratio` + high turning
+  = a noisy **sensor**; high `noise_ratio` + low turning = water genuinely moving fast. Both
+  mean "do not delete these one at a time"; only the first is a data-quality problem at all.
+  In this FP population the low turning fraction says most of them are **storm limbs**.
+- **Residual-based noise measures were tried and dropped.** Scatter around a short centred
+  rolling median is the textbook noise estimate and looks better on paper, but on quantised
+  turbidity the residual MAD collapses to exactly 0 in a large share of windows and the ratio
+  explodes — the §7.1 trap in a new place. First differences do not have this failure mode.
+- **`reads_like` gained a `noisy-stretch` label**, returned instead of `spike` when the guard
+  trips. Measured (`scratchpad/probe_noise_reads_like.py`): on detector false positives it
+  drops **34.6%** of the wrong `spike` hints (179 → 117 of 621), on true injected spikes it
+  costs **3.0%** (164 → 159 of 168), and on unflagged normal rows it changes **nothing**.
+  This supersedes the "spike 87/120, 11 storm-peak FP" figure above for the spike branch.
+- **`noise_ratio` and `step_sigmas_local` ride in every `describe_points` row**, because this
+  failure is only visible *across* a cluster — no single row shows it. `episode_start` /
+  `episode_end` bound the elevated stretch so the agent can write one §5 decision span over
+  it instead of one per flagged row.
+- `_block_noise` computes the reference distribution by reshaping the whole record's diffs
+  into non-overlapping blocks and taking a `nanmedian` along an axis. The obvious
+  `rolling().apply(mad)` is O(n·w) in Python and takes seconds per call on a two-year 15-min
+  series; this is ~10 ms, which is what makes 100 points in one `describe_points` call viable.
 
 ---
 
@@ -418,7 +630,12 @@ as truth; `scratchpad/demo_point_context.py` reproduces the table):**
 2. **Reason** — read the summary; decide which checks to run, in what order, with what params.
 3. **Act** — call tools one at a time; use each result to decide the next call. Respect the
    25-call cap; if reached, stop and summarise.
-4. **Summarise** — call `get_flag_summary` and `export_clean_data`.
+4. **Summarise** — call `get_flag_summary`, then `export_clean_data` **with `decisions`
+   covering every flagged segment** (§5). Each decision states **two separate things**: a
+   `verdict` (is this segment anomalous, and of which type — the answer §10 scores) and an
+   `action` (what to do with the values). This is the step where the run's reasoning becomes
+   the record; without it the flag log says the agent concluded nothing. The result reports
+   `n_undecided` and any span that matched no flagged row — budget a spare call to fix it.
 5. **Report** — write a plain-language report: what was found (by type), what was done, and
    any caveats.
 
@@ -426,6 +643,36 @@ The system prompt (in `src/agent.py`, versioned in git — commit changes with a
 the agent's role, the golden rules, the tool list, and that it must justify each action.
 Use the Anthropic Messages API multi-turn tool-use pattern (assistant emits tool_use →
 we run the tool → we return tool_result → loop).
+
+**The prompt describes PHASES, not a script** (v0.5, 2026-08-10). It used to lay out STEP 1–8
+with a fixed detector order and required a full plan up front — which, given §0 (the agent
+cannot see the data), is a guess dressed up as a decision, and it produced runs that executed
+their plan instead of reading their results. Only three orderings are actually forced, and
+each is technical rather than stylistic: `inspect_dataset` first, `flag_range` before the
+spike detectors (so impossible values do not distort the neighbourhood statistics they
+depend on), and `flag_nan` before `impute_rolling` (so `max_gap` comes from the gap
+distribution). Everything else is a menu the agent sequences from evidence, and it is told
+explicitly that a detector it has no reason to expect anything from is a wasted call.
+
+**Cost: the levers are prompt caching and payload size, not thinking or a cheaper model.**
+Measured on the 2026-08-10 run (15 steps, $4.91):
+
+- **88% of the bill was input tokens** (1.45M in / 38k out) and `cache_read_input_tokens` was
+  **0 on every step** — the whole conversation was re-sent at full price 15 times. Thinking
+  was 12% of the bill, so turning it off saves little and costs the trace `visualize_log.py`
+  renders. **Prompt caching is now on** via top-level `cache_control={"type": "ephemeral"}`,
+  which auto-places the breakpoint on the last cacheable block — the standard multi-turn
+  pattern. Verified: `scratchpad/probe_prompt_cache.py` shows 15,546 tokens (tools + system)
+  written then read back. Cache reads bill at ~0.1×, writes at ~1.25×, and `RunSummary` now
+  tracks all three and **warns when a multi-step run records zero cache reads**.
+- **This only holds while the prefix is byte-stable.** `tools` renders first and `system`
+  second, so interpolating a timestamp, run id or dataset name into `SYSTEM_PROMPT`, or
+  varying `TOOL_SCHEMAS` between calls, silently invalidates everything. Re-run the probe
+  after touching either.
+- **34% of the payload was raw `flagged_datetimes`** — 8,900 timestamps. Now sampled (§5).
+- **A cheaper model is not available for this workload.** Haiku 4.5's context window is 200K;
+  that run's final request was **263,345 input tokens**. It would not fit, quite apart from
+  the §2 golden rule pinning `claude-sonnet-4-6` (1M context).
 
 **Adaptive thinking is ON** (`thinking={"type": "adaptive"}`, 2026-08-01). Without it the
 log records only the prose the model writes for the reader, not its reasoning, and
@@ -623,12 +870,18 @@ python -m src.workbench.review merge  data/raw/provisional/<gauge>.csv <decision
   `Z` to undo, progress mirrored to `localStorage` so closing the tab loses nothing.
   That store is keyed on the dataset name **and candidate count**, so re-running `detect`
   with different options orphans an in-progress review. Finish a pass before retuning.
-- **Two page traps, both verified in a browser, both silent failures.** Plotly renders a
-  `Date` object in the *viewer's* timezone, so an axis built from Dates printed hours away
-  from the timestamps in the side panel and the CSV; the series is timezone-naive, so x
-  values must be naive ISO **strings**. And `gd.on(...)` does not exist until Plotly has
-  plotted into that div — registering `plotly_click` at start-up throws and takes the rest
-  of the init down with it, keyboard handlers included. Wire it after the first draw.
+- **Three page traps, all verified in a browser, all silent failures** — they apply to every
+  page in `workbench/`, not just `review.py`. Plotly renders a `Date` object in the
+  *viewer's* timezone, so an axis built from Dates printed hours away from the timestamps in
+  the side panel and the CSV; the series is timezone-naive, so x values must be naive ISO
+  **strings**. `gd.on(...)` does not exist until Plotly has plotted into that div —
+  registering `plotly_click` at start-up throws and takes the rest of the init down with it,
+  keyboard handlers included; wire it after the first draw. And **`DatetimeIndex.view("int64")`
+  does not return nanoseconds** (2026-08-11): these CSVs parse to `datetime64[us]`, so the
+  usual `// 1_000_000` yielded *seconds* and `spike_audit.py` plotted a two-year series
+  entirely inside 1970. Use `index.as_unit("ms").astype("int64")`, which is explicit about
+  the unit whatever the source resolution. The axis is the only place this shows, so it
+  survives every test that checks the data rather than the picture.
 - **`merge` writes the §5 labels contract** with `source=natural` and an empty `true_value`:
   these anomalies were already in the record, so no uncontaminated value exists for them
   and they are scoreable for detection but not for imputation (§5, §10). It **refuses**
@@ -779,6 +1032,11 @@ manifest to `data/comparison/<gauge>/`.
   macro-F1 ≥ 0.70 target refers to those four. Drift is not scored at all — it is removed
   (§9.2); it was already excluded from macro-F1 when it existed, so the headline number is
   unchanged by its removal, and there is no longer a drift correction-quality metric.
+  **Scored on the agent's `verdict`, and typed by the agent's `anomaly_type`** (§5.1):
+  flagging is candidate generation, not a claim. `evaluate.load_verdicts` returns `None` for a
+  log written before the field existed, and scoring falls back to inferring the claim from
+  `POSITIVE_ACTIONS` + `TOOL_TO_TYPE`; the printed table's `mode:` line always says which of
+  the three paths ran (verdicts / actions / raw flags), so the two are never confused.
 - **Imputation:** RMSE / MAE on filled values vs true values, compared to a
   linear-interpolation baseline.
 - **Decision quality:** for each flagged segment, does the chosen action match the known

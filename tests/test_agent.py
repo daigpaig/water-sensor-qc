@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import anthropic
 import numpy as np
 import pandas as pd
 import pytest
@@ -26,11 +27,44 @@ def _toy_qc():
     return saqc.SaQC(data)
 
 
-def _mock_usage(input_tokens: int = 100, output_tokens: int = 50):
-    """Create a mock usage object matching the Anthropic response.usage shape."""
+def _wire_stream(mock_client, responses):
+    """Wire `client.messages.stream(...)` to hand back each response in turn.
+
+    The loop streams and calls `get_final_message()` (the SDK refuses non-streaming
+    requests at this max_tokens), so mocking `messages.create` no longer intercepts
+    anything. An entry that is an exception is raised from the stream() call itself,
+    which is how an API failure reaches the loop's guard.
+    """
+    entries = []
+    for r in responses:
+        if isinstance(r, BaseException):
+            entries.append(r)
+            continue
+        cm = MagicMock()
+        cm.__enter__.return_value.get_final_message.return_value = r
+        cm.__exit__.return_value = False
+        entries.append(cm)
+    mock_client.messages.stream.side_effect = entries
+    return mock_client.messages.stream
+
+
+def _mock_usage(
+    input_tokens: int = 100,
+    output_tokens: int = 50,
+    cache_write_tokens: int = 0,
+    cache_read_tokens: int = 0,
+):
+    """Create a mock usage object matching the Anthropic response.usage shape.
+
+    The cache fields must be set explicitly: a bare MagicMock returns a truthy
+    child mock for any attribute, so leaving them out makes the cost arithmetic
+    add a MagicMock to an int and the failure looks nothing like its cause.
+    """
     usage = MagicMock()
     usage.input_tokens = input_tokens
     usage.output_tokens = output_tokens
+    usage.cache_creation_input_tokens = cache_write_tokens
+    usage.cache_read_input_tokens = cache_read_tokens
     return usage
 
 
@@ -56,12 +90,12 @@ def test_agent_terminates_on_text(mock_anthropic, tmp_path):
     mock_response.content = [text_block]
     mock_response.model_dump.return_value = {"mock": "dump"}
 
-    mock_client.messages.create.return_value = mock_response
+    _wire_stream(mock_client, [mock_response])
 
     final_qc, clean_df, report, summary = run_agent(qc, max_steps=5, log_dir=str(tmp_path))
 
     # Ensure it only ran 1 step since the first response was "end_turn"
-    assert mock_client.messages.create.call_count == 1
+    assert mock_client.messages.stream.call_count == 1
     assert "This is the final report." in report
     assert final_qc is qc
     assert clean_df is None
@@ -135,12 +169,12 @@ def test_agent_tool_dispatch(mock_anthropic, tmp_path):
     resp3.model_dump.return_value = {"mock": "dump3"}
 
     # Wire the mock responses sequentially
-    mock_client.messages.create.side_effect = [resp1, resp2, resp3]
+    _wire_stream(mock_client, [resp1, resp2, resp3])
 
     final_qc, clean_df, report, summary = run_agent(qc, max_steps=5, log_dir=str(tmp_path))
 
     # Ensure it ran 3 steps
-    assert mock_client.messages.create.call_count == 3
+    assert mock_client.messages.stream.call_count == 3
     assert "All done exporting." in report
 
     # Clean df should be returned from export_clean_data
@@ -214,7 +248,7 @@ def test_token_tracking(mock_anthropic, tmp_path):
     resp2.content = [text_block]
     resp2.model_dump.return_value = {"mock": "dump2"}
 
-    mock_client.messages.create.side_effect = [resp1, resp2]
+    _wire_stream(mock_client, [resp1, resp2])
 
     final_qc, clean_df, report, summary = run_agent(qc, max_steps=10, log_dir=str(tmp_path))
 
@@ -282,7 +316,7 @@ def test_cli_writes_outputs(mock_anthropic, tmp_path):
     resp2.content = [text_block]
     resp2.model_dump.return_value = {"mock": "resp2"}
 
-    mock_client.messages.create.side_effect = [resp1, resp2]
+    _wire_stream(mock_client, [resp1, resp2])
 
     log_dir = str(tmp_path / "logs")
     result = main([str(csv_path), "--output-dir", str(series_dir), "--log-dir", log_dir])
@@ -315,3 +349,157 @@ def test_cli_writes_outputs(mock_anthropic, tmp_path):
     # Check that a JSONL log was written
     log_files = list(Path(log_dir).glob("*.jsonl"))
     assert len(log_files) == 1
+
+
+@patch("src.agent.anthropic.Anthropic")
+@patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test_key"})
+def test_cli_flag_log_carries_the_agents_decisions(mock_anthropic, tmp_path):
+    """The §5 flag log is written by export_clean_data, with action + reason intact.
+
+    Without this the log records only that a row was flagged, which `evaluate.py`
+    scores as no claim at all — the run's reasoning never reaches the metrics.
+    """
+    from src.agent import main
+
+    series_dir = tmp_path / "data"
+    series_dir.mkdir()
+    idx = pd.date_range("2024-01-01", periods=40, freq="15min")
+    values = [10.0] * 40
+    values[20] = 500.0                     # a spike flag_range will catch
+    df = pd.DataFrame({"datetime": idx, "value": values})
+    csv_path = series_dir / "test_gauge_l1.csv"
+    df.to_csv(csv_path, index=False)
+
+    mock_client = MagicMock()
+    mock_anthropic.return_value = mock_client
+
+    def _tool_step(name, tool_input, call_id):
+        resp = MagicMock()
+        resp.stop_reason = "tool_use"
+        resp.usage = _mock_usage(800, 200)
+        block = MagicMock()
+        block.type = "tool_use"
+        block.name = name
+        block.input = tool_input
+        block.id = call_id
+        resp.content = [block]
+        resp.model_dump.return_value = {"mock": name}
+        return resp
+
+    spike_at = idx[20].strftime("%Y-%m-%dT%H:%M:%S")
+    resp1 = _tool_step("flag_range", {"min": 0, "max": 100}, "c1")
+    resp2 = _tool_step(
+        "export_clean_data",
+        {"decisions": [
+            {"start": spike_at, "verdict": "anomaly", "anomaly_type": "spike",
+             "action": "delete", "reason": "500 NTU, 1 sample, robust_z 30"},
+        ]},
+        "c2",
+    )
+    resp3 = MagicMock()
+    resp3.stop_reason = "end_turn"
+    resp3.usage = _mock_usage(1500, 400)
+    text_block = MagicMock()
+    text_block.type = "text"
+    text_block.text = "One spike deleted."
+    resp3.content = [text_block]
+    resp3.model_dump.return_value = {"mock": "resp3"}
+
+    _wire_stream(mock_client, [resp1, resp2, resp3])
+
+    assert main([str(csv_path), "--output-dir", str(series_dir),
+                 "--log-dir", str(tmp_path / "logs")]) == 0
+
+    flags = json.loads((series_dir / "test_gauge_l1_flags.json").read_text())
+    assert len(flags) == 1
+    entry = flags[0]
+    assert entry["datetime"] == spike_at
+    assert entry["action"] == "delete"
+    assert entry["reason"] == "500 NTU, 1 sample, robust_z 30"
+    assert "flagRange" in entry["flagged_by"]
+
+    # The entries themselves must not be echoed back to the model — a real run has
+    # thousands of them and they would swamp the context.
+    log_file = next(Path(tmp_path / "logs").glob("*.jsonl"))
+    calls = [json.loads(l) for l in log_file.read_text().splitlines()]
+    tool_results = [
+        block
+        for call in calls if call["event"] == "api_call"
+        for msg in call["messages"] if msg["role"] == "user" and isinstance(msg["content"], list)
+        for block in msg["content"] if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
+    exported = [b for b in tool_results if "Flag log holds" in str(b["content"])]
+    assert exported, "export_clean_data result never reached the model"
+    assert '"flags"' not in str(exported[0]["content"])
+
+
+@patch("src.agent.anthropic.Anthropic")
+@patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test_key"})
+def test_a_truncated_thinking_turn_stops_the_run_instead_of_poisoning_it(mock_anthropic, tmp_path):
+    """A turn that hits max_tokens mid-thought must not go onto the history.
+
+    Its content is a lone `thinking` block, and the API rejects an assistant message
+    whose final block is `thinking` — so appending it makes the NEXT call 400 with an
+    error that says nothing about the real cause. Seen on 08041770_l1 (2026-08-13),
+    where it killed a run 14 steps in.
+    """
+    from src.agent import run_agent
+
+    idx = pd.date_range("2024-01-01", periods=20, freq="15min")
+    qc = saqc.SaQC(pd.DataFrame({"value": range(20)}, index=idx))
+
+    mock_client = MagicMock()
+    mock_anthropic.return_value = mock_client
+
+    truncated = MagicMock()
+    truncated.stop_reason = "max_tokens"
+    truncated.usage = _mock_usage(500, 16000)
+    thinking_block = MagicMock()
+    thinking_block.type = "thinking"
+    truncated.content = [thinking_block]
+    truncated.model_dump.return_value = {"mock": "truncated"}
+
+    # If the loop appended the truncated turn it would call the API again; a single
+    # response in side_effect means a second call raises StopIteration and fails here.
+    _wire_stream(mock_client, [truncated])
+
+    _, _, report, summary = run_agent(qc, max_steps=5, log_dir=str(tmp_path))
+
+    assert mock_client.messages.stream.call_count == 1
+    assert "max_tokens" in report or "token" in report.lower()
+    assert summary.steps == 1
+
+
+@patch("src.agent.anthropic.Anthropic")
+@patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test_key"})
+def test_an_api_error_mid_loop_does_not_discard_the_run(mock_anthropic, tmp_path):
+    """A 400 at step N must not throw away the N-1 tool calls already made."""
+    from src.agent import run_agent
+
+    idx = pd.date_range("2024-01-01", periods=20, freq="15min")
+    qc = saqc.SaQC(pd.DataFrame({"value": range(20)}, index=idx))
+
+    mock_client = MagicMock()
+    mock_anthropic.return_value = mock_client
+
+    ok = MagicMock()
+    ok.stop_reason = "tool_use"
+    ok.usage = _mock_usage(400, 100)
+    block = MagicMock()
+    block.type = "tool_use"; block.name = "inspect_dataset"; block.input = {}; block.id = "c1"
+    ok.content = [block]
+    ok.model_dump.return_value = {"mock": "ok"}
+
+    _wire_stream(mock_client, [
+        ok,
+        anthropic.BadRequestError(
+            "credit balance is too low",
+            response=MagicMock(status_code=400, headers={}),
+            body=None,
+        ),
+    ])
+
+    _, _, report, summary = run_agent(qc, max_steps=5, log_dir=str(tmp_path))
+
+    assert "stopped at step 1" in report
+    assert summary.steps == 1          # the completed step is still accounted for

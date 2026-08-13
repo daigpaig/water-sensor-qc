@@ -13,9 +13,12 @@ points surrounding it. Nothing here flags, mutates or writes anything.
 The discriminating measurements, and what they mean physically:
 
   ``slope_context``      rise vs fall gradient either side of the point, and the
-                         single-sample steps into and out of it. Note the
-                         measured caveat in its docstring: the rise/fall *ratio*
-                         alone does not separate storms from spikes.
+                         single-sample steps into and out of it. At the default
+                         45-minute window a *gentle* fall against a sharp rise
+                         (ratio ≲ 0.8) means a real flush event; ≈ 1 means an
+                         artifact. The window matters more than anything else
+                         here — the signal reverses past ~90 min. Read its
+                         docstring before changing it.
   ``excursion_context``  how *wide* the excursion is at half its height, and how
                          much of it happens in a single sample. One sample wide
                          and sharp ⇒ artifact; hours wide ⇒ event.
@@ -25,6 +28,10 @@ The discriminating measurements, and what they mean physically:
                          the new level *persists* well beyond the transition.
   ``flatness_context``   repeated-value evidence for a stuck sensor (plateau).
   ``neighbourhood_stats`` local median / robust sigma / robust z / percentile.
+  ``noise_context``      how noisy this stretch is compared with the rest of the
+                         record, and how far the point stands out *within* that
+                         stretch. The measurement that stops a noisy hour being
+                         read as fifty separate sensor failures.
   ``gap_context``        distance to the nearest NaN run; values on a gap edge
                          are the usual suspects for telemetry artifacts.
   ``historical_context`` has the series *ever* reached this level elsewhere, and
@@ -231,28 +238,41 @@ def slope_context(
     source,
     at,
     field: str = VALUE_COL,
-    n_before: int = 8,
-    n_after: int = 8,
+    n_before: int = 3,
+    n_after: int = 3,
 ) -> dict:
     """Gradient leading into *at* vs the gradient leading out of it.
 
     ``n_before`` / ``n_after`` are counts of samples, each window *including* the
     point itself, so the rise into the peak and the fall out of it are both
-    measured. At 15-min sampling, 8 samples = 2 hours.
+    measured. At 15-min sampling, 3 samples = 45 minutes.
 
-    MEASURED CAVEAT — ``fall_rise_ratio`` does NOT separate spikes from storms.
-    The intuition is that a storm rises sharply and recedes gradually (ratio well
-    below 1) while a debris spike falls as fast as it rose (ratio ≈ 1). On these
-    datasets that does not hold: injected upward spikes and genuine storm peaks
-    sit at median ratios of 1.00 vs 0.97 at a 2 h window, and the overlap is just
-    as bad at 1 h, 6 h and 24 h, with or without the point excluded from the fits
-    (measured on 3 gauges × 120 points each). The reason is scale: a storm's
-    asymmetry lives at the *event* scale — a rise over hours against a recession
-    over days — not in the local gradient either side of one sample. The
-    measurements that do separate them are width and recovery time
-    (``excursion_context``, ``recovery_context``) and ``robust_z``
-    (``neighbourhood_stats``). Use this function for shape and direction, and do
-    not lean on the ratio alone.
+    THE WINDOW IS THE WHOLE BALLGAME, AND THE SIGNAL INVERTS WITH IT (measured
+    2026-08-11 on 31 flush events vs 14 injected spikes, 03447687_l1). Separation,
+    as P(artifact ratio > flush ratio):
+
+        window            flush median   artifact median   separation
+        2 samples (30m)       0.58            0.99            0.56
+        3 samples (45m)       0.75            0.99            0.84   <- default
+        4 samples (60m)       0.83            1.00            0.71
+        6 samples (90m)       1.11            0.98            0.42
+        8 samples (120m)      1.24            0.99            0.34
+        12 samples (180m)     1.43            0.93            0.27
+
+    A small first-flush event rises in one sample and decays over 3-5, so at a
+    45-minute window its fall gradient is visibly gentler than its rise and the
+    ratio sits near 0.75; a debris strike falls as fast as it rose and sits at
+    0.99. Past ~90 minutes the decay is over and the window fills with the flat
+    surroundings, the ratio drifts above 1, and the ordering REVERSES — which is
+    why the earlier reading of this function (2 h and wider, on storm peaks rather
+    than flush events) concluded the ratio was useless and recorded that in §7.3.
+    It is not useless; it was being measured past the scale of the thing it
+    measures. Default therefore moved 8 -> 3 samples.
+
+    This is still one signal among several: at a ``< 0.8`` threshold the rule
+    "gentle fall means real water, keep it" catches 77% of flush events and
+    wrongly keeps 14% of genuine artifacts. Read it with width and recovery time
+    (``excursion_context``, ``recovery_context``), not instead of them.
     """
     series = as_series(source, field)
     ts = resolve_timestamp(series, at)
@@ -807,7 +827,257 @@ def neighbourhood_stats(
 
 
 # ---------------------------------------------------------------------------
-# 7. Gap proximity
+# 7. Local noise — is this stretch noisy, or is this point an outlier?
+# ---------------------------------------------------------------------------
+def _block_noise(diffs: np.ndarray, block: int) -> np.ndarray:
+    """Robust first-difference scale of every non-overlapping *block* of ``diffs``.
+
+    Vectorised deliberately: this runs on the whole record on every call, and the
+    obvious ``rolling().apply(mad)`` is O(n·w) in Python and takes seconds on a
+    two-year 15-minute series. A reshape plus two ``nanmedian``s along an axis is
+    milliseconds, and non-overlapping blocks are the right unit anyway — the
+    question is "how noisy is a window like this one", not a per-row curve.
+
+    All-NaN blocks (a long gap) come back NaN and are dropped by the caller.
+    """
+    n = (len(diffs) // block) * block
+    if n < block:
+        return np.array([])
+    grid = diffs[:n].reshape(-1, block)
+    with np.errstate(invalid="ignore"):
+        med = np.nanmedian(grid, axis=1, keepdims=True)
+        sigma = _MAD_TO_SIGMA * np.nanmedian(np.abs(grid - med), axis=1)
+    return sigma
+
+
+def noise_context(
+    source,
+    at,
+    field: str = VALUE_COL,
+    window: str = "90min",
+    elevated_ratio: float = 3.0,
+) -> dict:
+    """How noisy is the data around *at*, and does the point stand out within it?
+
+    THE PROBLEM THIS EXISTS TO SOLVE. Every other measurement in this module
+    describes one point against a *record-wide* scale, so a point that moves 18
+    robust sigmas is 18 sigmas whether its neighbours are flat or thrashing. In a
+    stretch where the sensor is noisy — or where the water is genuinely moving
+    fast — the spike detectors fire on dozens of points, each one looks extreme by
+    that record-wide standard, and the run deletes them as dozens of separate
+    sensor failures. They are not separate failures. They are one noisy stretch,
+    and the right output is a single decision about the stretch.
+
+    Two numbers carry this, and they answer different halves of the question:
+
+    ``noise_ratio``
+        The window's robust sample-to-sample scale divided by the record-typical
+        one. 1.0 is an ordinary stretch of this record; 10 means the data here is
+        moving ten times as much as it usually does.
+    ``point_step_sigmas_local``
+        The point's own largest single-sample move, measured against **its own
+        neighbourhood** rather than the record. This is the discriminator. A real
+        artifact jumps far further than the samples around it are jumping; a false
+        positive in a busy stretch is doing what everything near it is doing.
+
+    MEASURED (``scratchpad/tune_noise_context.py``; 4 datasets across all three
+    gauges, injected labels as truth). Three populations: 168 injected spikes that
+    a ``flagUniLOF(thresh=1.5)`` run found, 662 **false positives** from the same
+    run — points it flagged that the labels call normal water, i.e. exactly the
+    population this docstring is about — and 1600 ordinary normal rows.
+
+        metric                    true spike    false positive    normal
+        noise_ratio                   1.2            11.3           1.0
+        point_step_sigmas_local      17.1             1.6           1.1
+        point_step_sigmas_global     18.7            16.7           1.0
+        turning_fraction             0.55            0.27          0.55
+
+    Read the third row first: the measurement the agent already had —
+    ``slope_context``'s ``delta_before_sigmas``, which is scaled by the *record*
+    step sigma — reads 18.7 on a real spike and 16.7 on a false positive. It
+    cannot tell them apart at all (separation 0.53, a coin flip). Rescaling the
+    same move against the local neighbourhood moves it to 17.1 vs 1.6, separation
+    **0.87**. The information was always there; the denominator was wrong.
+
+    Rules, scored as what they buy and what they cost:
+
+        spare the point when...                    FPs spared   spikes lost
+        point_step_sigmas_local < 5                   83.1%        16.7%
+        noise_ratio > 5                               70.7%         7.1%
+        noise_ratio > 3 and step_sigmas_local < 5     76.7%         3.0%   <- used
+
+    THE WINDOW MATTERS AND ±90 MIN IS THE PEAK. Swept at ±1 / 1.5 / 2 / 3 h, the
+    combined rule spares 83.7 / 76.7 / 72.4 / 61.0% of false positives at 6.5 /
+    3.0 / 1.2 / 2.4% of true spikes. Widen it and the window fills with calm
+    surroundings, the local scale falls back toward the record scale, and the
+    measurement degrades into the global one it exists to replace.
+
+    ``turning_fraction`` splits the two ways a stretch can be busy, which need
+    different decisions: it is the share of samples where the series reverses
+    direction. White noise reverses about half the time (a thrashing sensor, and
+    also a calm baseline, both ≈0.55); a storm limb climbing steadily almost never
+    does (≈0.27). So high ``noise_ratio`` with a high turning fraction is a noisy
+    *sensor*, while high ``noise_ratio`` with a low one is water genuinely moving
+    fast. Both mean "do not delete these points one at a time"; only the first is
+    a data-quality problem at all.
+
+    ``episode_start`` / ``episode_end`` bound the contiguous elevated-noise
+    stretch containing the point, so a run can write **one** decision span over it
+    instead of one per flagged row (§5).
+    """
+    series = as_series(source, field)
+    ts = resolve_timestamp(series, at)
+    pos = _pos(series, ts)
+    params = {"field": field, "window": window, "elevated_ratio": elevated_ratio}
+
+    step = _median_step(series)
+    half = max(2, int(round(pd.Timedelta(window) / step)))
+    block = 2 * half + 1
+
+    diffs = series.diff().to_numpy()
+    global_sigma = _step_sigma(series)
+
+    lo, hi = max(0, pos - half), min(len(series), pos + half + 1)
+    local_sigma = max(_mad_sigma(diffs[lo:hi]), _SIGMA_EPS)
+
+    # Record-typical noise: the MEDIAN window, not the record-wide first-difference
+    # scale. They are usually close, but the median block is the honest reference
+    # for "is this window unusual", and it is what noise_percentile ranks against.
+    raw_blocks = _block_noise(diffs, block)
+    blocks = raw_blocks[np.isfinite(raw_blocks)] if raw_blocks.size else raw_blocks
+    if blocks.size:
+        baseline = max(float(np.median(blocks)), _SIGMA_EPS)
+        percentile = float((blocks < local_sigma).mean() * 100)
+    else:
+        baseline = global_sigma
+        percentile = None
+    noise_ratio = local_sigma / baseline
+
+    # The point's own move, against the local scale and the record scale. The gap
+    # between the two IS the finding whenever this tool changes a decision.
+    prev_value = series.iloc[pos - 1] if pos > 0 else np.nan
+    next_value = series.iloc[pos + 1] if pos + 1 < len(series) else np.nan
+    value = series.iloc[pos]
+    adjacent = np.array([abs(value - prev_value), abs(next_value - value)])
+    point_step = float(np.nanmax(adjacent)) if np.isfinite(adjacent).any() else np.nan
+
+    window_steps = np.abs(diffs[lo:hi])
+    window_steps = window_steps[np.isfinite(window_steps)]
+    if window_steps.size and np.isfinite(point_step):
+        pct_as_much = float((window_steps >= point_step).mean() * 100)
+    else:
+        pct_as_much = None
+
+    # Direction reversals: separates a thrashing sensor from water moving fast.
+    finite = diffs[lo:hi]
+    finite = finite[np.isfinite(finite)]
+    if finite.size >= 3:
+        signs = np.sign(finite)
+        turning = float((signs[1:] * signs[:-1] < 0).mean())
+    else:
+        turning = None
+
+    # Extent of the elevated-noise stretch, so the agent can make ONE decision
+    # about it rather than one per flagged row.
+    episode_start = episode_end = None
+    n_blocks = len(blocks) if blocks.size else 0
+    if raw_blocks.size:
+        b = min(pos // block, len(raw_blocks) - 1)
+        elevated = np.where(np.isfinite(raw_blocks), raw_blocks, 0.0) >= elevated_ratio * baseline
+        if elevated[b]:
+            start = b
+            while start - 1 >= 0 and elevated[start - 1]:
+                start -= 1
+            end = b
+            while end + 1 < len(elevated) and elevated[end + 1]:
+                end += 1
+            episode_start = series.index[start * block]
+            episode_end = series.index[min((end + 1) * block - 1, len(series) - 1)]
+
+    if noise_ratio >= 5:
+        regime = "severe"
+    elif noise_ratio >= elevated_ratio:
+        regime = "elevated"
+    elif noise_ratio >= 0.6:
+        regime = "typical"
+    else:
+        regime = "quiet"
+
+    if turning is None:
+        variation = "unknown"
+    elif turning >= 0.45:
+        variation = "noise-like"          # reverses constantly: the sensor is thrashing
+    elif turning < 0.35:
+        variation = "directional"         # moving steadily: real water, e.g. a storm limb
+    else:
+        variation = "mixed"
+
+    stands_out = (
+        point_step / local_sigma if np.isfinite(point_step) and local_sigma > 0 else None
+    )
+    # The measured rule. Deliberately stated as "unremarkable here", not "keep":
+    # the verdict is the agent's (§7.3), this only says the point is not separable
+    # from its surroundings.
+    unremarkable = bool(
+        noise_ratio > elevated_ratio and stands_out is not None and stands_out < 5
+    )
+
+    if unremarkable:
+        verdict = (
+            f"This point does NOT stand out from its surroundings: it moves "
+            f"{round(stands_out, 1)}x the local sample-to-sample scale in a stretch that is "
+            f"already {round(noise_ratio, 1)}x noisier than this record's typical window. "
+            + ("The variation here reverses direction constantly, so the SENSOR is noisy here. "
+               if variation == "noise-like" else
+               "The variation here is directional, so this is water genuinely moving fast, "
+               "not sensor noise. " if variation == "directional" else "")
+            + "Treat the stretch as one segment rather than deleting its points individually; "
+              "measured, this pattern is a false positive ~4 times in 5."
+        )
+    elif stands_out is not None and stands_out >= 5:
+        verdict = (
+            f"This point DOES stand out: it moves {round(stands_out, 1)}x the local "
+            f"sample-to-sample scale, so it is not explained by the variability around it."
+        )
+    else:
+        verdict = "The point's own step could not be measured (it sits at an edge or a gap)."
+
+    msg = (
+        f"Local noise {round(local_sigma, 4)} vs record-typical {round(baseline, 4)} "
+        f"= {round(noise_ratio, 1)}x ({regime}"
+        + (f", {round(percentile, 1)}th percentile of windows" if percentile is not None else "")
+        + f"; variation is {variation}). {verdict}"
+    )
+
+    return _result(
+        "noise_context", params, ts, msg,
+        value=_f(value),
+        local_noise=_f(local_sigma),
+        baseline_noise=_f(baseline),
+        record_noise=_f(global_sigma),
+        noise_ratio=_f(noise_ratio),
+        noise_percentile=_f(percentile),
+        noise_regime=regime,
+        point_step=_f(point_step),
+        point_step_sigmas_local=_f(stands_out),
+        point_step_sigmas_global=_f(point_step / global_sigma) if np.isfinite(point_step) else None,
+        pct_window_moving_as_much=_f(pct_as_much),
+        turning_fraction=_f(turning),
+        variation_kind=variation,
+        point_unremarkable_here=unremarkable,
+        episode_start=_iso(episode_start),
+        episode_end=_iso(episode_end),
+        episode_hours=_f(
+            (episode_end - episode_start).total_seconds() / 3600.0
+            if episode_start is not None else None
+        ),
+        window_samples=int(hi - lo),
+        n_reference_windows=n_blocks,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8. Gap proximity
 # ---------------------------------------------------------------------------
 def gap_context(
     source,
@@ -895,7 +1165,7 @@ def gap_context(
 
 
 # ---------------------------------------------------------------------------
-# 8. Historical precedent
+# 9. Historical precedent
 # ---------------------------------------------------------------------------
 def historical_context(
     source,
@@ -974,7 +1244,7 @@ def historical_context(
 
 
 # ---------------------------------------------------------------------------
-# 9. Aggregators
+# 10. Aggregators
 # ---------------------------------------------------------------------------
 def _reads_like(parts: dict) -> tuple[str, str]:
     """Heuristic label + one-line justification from the individual contexts.
@@ -1031,6 +1301,20 @@ def _reads_like(parts: dict) -> tuple[str, str]:
     # Spike: far from its own neighbourhood AND narrow. Sign-agnostic — injected
     # spikes go both ways, and |z| is what recovers the downward ones.
     if abs_z is not None and abs_z >= 3 and 0 < width <= 4:
+        # ...unless the whole stretch is doing this. A narrow high-z excursion in a
+        # stretch already 3x noisier than the record, whose own step is under 5x the
+        # LOCAL sample-to-sample scale, is a false positive ~4 times in 5 (measured;
+        # see noise_context). Falling through to "spike" here is what produces a run
+        # that deletes fifty points out of one noisy hour.
+        noise = parts.get("noise", {})
+        if noise.get("point_unremarkable_here"):
+            return (
+                "noisy-stretch",
+                f"narrow and {round(robust_z, 1)} sigmas out by the RECORD's scale, but it "
+                f"moves only {noise.get('point_step_sigmas_local')}x the LOCAL scale in a "
+                f"stretch {noise.get('noise_ratio')}x noisier than typical "
+                f"({noise.get('variation_kind')}) — judge the stretch, not the point.",
+            )
         return (
             "spike",
             f"{width}-sample excursion at {round(robust_z, 1)} robust sigmas from the "
@@ -1079,8 +1363,11 @@ def describe_point(
     source,
     at,
     field: str = VALUE_COL,
-    n_before: int = 8,
-    n_after: int = 8,
+    # 3 samples (45 min), matching slope_context: the fall/rise ratio in the row this
+    # builds only separates a flush event from an artifact at that scale, and inverts
+    # past ~90 min. See slope_context's docstring for the measured table.
+    n_before: int = 3,
+    n_after: int = 3,
     window: str = "6h",
     shift_window: str = "24h",
 ) -> dict:
@@ -1107,6 +1394,10 @@ def describe_point(
         "level_shift": level_shift_context(series, ts, field, window=shift_window),
         "flatness": flatness_context(series, ts, field, window=window),
         "neighbourhood": neighbourhood_stats(series, ts, field, window=window),
+        # Deliberately NOT passed `window`: noise_context peaks at its own ±90 min
+        # and degrades toward the global measurement as the window widens, so it
+        # must not inherit the 6 h neighbourhood window (see its docstring).
+        "noise": noise_context(series, ts, field),
         "gap": gap_context(series, ts, field),
         "history": historical_context(series, ts, field),
     }
@@ -1156,6 +1447,7 @@ def describe_points(
         exc_part = full["excursion"]
         slope_part = full["slope"]
         rec_part = full["recovery"]
+        noise_part = full["noise"]
         rows.append({
             "at": full["at"],
             "value": full["value"],
@@ -1167,6 +1459,11 @@ def describe_points(
             "fall_rise_ratio": slope_part.get("fall_rise_ratio"),
             "samples_to_recover": rec_part.get("n_samples_to_recover"),
             "recovered": rec_part.get("recovered"),
+            # Two noise columns, because triage is where they pay: scanning 100 rows
+            # and seeing noise_ratio ~10 on all of them is how a run notices it is
+            # looking at one noisy stretch and not 100 sensor failures.
+            "noise_ratio": noise_part.get("noise_ratio"),
+            "step_sigmas_local": noise_part.get("point_step_sigmas_local"),
         })
 
     tally: dict[str, int] = {}
