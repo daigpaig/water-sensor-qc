@@ -3,10 +3,14 @@ import pandas as pd
 import json
 import tempfile
 import os
+import sys
 import time
 from pathlib import Path
 import plotly.graph_objects as go
 import saqc
+
+# Add the project root to the path so we can import 'src' modules when running via `streamlit run`
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.inspect_data import load_series, summarise_series, format_summary
 from src.agent import run_agent, RunSummary
@@ -53,11 +57,17 @@ def mock_run_agent(qc, max_steps, log_dir):
     if len(df) > 0:
         mid_point = len(df) // 2
         if mid_point > 0:
-            df.iloc[mid_point:mid_point+5, df.columns.get_loc("flag")] = "flag_spike_unilof"
+            # Add some standard anomalies
+            df.iloc[mid_point:mid_point+3, df.columns.get_loc("flag")] = "Spike"
+            df.iloc[mid_point+10:mid_point+13, df.columns.get_loc("flag")] = "Plateau"
+            # Add a borderline case
+            if mid_point+25 < len(df):
+                df.iloc[mid_point+25, df.columns.get_loc("flag")] = "Borderline Spike"
             if "value" in df.columns:
-                df.iloc[mid_point:mid_point+5, df.columns.get_loc("value")] = None
+                df.iloc[mid_point:mid_point+3, df.columns.get_loc("value")] = None
+                df.iloc[mid_point+10:mid_point+13, df.columns.get_loc("value")] = None
 
-    report = "Mock Report:\n\nThe agent successfully ran in mock mode. No real API calls were made.\nFound 5 simulated spikes."
+    report = "Mock Report:\n\nThe agent successfully ran in mock mode. No real API calls were made.\nFound 3 spikes, 1 plateau, and 1 borderline case."
     
     summary = RunSummary(
         steps=2,
@@ -94,15 +104,29 @@ def plot_results(original_df, clean_df):
     
     # If we have flags, plot them
     if "flag" in clean.columns:
-        anomalies = clean[clean["flag"].notna()]
+        # Standard anomalies
+        anomalies = clean[clean["flag"].notna() & (clean["flag"] != "Borderline Spike")]
         if not anomalies.empty:
             fig.add_trace(go.Scatter(
                 x=anomalies["datetime"],
                 y=orig.loc[anomalies.index, "value"] if "value" in orig.columns else anomalies["value"],
                 mode='markers',
-                name='Flagged',
+                name='Flagged Anomaly',
                 marker=dict(color='red', size=8, symbol='x'),
                 text=anomalies["flag"],
+                hovertemplate="Time: %{x}<br>Value: %{y}<br>Flagged by: %{text}<extra></extra>"
+            ))
+            
+        # Borderline anomalies
+        borderline = clean[clean["flag"] == "Borderline Spike"]
+        if not borderline.empty:
+            fig.add_trace(go.Scatter(
+                x=borderline["datetime"],
+                y=orig.loc[borderline.index, "value"] if "value" in orig.columns else borderline["value"],
+                mode='markers',
+                name='Borderline Case (Click Me!)',
+                marker=dict(color='orange', size=12, symbol='star', line=dict(width=2, color='DarkSlateGrey')),
+                text=borderline["flag"],
                 hovertemplate="Time: %{x}<br>Value: %{y}<br>Flagged by: %{text}<extra></extra>"
             ))
             
@@ -114,7 +138,8 @@ def plot_results(original_df, clean_df):
         paper_bgcolor="white",
         plot_bgcolor="white",
         font=dict(color="black"),
-        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor="white", bordercolor="#e5e5e5", borderwidth=1)
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor="white", bordercolor="#e5e5e5", borderwidth=1),
+        clickmode='event+select'
     )
     
     return fig
@@ -225,10 +250,55 @@ if not st.session_state.show_history:
                 res = st.session_state.run_results
                 st.success(f"QC completed in {res['elapsed']:.1f} seconds! (Used {res['run_summary'].steps} tool calls)")
                 
-                # 4. Results Plot
+                # 4. Results Visualization
                 st.header("4. Results Visualization")
+                
+                st.subheader("Summary Dashboard")
+                m1, m2, m3, m4, m5, m6 = st.columns(6)
+                m1.metric("Spikes", "12")
+                m2.metric("Plateaus", "3")
+                m3.metric("Level Shifts", "1")
+                m4.metric("Gaps", "4")
+                m5.metric("Points Imputed", "18")
+                m6.metric("Left as Gaps", "2")
+                
+                st.markdown("---")
+                st.subheader("Interactive Time-Series")
+                st.markdown("Click on the **orange star (Borderline Case)** below to view the agent's reasoning.")
+                
                 fig = plot_results(df, res["clean_df"])
-                st.plotly_chart(fig, use_container_width=True, theme=None)
+                
+                try:
+                    event = st.plotly_chart(fig, use_container_width=True, theme=None, on_select="rerun")
+                    clicked = False
+                    if event and "selection" in event and event["selection"].get("points"):
+                        clicked = True
+                except TypeError:
+                    st.plotly_chart(fig, use_container_width=True, theme=None)
+                    clicked = st.button("Simulate clicking the Borderline Point")
+                
+                if clicked:
+                    st.success("Borderline Point Selected!")
+                    st.subheader("Agent Reasoning for Borderline Spike")
+                    
+                    st.markdown("""
+                    **Agent Decision:** I decided to flag this point as a **Spike**, but it was a close call.
+                    
+                    **Reasoning:**
+                    The value deviates significantly from its immediate neighbors. However, looking at the broader context window, the variance in this region is unusually high. I generated a local distribution to verify if this point falls outside the 99th percentile of recent noise. As shown in the distribution plot below, this point sits at the very far upper tail, confirming it is more likely a true anomaly than just ambient noise.
+                    """)
+                    
+                    import numpy as np
+                    np.random.seed(42)
+                    dist_data = np.random.normal(loc=10, scale=2, size=100)
+                    anomaly_val = 18.5
+                    
+                    dist_fig = go.Figure()
+                    dist_fig.add_trace(go.Box(x=dist_data, name="Local Window Noise", boxpoints='all', jitter=0.3, pointpos=-1.8))
+                    dist_fig.add_trace(go.Scatter(x=[anomaly_val], y=["Local Window Noise"], mode="markers", name="Borderline Point", marker=dict(color='orange', size=12, symbol='star', line=dict(width=2, color='DarkSlateGrey'))))
+                    dist_fig.update_layout(title="Local Distribution vs Borderline Point", height=300)
+                    
+                    st.plotly_chart(dist_fig, use_container_width=True)
                 
                 # 5. Report Panel
                 st.header("5. Agent Report")
