@@ -43,10 +43,10 @@ Self-contained HTML, plotly.js inlined, no server — like the other workbench p
 CLI
 ---
     python -m src.workbench.decision_audit \\
-        data/injected/03447687/l1/03447687_l1.csv \\
+        data/injected/02054550/l1/02054550_l1.csv \\
         --flags data/agent_runs/03447687_l1_flags.json \\
         --log logs/run_20260811_114419.jsonl \\
-        --raw data/raw/approved/03447687_turbidity_63680.csv
+        --raw data/raw/approved/02054550_turbidity_63680.csv
 
 Pages land in `figures/decision_audit/`.
 """
@@ -61,9 +61,9 @@ import numpy as np
 import pandas as pd
 
 from src.inspect_data import DATETIME_COL
+from src.workbench.provenance import Trace, call_table, explain_point, load_trace
 from src.workbench.spike_audit import (
     load_flag_log,
-    load_run,
     robust_step_sigma,
     _local_sigmas,
 )
@@ -76,24 +76,45 @@ REMOVING_ACTIONS = frozenset({"delete", "correct"})
 CATEGORIES = (
     "wrongly-deleted", "missed", "overwritten-anomaly", "undetected",
     "overwritten-water", "deleted", "imputed", "left-missing", "kept",
+    "inspected-not-flagged",
 )
 
 # Categories in which a labelled anomaly went unhandled. Summed in the CLI output so
 # the headline cannot read "missed=0" while thirteen anomalies sit in another bucket.
 UNHANDLED_ANOMALY = ("missed", "overwritten-anomaly", "undetected")
 
-# Samples drawn either side of the selected point in the detail plot.
-CONTEXT_SAMPLES = 96          # 24 h on a 15-min grid
+# Context drawn either side of the selected point in the detail plot, as a DURATION.
+# It used to be a fixed 96 samples, which silently meant 24 h on the 15-min bases and
+# 8 h once the project moved to 5-min ones — the plot quietly stopped showing the
+# surroundings a storm-vs-spike call depends on.
+CONTEXT_WINDOW = pd.Timedelta("24h")
+CONTEXT_SAMPLES = 96          # fallback when the step cannot be inferred
 
 
-def categorise(action: str, label: str, flagged: bool) -> str:
+def context_samples(index: pd.DatetimeIndex) -> int:
+    """How many samples span :data:`CONTEXT_WINDOW` on *this* series' grid."""
+    if len(index) < 2:
+        return CONTEXT_SAMPLES
+    step = pd.Series(index).diff().median()
+    if pd.isna(step) or step <= pd.Timedelta(0):
+        return CONTEXT_SAMPLES
+    return max(8, int(round(CONTEXT_WINDOW / step)))
+
+
+def categorise(action: str, label: str, flagged: bool, inspected: bool = False) -> str:
     """Which of the six buckets one row falls into.
 
     `label` is the §5 anomaly_type, or "" for normal water.
     """
     is_anomaly = bool(label)
     if not flagged:
-        return "undetected" if is_anomaly else ""       # unflagged normal water is not a case
+        if is_anomaly:
+            return "undetected"
+        # Normal water the agent measured without any detector flagging it. Rare — it
+        # picks its describe_points timestamps out of flagged_datetimes — but it can
+        # ask about any point, and such a row has a real story that the catch-all
+        # "nothing happened to this point" would misreport.
+        return "inspected-not-flagged" if inspected else ""
     if action == "impute":
         # `impute` on a row that was never missing means interpolateByRolling replaced a
         # real reading — SaQC filters already-flagged rows out of the imputer's input, so
@@ -123,23 +144,27 @@ def build_cases(
     series: pd.Series,
     labels: pd.DataFrame,
     flag_log: pd.DataFrame,
-    measured: dict[pd.Timestamp, dict],
+    trace: Trace,
     raw: pd.Series | None = None,
 ) -> list[dict]:
-    """One record per point worth clicking: every flagged row + every labelled anomaly.
+    """One record per point worth clicking: every flagged row, every labelled anomaly,
+    and anything the agent measured.
 
-    Points that are neither are deliberately absent — the page reports those from the
-    series itself ("never flagged, not a labelled anomaly") rather than embedding
-    70,000 empty records.
+    Points that are none of those are deliberately absent — their story is identical
+    (no detector fired, nobody looked, the labels call it water), so the page carries
+    one shared explanation rather than 70,000 copies of it.
     """
     sigma = robust_step_sigma(series)
     raw_sigma = robust_step_sigma(raw) if raw is not None else None
 
+    measured = {at: row for at, (_, row) in trace.measured.items()}
+    inspected = set(trace.measured) | set(trace.probed)
     label_type = labels["anomaly_type"].fillna("")
     anomalies = pd.DatetimeIndex(labels.index[label_type != ""])
     interesting = pd.DatetimeIndex(
-        sorted(set(flag_log.index) | set(anomalies))
+        sorted(set(flag_log.index) | set(anomalies) | inspected)
     )
+    n_flagged_rows = len(flag_log)
 
     position = {ts: i for i, ts in enumerate(series.index)}
     cases: list[dict] = []
@@ -149,9 +174,12 @@ def build_cases(
         flagged = at in flag_log.index
         action = str(flag_log["action"].get(at, "")) if flagged else ""
         label = str(label_type.get(at, ""))
-        category = categorise(action, label, flagged)
+        category = categorise(action, label, flagged, at in inspected)
         if not category:
             continue
+        entry = _flag_entry(flag_log, at) if flagged else None
+        source = ("" if pd.isna(labels["source"].get(at))
+                  else str(labels["source"].get(at)))
 
         value = float(series.get(at, np.nan))
         true_value = labels["true_value"].get(at)
@@ -164,9 +192,13 @@ def build_cases(
             "label": label or "normal water",
             # pd.isna, not `or ""` — a float NaN is TRUTHY, so `or` let it through and the
             # panel rendered "normal water (nan)".
-            "source": ("" if pd.isna(labels["source"].get(at))
-                       else str(labels["source"].get(at))),
+            "source": source,
             "flagged": bool(flagged),
+            # The whole reason this page exists (§5.1): the verdict is the run's answer,
+            # the action only what it did about it. They are shown separately because a
+            # gap correctly identified and left unfilled is `anomaly` + `keep`.
+            "verdict": str(flag_log["verdict"].get(at, "")) if flagged else "",
+            "anomaly_type": str(flag_log["anomaly_type"].get(at, "")) if flagged else "",
             "flagged_by": str(flag_log["flagged_by"].get(at, "")) if flagged else "",
             "action": action or "(never flagged)",
             "reason": str(flag_log["reason"].get(at, "")) if flagged else "",
@@ -177,6 +209,10 @@ def build_cases(
             "measurement": measured.get(at),
             "true_value": None if true_value is None else round(true_value, 3),
             "local_sigmas": _round(_local_sigmas(series, at, sigma)),
+            "explain": explain_point(
+                at, entry, trace, n_flagged_rows=n_flagged_rows,
+                label=label, label_source=source,
+            ),
         }
         if raw is not None and at in raw.index:
             record["raw_value"] = round(float(raw[at]), 3)
@@ -185,12 +221,23 @@ def build_cases(
     return cases
 
 
+def _flag_entry(flag_log: pd.DataFrame, at: pd.Timestamp) -> dict:
+    """One flag-log row as the plain dict `provenance` expects."""
+    row = flag_log.loc[at]
+    if isinstance(row, pd.DataFrame):      # duplicate timestamps: take the first
+        row = row.iloc[0]
+    entry = {k: (None if pd.isna(v) else v) for k, v in row.items()
+             if not isinstance(v, (list, dict))}
+    entry["decided_by"] = row.get("decided_by")
+    return entry
+
+
 def _round(x, n=1):
     return None if x is None or not np.isfinite(x) else round(float(x), n)
 
 
 def build_payload(series: pd.Series, cases: list[dict], title: str,
-                  has_raw: bool) -> dict:
+                  has_raw: bool, trace: Trace | None = None) -> dict:
     index = pd.DatetimeIndex(series.index)
     # as_unit("ms"), NOT view("int64") // 1e6 — these CSVs are datetime64[us] and that
     # idiom silently yields seconds, plotting the whole record inside 1970 (§9.1).
@@ -199,14 +246,27 @@ def build_payload(series: pd.Series, cases: list[dict], title: str,
               for v in series.to_numpy()]
 
     counts = {c: sum(1 for k in cases if k["category"] == c) for c in CATEGORIES}
+    trace = trace if trace is not None else Trace()
+    # Every point that is not a case has the identical story — no detector fired,
+    # nobody measured it, the labels call it water — so it is built once here instead
+    # of per row. `cases` covers every flagged row, every labelled anomaly and
+    # everything the agent inspected, which is exactly what makes that true.
+    inspected = set(trace.measured) | set(trace.probed)
+    quiet_at = next((t for t in index if t not in inspected), pd.Timestamp(index[0]))
+    quiet = explain_point(quiet_at, None, trace,
+                          n_flagged_rows=0, label="", label_source="")
+    quiet["headline"] = ("No detector flagged this point, nobody looked at it, and the "
+                         "labels do not call it an anomaly.")
     return {
         "title": title,
+        "calls": call_table(trace),
+        "quiet": quiet,
         "epoch_ms": epoch_ms,
         "values": values,
         "cases": cases,
         "counts": counts,
         "has_raw": has_raw,
-        "context": CONTEXT_SAMPLES,
+        "context": context_samples(index),
         "n_rows": len(series),
     }
 
@@ -268,6 +328,26 @@ _TEMPLATE = r"""<!DOCTYPE html>
         border-radius:6px; overflow-x:auto; font-size:11.5px; color:#cbd5e1; }
   kbd { background:#0c0e13; border:1px solid var(--line); border-radius:4px; padding:1px 5px;
         font-size:11px; }
+  #why { border-bottom:1px solid var(--line); padding-bottom:10px; margin-bottom:12px; }
+  #why h2 { font-size:15px; margin:0 0 10px; line-height:1.35; }
+  .sec { margin:0 0 11px; }
+  .sec .t { font-size:11px; color:var(--dim); text-transform:uppercase;
+            letter-spacing:.08em; margin-bottom:3px; }
+  .sec ul { margin:5px 0 0; padding-left:18px; }
+  .sec li { margin:2px 0; }
+  .sec .f { margin-top:5px; padding:6px 10px; border-left:3px solid #3b4252;
+            background:#1b1f28; border-radius:0 5px 5px 0; color:var(--dim); }
+  .sec .f.warn { border-left-color:#f59e0b; background:#241d0f; color:var(--text); }
+  .trace { display:grid; grid-template-columns:auto 1fr auto; gap:2px 12px;
+           font-size:12px; align-items:baseline; }
+  .trace .s { color:var(--dim); font-variant-numeric:tabular-nums; }
+  .trace .r { color:var(--dim); font-size:11px; text-align:right; }
+  .trace .on { color:var(--text); }
+  .trace .on .r { color:#7dd3fc; }
+  .tabs { display:flex; gap:6px; margin-bottom:10px; }
+  .tab { padding:4px 11px; border:1px solid var(--line); border-radius:14px;
+         cursor:pointer; font-size:12px; color:var(--dim); }
+  .tab.on { background:#252b39; color:var(--text); border-color:#3b4252; }
 </style>
 <body>
 <div id="side"></div>
@@ -283,6 +363,7 @@ const COLOR = {
   "wrongly-deleted":"#ef4444", "missed":"#f59e0b", "overwritten-anomaly":"#fb923c",
   "undetected":"#a855f7", "overwritten-water":"#fb7185", "deleted":"#22c55e",
   "imputed":"#38bdf8", "left-missing":"#7dd3fc", "kept":"#64748b",
+  "inspected-not-flagged":"#94a3b8",
 };
 const BLURB = {
   "wrongly-deleted":"Removed a value the labels call normal water — review these first.",
@@ -294,7 +375,9 @@ const BLURB = {
   "overwritten-water":"impute_rolling replaced a real reading that was never missing.",
   "left-missing":"A gap left as NaN. Correct for a long outage — §6 says impute short gaps only.",
   "kept":"Flagged and left in place.",
+  "inspected-not-flagged":"The agent measured this point although no detector flagged it.",
 };
+const VERDICT_COLOR = {anomaly:"#f87171", normal:"#4ade80", undecided:"#f59e0b"};
 const $ = (id) => document.getElementById(id);
 const iso = (ms) => new Date(ms).toISOString().slice(0, 19);   // naive round-trip
 const f2 = (v, n=2) => (v === null || v === undefined) ? "&mdash;" : (+v).toFixed(n);
@@ -312,7 +395,9 @@ function renderSide() {
             <span>${c}</span><span class="n">${D.counts[c]}</span></div>`;
   }
   h += `<div class="hint">Click any point on either plot — including one that was never
-        flagged. <kbd>1</kbd>-<kbd>9</kbd> switch category, <kbd>J</kbd>/<kbd>K</kbd> step.</div>`;
+        flagged — and the panel says why it got the verdict it got.
+        <kbd>1</kbd>-<kbd>9</kbd> category, <kbd>J</kbd>/<kbd>K</kbd> step,
+        <kbd>W</kbd>/<kbd>T</kbd>/<kbd>M</kbd> why / trace / measurements.</div>`;
   const rows = inCat();
   for (let i = 0; i < rows.length; i++) {
     const c = rows[i];
@@ -401,14 +486,25 @@ function nearestIndex(at) {
   return lo;
 }
 
+function verdictText(c) {
+  if (!c || !c.verdict) return ["never flagged", "#9aa3b2"];
+  const t = c.verdict === "anomaly" && c.anomaly_type
+    ? `anomaly · ${c.anomaly_type}` : c.verdict;
+  return [t, VERDICT_COLOR[c.verdict] || "#9aa3b2"];
+}
+
 function renderHead(at, c) {
   const v = c ? c.value : D.values[nearestIndex(at)];
+  const [vt, vc] = verdictText(c);
   $("head").innerHTML = `
     <div><div class="k">timestamp</div><div class="v">${at.replace("T"," ")}</div></div>
     <div><div class="k">value</div><div class="v">${f2(v)}</div></div>
-    <div><div class="k">outcome</div><div class="v" style="color:${c?COLOR[c.category]:"#9aa3b2"}">
-         ${c ? c.category : "nothing happened"}</div></div>
-    <div><div class="k">decision</div><div class="v">${c ? c.action : "never flagged"}</div></div>`;
+    <div><div class="k">verdict &mdash; the run's answer</div>
+         <div class="v" style="color:${vc}">${vt}</div></div>
+    <div><div class="k">action taken</div><div class="v">${c ? c.action : "&mdash;"}</div></div>
+    <div><div class="k">outcome vs labels</div>
+         <div class="v" style="color:${c?COLOR[c.category]:"#9aa3b2"}">
+         ${c ? c.category : "nothing happened"}</div></div>`;
 }
 
 const SRC_LABEL = {
@@ -436,10 +532,55 @@ function rationaleBlock(c) {
   return h;
 }
 
+// The narrative is written server-side (src/workbench/provenance.py) so it can be
+// tested; this only escapes it and renders **bold**. Escaping first matters — the
+// text quotes the agent's own words, which are free-form.
+const esc = (t) => String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const md = (t) => esc(t).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+                        .replace(/`(.+?)`/g, "<code>$1</code>");
+
+function renderWhy(x) {
+  let h = `<div id="why"><h2>${md(x.headline)}</h2>`;
+  for (const s of x.sections) {
+    h += `<div class="sec"><div class="t">${esc(s.title)}</div><div>${md(s.text)}</div>`;
+    if (s.bullets && s.bullets.length) {
+      h += `<ul>${s.bullets.map(b => `<li>${md(b)}</li>`).join("")}</ul>`;
+    }
+    if (s.footer) h += `<div class="f ${s.tone==="warn"?"warn":""}">${md(s.footer)}</div>`;
+    h += `</div>`;
+  }
+  return h + `</div>`;
+}
+
+function renderTrace(roles) {
+  // Every call the run made, in order, annotated with what it did to THIS point.
+  // A detector that ran and stayed silent is evidence, so it is listed too.
+  let h = `<div class="trace">`;
+  for (let i = 0; i < D.calls.length; i++) {
+    const call = D.calls[i], role = (roles && roles[i]) || "";
+    const on = role && role.indexOf("did not") === -1;
+    h += `<div class="s ${on?"on":""}">${call.step}</div>
+          <div class="${on?"on":""}">${esc(call.signature)}${call.failed?" &middot; <span style='color:#f87171'>failed</span>":""}</div>
+          <div class="r ${on?"on":""}">${esc(role)}</div>`;
+  }
+  return h + `</div>`;
+}
+
+let tab = "why";
+function setTab(t) { tab = t; draw(); }
+
 function renderPanel(at, c) {
   const row = (k, v) => `<div class="row"><div class="k">${k}</div><div>${v}</div></div>`;
+  const x = c ? c.explain : D.quiet;
+  const tabs = `<div class="tabs">
+      <div class="tab ${tab==="why"?"on":""}" onclick="setTab('why')">why this verdict</div>
+      <div class="tab ${tab==="trace"?"on":""}" onclick="setTab('trace')">what the run did (${D.calls.length} steps)</div>
+      <div class="tab ${tab==="raw"?"on":""}" onclick="setTab('raw')">measurements &amp; labels</div>
+    </div>`;
+  if (tab === "why") { $("panel").innerHTML = tabs + renderWhy(x); return; }
+  if (tab === "trace") { $("panel").innerHTML = tabs + renderTrace(x.roles); return; }
   if (!c) {
-    $("panel").innerHTML = `<div class="note flat"><b>Nothing happened to this point.</b>
+    $("panel").innerHTML = tabs + `<div class="note flat"><b>Nothing happened to this point.</b>
       No detector flagged it, so the agent never saw it, and the label file does not call it
       an anomaly. It is ordinary water that was correctly left alone — the overwhelming
       majority of the ${D.n_rows.toLocaleString()} rows are in this state.</div>`;
@@ -480,7 +621,8 @@ function renderPanel(at, c) {
     note = [(c.category === "kept" || c.category === "left-missing") ? "flat" : "ok",
             BLURB[c.category]];
   }
-  let h = `<div class="note ${note[0]}">${note[1]}</div>`;
+  let h = tabs + `<div class="note ${note[0]}">${note[1]}</div>`;
+  h += row("verdict", `<b>${verdictText(c)[0]}</b> &mdash; the run's answer, and what §10 scores`);
   h += row("ground truth", c.label + (c.source ? ` (${c.source})` : ""));
   if (c.true_value != null) h += row("true value", `${f2(c.true_value)} &rarr; ${f2(c.value)}`);
   h += row("displacement", `${f2(c.local_sigmas,1)}σ from the local median`);
@@ -513,6 +655,9 @@ function wireClick() {
 }
 
 addEventListener("keydown", (e) => {
+  if (e.key === "w") { setTab("why"); return; }
+  if (e.key === "t") { setTab("trace"); return; }
+  if (e.key === "m") { setTab("raw"); return; }
   if (/^[1-9]$/.test(e.key)) { pick(Object.keys(COLOR)[+e.key - 1]); return; }
   if (e.key === "j" || e.key === "ArrowDown") { sel++; draw(); }
   else if (e.key === "k" || e.key === "ArrowUp") { sel--; draw(); }
@@ -554,10 +699,11 @@ def main(argv: list[str] | None = None) -> int:
         raw_frame = pd.read_csv(args.raw, parse_dates=[DATETIME_COL]).sort_values(DATETIME_COL)
         raw = raw_frame.set_index(DATETIME_COL)["value"]
 
-    _, measured = load_run(args.log)
-    cases = build_cases(series, labels, load_flag_log(args.flags), measured, raw)
+    trace = load_trace(args.log)
+    cases = build_cases(series, labels, load_flag_log(args.flags), trace, raw)
     payload = build_payload(
-        series, cases, title=f"{args.series.stem} · {args.log.name}", has_raw=raw is not None
+        series, cases, title=f"{args.series.stem} · {args.log.name}",
+        has_raw=raw is not None, trace=trace,
     )
 
     args.outdir.mkdir(parents=True, exist_ok=True)

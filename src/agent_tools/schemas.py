@@ -185,9 +185,13 @@ _EXPORT_CLEAN_DATA = {
                                 "Be honest: a narrow high-z excursion whose fall decays is "
                                 "a judgement call, not a clear one, and marking it clear "
                                 "hides the very decision a reviewer needs to check. "
-                                "Defaults to 'clear' if omitted."
+                                "REQUIRED — there is no default. On a typical record "
+                                "roughly 10-15% of decisions should be 'judgement-call'; "
+                                "a run that marks everything 'clear' is not confident, it "
+                                "is unhelpful, because the reviewer is left with nothing "
+                                "to check. Deletions of narrow excursions inside a noisy "
+                                "stretch are the usual judgement calls."
                             ),
-                            "default": "clear",
                         },
                         "deliberation": {
                             "type": "string",
@@ -203,7 +207,7 @@ _EXPORT_CLEAN_DATA = {
                             ),
                         },
                     },
-                    "required": ["start", "verdict", "action", "reason"],
+                    "required": ["start", "verdict", "action", "reason", "difficulty"],
                 },
             },
         },
@@ -596,11 +600,16 @@ _DESCRIBE_POINTS = {
             "max_points": {
                 "type": "integer",
                 "description": (
-                    "Maximum timestamps to describe in this call. Default 20. Any extras are "
-                    "reported in n_truncated and named in the message — never dropped "
-                    "silently — so call again with the remainder if you need them."
+                    "Maximum timestamps to describe in this call. Default 100, hard ceiling "
+                    "300. Any extras are reported in n_truncated and named in the message — "
+                    "never dropped silently — so call again with the remainder if you need "
+                    "them. Cost is about 90 tokens per point and does not grow per point "
+                    "with batch size, so describing 100 points costs roughly what one "
+                    "describe_point call on a single point costs six times over: measuring "
+                    "a detector's whole output is cheap, and far cheaper than deleting a "
+                    "reading you never looked at."
                 ),
-                "default": 20,
+                "default": 100,
             },
             "window": {
                 "type": "string",

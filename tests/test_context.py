@@ -386,3 +386,33 @@ def test_describe_points_accepts_a_saqc_object(spike_series):
     qc = saqc.SaQC(pd.DataFrame({"value": spike_series}))
     r = ctx.describe_points(qc, [spike_series.index[200]], field="value")
     assert r["points"][0]["reads_like"] == "spike"
+
+def test_describe_points_batches_a_hundred_by_default_and_clamps_beyond_the_ceiling():
+    """The 20-point default was the binding limit on how much a run ever measured.
+
+    On 01467200_l1 the agent measured 45 of 10,463 decided rows and deleted 367
+    spikes having inspected 33 — 194 of those deletions were normal water. Cost is
+    ~90 tokens/point and flat with batch size, so the default is 100. It stays
+    agent-settable, but clamped: MAX_FLAGGED_DATETIMES is 1000, and an uncapped
+    call would return ~90k tokens in a single tool result.
+    """
+    index = pd.date_range("2024-01-01", periods=1200, freq="5min")
+    series = pd.Series(np.linspace(5.0, 9.0, 1200), index=index)
+    ats = [str(t) for t in index]
+
+    default = ctx.describe_points(series, ats=ats)
+    assert default["n_described"] == ctx.DEFAULT_MAX_POINTS == 100
+    assert default["n_truncated"] == 1200 - 100
+    # Truncation is reported, never silent.
+    assert "NOT described" in default["message"]
+
+    raised = ctx.describe_points(series, ats=ats, max_points=250)
+    assert raised["n_described"] == 250, "max_points must stay agent-settable"
+
+    clamped = ctx.describe_points(series, ats=ats, max_points=5000)
+    assert clamped["n_described"] == ctx.MAX_POINTS_CEILING == 300
+    # The message must name the cap that was APPLIED, not the one that was asked
+    # for — otherwise a clamped call reads as if 5000 points were considered.
+    assert "max_points=300" in clamped["message"]
+    assert "clamped from the 5000" in clamped["message"]
+    assert clamped["params"]["max_points_requested"] == 5000

@@ -34,10 +34,10 @@ normal-water cases, R to reset the zoom.
 CLI
 ---
     python -m src.workbench.spike_audit \\
-        data/injected/03447687/l1/03447687_l1.csv \\
+        data/injected/02054550/l1/02054550_l1.csv \\
         --flags data/agent_runs/03447687_l1_flags.json \\
         --log logs/run_20260810_174153.jsonl \\
-        --raw data/raw/approved/03447687_turbidity_63680.csv
+        --raw data/raw/approved/02054550_turbidity_63680.csv
 
 `--raw` is optional but is the single most useful flag on this page: without it a
 deleted-natural case cannot be told from a mislabelled base spike.
@@ -66,8 +66,22 @@ SPIKE_FUNCS = ("flagUniLOF", "flagZScore", "flagRange")
 # §5 actions that mean the agent judged the value wrong.
 POSITIVE_ACTIONS = frozenset({"delete", "correct"})
 
-# Context drawn either side of a case, in samples.
-CONTEXT_SAMPLES = 96          # 24 h on a 15-min grid
+# Context drawn either side of the selected point in the detail plot, as a DURATION.
+# It used to be a fixed 96 samples, which silently meant 24 h on the 15-min bases and
+# 8 h once the project moved to 5-min ones — the plot quietly stopped showing the
+# surroundings a storm-vs-spike call depends on.
+CONTEXT_WINDOW = pd.Timedelta("24h")
+CONTEXT_SAMPLES = 96          # fallback when the step cannot be inferred
+
+
+def context_samples(index: pd.DatetimeIndex) -> int:
+    """How many samples span :data:`CONTEXT_WINDOW` on *this* series' grid."""
+    if len(index) < 2:
+        return CONTEXT_SAMPLES
+    step = pd.Series(index).diff().median()
+    if pd.isna(step) or step <= pd.Timedelta(0):
+        return CONTEXT_SAMPLES
+    return max(8, int(round(CONTEXT_WINDOW / step)))
 
 # Shared vocabulary with decision_audit: `missed` means the agent judged it and kept
 # it; `overwritten` means the imputer took it before any judgement was made. Keep the
@@ -149,6 +163,14 @@ def load_run(log_path: Path) -> tuple[list[dict], dict[pd.Timestamp, dict]]:
     return decisions, measured
 
 
+# §5 flag-log fields the audit pages read, in panel order. `verdict` leads because it
+# is the run's answer; `action` is only what was done about it (§5.1).
+_FLAG_LOG_COLUMNS: tuple[str, ...] = (
+    "flagged_by", "verdict", "anomaly_type", "action", "reason",
+    "rationale", "rationale_source", "deliberation", "decided_by",
+)
+
+
 def load_flag_log(path: Path) -> pd.DataFrame:
     """The §5 flag log as a frame indexed by timestamp."""
     entries = json.loads(path.read_text())
@@ -156,16 +178,15 @@ def load_flag_log(path: Path) -> pd.DataFrame:
         raise ValueError(f"{path} is not a §5 flag log (expected a JSON list).")
     frame = pd.DataFrame(entries)
     if frame.empty:
-        return pd.DataFrame(columns=["flagged_by", "action", "reason",
-                                     "rationale", "rationale_source", "deliberation"])
+        return pd.DataFrame(columns=list(_FLAG_LOG_COLUMNS))
     frame[DATETIME_COL] = pd.to_datetime(frame["datetime"])
-    # rationale/rationale_source/deliberation arrived 2026-08-11; older logs lack them.
-    for column in ("rationale", "rationale_source", "deliberation"):
+    # These arrived in stages — rationale/rationale_source/deliberation 2026-08-11,
+    # verdict/anomaly_type 2026-08-13, decided_by 2026-08-18 — so a log written before
+    # any of them is read with the field blank rather than rejected.
+    for column in _FLAG_LOG_COLUMNS:
         if column not in frame.columns:
-            frame[column] = ""
-    return frame.set_index(DATETIME_COL)[
-        ["flagged_by", "action", "reason", "rationale", "rationale_source", "deliberation"]
-    ]
+            frame[column] = None if column == "decided_by" else ""
+    return frame.set_index(DATETIME_COL)[list(_FLAG_LOG_COLUMNS)]
 
 
 def robust_step_sigma(series: pd.Series) -> float:
@@ -345,7 +366,7 @@ def build_payload(series: pd.Series, labels: pd.DataFrame, cases: list[Case],
         "has_raw": has_raw,
         "unmeasured_misses": unmeasured_misses,
         "natural_in_raw": natural_in_raw,
-        "context": CONTEXT_SAMPLES,
+        "context": context_samples(index),
     }
 
 

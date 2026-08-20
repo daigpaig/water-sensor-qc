@@ -67,6 +67,20 @@ from src.inspect_data import DATETIME_COL, VALUE_COL
 # Scale factor that makes the MAD a consistent estimator of sigma for Gaussian data.
 _MAD_TO_SIGMA = 1.4826
 
+# The §7.4 noisy-stretch guard, re-tuned for the 5-min bases (2026-08-20). A point
+# is "unremarkable here" — reads_like returns `noisy-stretch` rather than `spike` —
+# when its surroundings are ELEVATED_NOISE_RATIO x noisier than a typical window of
+# this record AND its own largest single-sample move is under
+# LOCAL_STEP_UNREMARKABLE x the LOCAL sample-to-sample scale.
+#
+# Was 3.0 / 5, fitted on the retired 15-min gauges. Those values fire on 0 of the
+# 104 surviving false positives at 5-min. Refitted on 2,892 FPs / 392 true spikes
+# pooled from 02054550 and 040851385 — never the gauge we report on — by
+# scratchpad/tune_noise_spare_rule.py, maximising FPs spared subject to losing at
+# most 5% of true spikes. See the noise_context docstring for the full table.
+ELEVATED_NOISE_RATIO = 2.0
+LOCAL_STEP_UNREMARKABLE = 8.0
+
 # A sigma floor of last resort, used only when a series has no variation at all.
 _SIGMA_EPS = 1e-9
 
@@ -149,6 +163,12 @@ def _median_step(series: pd.Series) -> pd.Timedelta:
 
 def _pos(series: pd.Series, ts: pd.Timestamp) -> int:
     return int(series.index.get_indexer([ts])[0])
+
+
+def _round(x, digits: int = 1) -> float | None:
+    """`_f` with a caller-chosen precision — for numbers a reader will scan, not compute with."""
+    value = _f(x)
+    return None if value is None else round(value, digits)
 
 
 def _f(x) -> float | None:
@@ -855,7 +875,7 @@ def noise_context(
     at,
     field: str = VALUE_COL,
     window: str = "90min",
-    elevated_ratio: float = 3.0,
+    elevated_ratio: float = ELEVATED_NOISE_RATIO,
 ) -> dict:
     """How noisy is the data around *at*, and does the point stand out within it?
 
@@ -904,7 +924,22 @@ def noise_context(
         spare the point when...                    FPs spared   spikes lost
         point_step_sigmas_local < 5                   83.1%        16.7%
         noise_ratio > 5                               70.7%         7.1%
-        noise_ratio > 3 and step_sigmas_local < 5     76.7%         3.0%   <- used
+        noise_ratio > 3 and step_sigmas_local < 5     76.7%         3.0%
+                                        (all three measured on the 15-min bases)
+
+    RE-TUNED FOR THE 5-MIN BASES (2026-08-20). The rule above spares **0 of 104**
+    surviving false positives on 01467200_l1: it was fitted on a FP population of
+    storm limbs at median noise_ratio 11.3, and the 5-min FP population sits at
+    median 2.2. The separator still holds — FP median noise_ratio 2.2 vs true-spike
+    0.9, FP median step_sigmas_local 8.4 vs 14.9 — so only the thresholds moved.
+    Refitted over 2,892 FPs and 392 true spikes pooled from 02054550 l1/l2 and
+    040851385 l1/l2 (never the gauge we report on; scratchpad/tune_noise_spare_rule.py):
+
+        noise_ratio > 2.0 and step_sigmas_local < 8   60.2%        4.1%   <- used
+
+    Held out on 01467200_l1 the same rule spares 34 of 104 FPs and loses 0 of 57
+    true spikes. Note the transfer gap — 60% sparing where fitted, 33% held out —
+    the direction carries, the magnitude does not fully.
 
     THE WINDOW MATTERS AND ±90 MIN IS THE PEAK. Swept at ±1 / 1.5 / 2 / 3 h, the
     combined rule spares 83.7 / 76.7 / 72.4 / 61.0% of false positives at 6.5 /
@@ -1019,7 +1054,9 @@ def noise_context(
     # the verdict is the agent's (§7.3), this only says the point is not separable
     # from its surroundings.
     unremarkable = bool(
-        noise_ratio > elevated_ratio and stands_out is not None and stands_out < 5
+        noise_ratio > elevated_ratio
+        and stands_out is not None
+        and stands_out < LOCAL_STEP_UNREMARKABLE
     )
 
     if unremarkable:
@@ -1414,11 +1451,133 @@ def describe_point(
     )
 
 
+# Points per describe_points call. Raised 20 -> 100 (2026-08-20): 20 was the
+# binding constraint on how much of a detector's output the agent ever measured.
+# On 01467200_l1 it measured 45 of 10,463 decided rows (0.43%) and deleted 367
+# spikes having individually inspected 33 of them — and 194 of those deletions
+# were normal water. Measured cost is ~90 tokens/point and flat from 20 to 263
+# points, so 100 covers a typical full detector output in ~3 calls.
+DEFAULT_MAX_POINTS = 100
+
+# Hard ceiling, because the parameter is agent-settable and the cost is linear:
+# `MAX_FLAGGED_DATETIMES` is 1000, so an uncapped call could return ~90k tokens
+# in one result. 300 still covers a full detector output in a single call.
+MAX_POINTS_CEILING = 300
+
+
+def noise_profile(
+    source,
+    field: str = VALUE_COL,
+    window: str = "3h",
+    elevated_ratio: float = ELEVATED_NOISE_RATIO,
+    max_stretches: int = 20,
+) -> dict:
+    """Where in the record is the sensor noisy? — a rolling scan, not fixed blocks.
+
+    ``noise_context`` answers "is THIS point in a noisy stretch". This answers the
+    record-level question a run needs *before* it starts judging points: which
+    calendar stretches are noisy at all, and how much of the record they cover.
+    Without it the agent judges every flagged point against the record-wide scale
+    and deletes ordinary water that happens to sit in a busy week — the failure
+    that produced 104 false positives on 01467200_l1.
+
+    Rolling, deliberately. Fixed non-overlapping blocks (what ``_block_noise`` uses
+    to build a *reference distribution*) dilute a stretch that straddles a boundary
+    and can push it under the threshold in both halves; a rolling measure finds the
+    real edges. The §7.4 warning that ``rolling().apply(mad)`` costs seconds does
+    not bite here: this runs once per run, and it uses pandas' native rolling
+    median rather than ``.apply``, so it is C-speed.
+
+    Returns the elevated stretches (merged contiguous runs, widest first, capped at
+    *max_stretches*) plus the counts, so a long noisy record cannot bloat the
+    inspect_dataset payload.
+    """
+    series = as_series(source, field).dropna()
+    if len(series) < 3:
+        return {"tool": "noise_profile", "n_stretches": 0, "stretches": [],
+                "share_of_record_elevated": 0.0,
+                "message": "Series too short to profile noise."}
+
+    params = {"field": field, "window": window, "elevated_ratio": elevated_ratio}
+    step = pd.Series(series.index).diff().median()
+    n = max(int(pd.Timedelta(window) / step), 3) if step and step > pd.Timedelta(0) else 36
+
+    # Robust local scale from first differences, exactly the quantity noise_context
+    # compares a point against — so the two agree about what "noisy" means.
+    moves = series.diff().abs()
+    local = moves.rolling(n, center=True, min_periods=max(3, n // 3)).median() * _MAD_TO_SIGMA
+    typical = float(np.nanmedian(local.to_numpy()))
+    if not np.isfinite(typical) or typical <= 0:
+        return {"tool": "noise_profile", "params": params, "n_stretches": 0,
+                "stretches": [], "share_of_record_elevated": 0.0,
+                "message": "Noise scale is degenerate (quantised or constant series)."}
+
+    ratio = local / typical
+    hot = (ratio > elevated_ratio).to_numpy()
+
+    stretches, start = [], None
+    for i, is_hot in enumerate(hot):
+        if is_hot and start is None:
+            start = i
+        elif not is_hot and start is not None:
+            stretches.append((start, i - 1))
+            start = None
+    if start is not None:
+        stretches.append((start, len(hot) - 1))
+
+    # Bridge runs separated by less than one window. A rolling threshold flickers
+    # across a single noisy episode and splits it into fragments — unbridged, one
+    # storm reported as 796 "stretches", which is true and useless. Bridging at the
+    # window width gives back the episodes a reader would point at on a plot.
+    bridged: list[tuple[int, int]] = []
+    for a, b in stretches:
+        if bridged and a - bridged[-1][1] <= n:
+            bridged[-1] = (bridged[-1][0], b)
+        else:
+            bridged.append((a, b))
+    stretches = bridged
+
+    rows = []
+    for a, b in stretches:
+        seg = ratio.iloc[a:b + 1]
+        rows.append({
+            "start": series.index[a].strftime("%Y-%m-%dT%H:%M:%S"),
+            "end": series.index[b].strftime("%Y-%m-%dT%H:%M:%S"),
+            "n_samples": int(b - a + 1),
+            "peak_noise_ratio": _round(float(np.nanmax(seg.to_numpy())), 1),
+            "median_noise_ratio": _round(float(np.nanmedian(seg.to_numpy())), 1),
+        })
+    covered = sum(r["n_samples"] for r in rows)
+    rows.sort(key=lambda r: r["n_samples"], reverse=True)
+    shown = rows[:max_stretches]
+
+    share = covered / max(len(series), 1)
+    msg = (
+        f"{len(rows)} stretch(es) are more than {elevated_ratio}x noisier than this "
+        f"record's typical {window} window, covering {100 * share:.1f}% of it."
+    )
+    if len(rows) > len(shown):
+        msg += f" The {len(shown)} widest are listed; {len(rows) - len(shown)} more are not."
+    if rows:
+        msg += (" A flagged point inside one of these is far more likely to be ordinary "
+                "water than a sensor artifact — judge it against its local neighbourhood, "
+                "not against the record.")
+    return {
+        "tool": "noise_profile",
+        "params": params,
+        "record_typical_step_sigma": _round(typical, 4),
+        "n_stretches": len(rows),
+        "share_of_record_elevated": _round(share, 4),
+        "stretches": shown,
+        "message": msg,
+    }
+
+
 def describe_points(
     source,
     ats,
     field: str = VALUE_COL,
-    max_points: int = 20,
+    max_points: int = DEFAULT_MAX_POINTS,
     window: str = "6h",
 ) -> dict:
     """Compact context for a list of timestamps — e.g. a detector's flagged rows.
@@ -1429,12 +1588,19 @@ def describe_points(
 
     Truncation is explicit: if more than ``max_points`` timestamps are supplied,
     the extras are reported in ``n_truncated`` and named in the message rather
-    than silently dropped.
+    than silently dropped. ``max_points`` is additionally clamped to
+    :data:`MAX_POINTS_CEILING`, and a clamp is reported the same way — measured
+    cost is ~90 tokens per point, so an uncapped call on a 1000-timestamp
+    detector output would return ~90k tokens in a single result.
     """
     series = as_series(source, field)
     requested = list(ats)
-    selected = requested[:max_points]
-    params = {"field": field, "max_points": max_points, "window": window, "n_requested": len(requested)}
+    capped = min(int(max_points), MAX_POINTS_CEILING)
+    selected = requested[:capped]
+    params = {"field": field, "max_points": capped, "window": window,
+              "n_requested": len(requested)}
+    if capped != int(max_points):
+        params["max_points_requested"] = int(max_points)
 
     rows: list[dict] = []
     errors: list[dict] = []
@@ -1474,7 +1640,10 @@ def describe_points(
     msg = f"Described {len(rows)} of {len(requested)} point(s): {tally}."
     if n_truncated:
         msg += (
-            f" {n_truncated} timestamp(s) were NOT described (max_points={max_points}); "
+            f" {n_truncated} timestamp(s) were NOT described (max_points={capped}"
+            + (f", clamped from the {int(max_points)} you asked for; the ceiling is "
+               f"{MAX_POINTS_CEILING}" if capped != int(max_points) else "")
+            + "); "
             "call again with the remaining timestamps if you need them."
         )
     if errors:

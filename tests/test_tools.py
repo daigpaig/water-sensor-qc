@@ -191,10 +191,10 @@ def test_export_writes_the_flag_log_with_the_agents_decisions(tmp_path):
     result = wrappers.export_clean_data(
         qc,
         decisions=[
-            {"start": str(spike_at), "verdict": "anomaly", "anomaly_type": "spike",
+            {"start": str(spike_at), "difficulty": "clear", "verdict": "anomaly", "anomaly_type": "spike",
              "action": "delete", "reason": "robust_z 40, 1 sample wide"},
             {"start": "2024-01-01T20:00:00", "end": "2024-01-01T21:00:00",
-             "verdict": "anomaly", "anomaly_type": "gap",
+             "difficulty": "clear", "verdict": "anomaly", "anomaly_type": "gap",
              "action": "impute", "reason": "5-sample gap, well under max_gap"},
         ],
         output_dir=tmp_path,
@@ -237,7 +237,7 @@ def test_export_reports_a_decision_that_matched_no_flagged_row(tmp_path):
     """A mistyped timestamp is a silent loss of a verdict unless it is reported back."""
     result = wrappers.export_clean_data(
         _flagged_qc(),
-        decisions=[{"start": "2024-06-01T00:00:00", "verdict": "normal",
+        decisions=[{"start": "2024-06-01T00:00:00", "difficulty": "clear", "verdict": "normal",
                     "action": "keep", "reason": "storm"}],
         output_dir=tmp_path,
         stem="toy_l1",
@@ -252,7 +252,7 @@ def test_export_rejects_an_action_outside_the_contract():
     with pytest.raises(ValueError, match="delete"):
         wrappers.export_clean_data(
             _flagged_qc(),
-            decisions=[{"start": "2024-01-01T12:30:00", "verdict": "anomaly",
+            decisions=[{"start": "2024-01-01T12:30:00", "difficulty": "clear", "verdict": "anomaly",
                         "anomaly_type": "spike", "action": "flag", "reason": "x"}],
         )
 
@@ -282,9 +282,9 @@ def test_the_verdict_is_recorded_per_row_and_carries_the_agents_own_type():
     spike_at = str(idx[50])
 
     result = wrappers.export_clean_data(qc, decisions=[
-        {"start": str(idx[0]), "end": str(idx[-1]), "verdict": "normal",
+        {"start": str(idx[0]), "end": str(idx[-1]), "difficulty": "clear", "verdict": "normal",
          "action": "keep", "reason": "storm limb, 14 samples wide"},
-        {"start": spike_at, "verdict": "anomaly", "anomaly_type": "plateau",
+        {"start": spike_at, "difficulty": "clear", "verdict": "anomaly", "anomaly_type": "plateau",
          "action": "delete", "reason": "flagged by UniLOF but 9 samples unchanged"},
     ])
 
@@ -313,7 +313,7 @@ def test_a_normal_verdict_may_not_delete_the_value():
     for action in ("delete", "correct", "impute"):
         with pytest.raises(ValueError, match="verdict='normal'"):
             wrappers.export_clean_data(qc, decisions=[
-                {"start": at, "verdict": "normal", "action": action, "reason": "storm"},
+                {"start": at, "difficulty": "clear", "verdict": "normal", "action": action, "reason": "storm"},
             ])
 
 
@@ -330,12 +330,12 @@ def test_an_anomaly_may_be_left_untreated_if_the_agent_says_why():
 
     with pytest.raises(ValueError, match="cannot be treated"):
         wrappers.export_clean_data(qc, decisions=[
-            {"start": at, "verdict": "anomaly", "anomaly_type": "gap",
+            {"start": at, "difficulty": "clear", "verdict": "anomaly", "anomaly_type": "gap",
              "action": "keep", "reason": "too long"},          # no real justification
         ])
 
     result = wrappers.export_clean_data(qc, decisions=[
-        {"start": at, "verdict": "anomaly", "anomaly_type": "gap", "action": "keep",
+        {"start": at, "difficulty": "clear", "verdict": "anomaly", "anomaly_type": "gap", "action": "keep",
          "reason": "47-sample outage, longer than any window I could defend; left NaN"},
     ])
     entry = next(e for e in result["flags"]
@@ -352,26 +352,50 @@ def test_export_rejects_a_decision_with_no_verdict_or_a_bad_one():
 
     with pytest.raises(ValueError, match="verdict"):
         wrappers.export_clean_data(qc, decisions=[
-            {"start": at, "action": "delete", "reason": "spike"},           # missing
+            {"start": at, "difficulty": "clear", "action": "delete", "reason": "spike"},
         ])
     with pytest.raises(ValueError, match="verdict"):
         wrappers.export_clean_data(qc, decisions=[
-            {"start": at, "verdict": "suspicious", "action": "delete", "reason": "x"},
+            {"start": at, "difficulty": "clear", "verdict": "suspicious", "action": "delete", "reason": "x"},
         ])
     with pytest.raises(ValueError, match="anomaly_type"):
         wrappers.export_clean_data(qc, decisions=[
-            {"start": at, "verdict": "anomaly", "action": "delete", "reason": "x"},
+            {"start": at, "difficulty": "clear", "verdict": "anomaly", "action": "delete", "reason": "x"},
         ])
     with pytest.raises(ValueError, match="anomaly_type"):
         wrappers.export_clean_data(qc, decisions=[
-            {"start": at, "verdict": "anomaly", "anomaly_type": "drift",     # §9.2
+            {"start": at, "difficulty": "clear", "verdict": "anomaly", "anomaly_type": "drift",     # §9.2
              "action": "delete", "reason": "x"},
         ])
     with pytest.raises(ValueError, match="no failure type"):
         wrappers.export_clean_data(qc, decisions=[
-            {"start": at, "verdict": "normal", "anomaly_type": "spike",
+            {"start": at, "difficulty": "clear", "verdict": "normal", "anomaly_type": "spike",
              "action": "keep", "reason": "x"},
         ])
+
+
+def test_export_rejects_a_decision_that_does_not_say_how_hard_the_call_was():
+    """`difficulty` is required, with no default — it used to default to 'clear'.
+
+    Measured on the 2026-08-20 run: 145 of 147 spans omitted it, so 98.6% of the
+    run read as clear-cut, and those deletions were wrong 37.8% of the time. A
+    default that manufactures a confidence claim is worse than no field, because
+    the review queue is built from exactly this signal.
+    """
+    qc = _flagged_qc()
+    at = str(qc.data.to_pandas().index[50])
+
+    with pytest.raises(ValueError, match="difficulty"):
+        wrappers.export_clean_data(qc, decisions=[
+            {"start": at, "verdict": "anomaly", "anomaly_type": "spike",
+             "action": "delete", "reason": "robust_z 40, 1 sample wide"},
+        ])
+    # Present and valid is fine; the omission is what fails.
+    ok = wrappers.export_clean_data(qc, decisions=[
+        {"start": at, "difficulty": "clear", "verdict": "anomaly", "anomaly_type": "spike",
+         "action": "delete", "reason": "robust_z 40, 1 sample wide"},
+    ])
+    assert ok["n_by_verdict"]["anomaly"] >= 1
 
 
 def test_an_imputed_row_is_recorded_as_a_gap_the_agent_found():
@@ -403,6 +427,48 @@ def test_an_undecided_row_is_neither_a_detection_nor_a_rejection():
     assert all(e["anomaly_type"] == "" for e in result["flags"])
     assert result["n_by_verdict"][wrappers.UNDECIDED] == len(result["flags"])
     assert "anomaly" not in result["n_by_verdict"]
+
+
+def test_every_entry_records_which_span_claimed_it():
+    """`decided_by` is what lets an audit page tell a judgement from an absorption.
+
+    `rationale_source` already says "blanket", but not by WHICH span or how wide it
+    was — so a reader could not see that a row they were looking at had been swept
+    up by a decision spanning the whole record.
+    """
+    qc = _flagged_qc()
+    spike_at = qc.data.to_pandas().index[50]
+
+    result = wrappers.export_clean_data(
+        qc,
+        decisions=[
+            {"start": "2024-01-01T00:00:00", "end": "2024-01-03T00:00:00",
+             "difficulty": "clear", "verdict": "normal", "action": "keep",
+             "reason": "catch-all for everything not judged individually"},
+            {"start": str(spike_at), "difficulty": "clear", "verdict": "anomaly", "anomaly_type": "spike",
+             "action": "delete", "reason": "robust_z 40, 1 sample wide"},
+        ],
+    )
+    by_time = {e["datetime"]: e for e in result["flags"]}
+    spike = by_time[spike_at.strftime("%Y-%m-%dT%H:%M:%S")]
+
+    # The narrow span won the row, and the entry names it rather than the catch-all.
+    assert spike["decided_by"]["start"] == spike["decided_by"]["end"]
+    assert spike["decided_by"]["n_rows_claimed"] == 1
+    assert spike["rationale_source"] == "agent-reason"
+
+    swept = [e for e in result["flags"] if e["rationale_source"] == "blanket"]
+    assert swept, "the wide span should have claimed the rest"
+    span = swept[0]["decided_by"]
+    # Its reach is every flagged row it covers, INCLUDING the one the narrow span took —
+    # that is what makes it a blanket — while n_rows_claimed is what it actually got.
+    assert span["n_flagged_rows_in_span"] > span["n_rows_claimed"]
+    assert span["start"] == "2024-01-01T00:00:00"
+
+    # A row code decided is attributed to nobody: pinning it on a span the agent wrote
+    # would credit it with a judgement it never made.
+    assert all(e["decided_by"] is None
+               for e in result["flags"] if e["rationale_source"] == "deterministic")
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +538,7 @@ def test_a_broad_keep_span_cannot_relabel_rows_the_imputer_filled(tmp_path):
     result = wrappers.export_clean_data(
         qc,
         decisions=[{
-            "start": str(idx[0]), "end": str(idx[-1]), "verdict": "normal",
+            "start": str(idx[0]), "end": str(idx[-1]), "difficulty": "clear", "verdict": "normal",
             "action": "keep", "reason": "catch-all: everything else is genuine water",
         }],
         output_dir=tmp_path,
@@ -498,7 +564,7 @@ def test_an_explicit_delete_still_wins_over_the_impute_default(tmp_path):
 
     result = wrappers.export_clean_data(
         qc,
-        decisions=[{"start": filled_at, "verdict": "anomaly", "anomaly_type": "gap",
+        decisions=[{"start": filled_at, "difficulty": "clear", "verdict": "anomaly", "anomaly_type": "gap",
                     "action": "delete", "reason": "fill is unreliable"}],
     )
 
@@ -563,9 +629,9 @@ def test_a_specific_decision_beats_a_broad_catch_all_whatever_the_order(tmp_path
         qc,
         decisions=[
             # Catch-all FIRST — the ordering that used to silently win.
-            {"start": str(idx[0]), "end": str(idx[-1]), "verdict": "normal",
+            {"start": str(idx[0]), "end": str(idx[-1]), "difficulty": "clear", "verdict": "normal",
              "action": "keep", "reason": "everything else is genuine water"},
-            {"start": spike_at, "verdict": "anomaly", "anomaly_type": "spike",
+            {"start": spike_at, "difficulty": "clear", "verdict": "anomaly", "anomaly_type": "spike",
              "action": "delete", "reason": "robust_z 7.4, width 3"},
         ],
     )
@@ -586,11 +652,11 @@ def test_a_broad_span_whose_rows_are_all_claimed_is_not_reported_as_unmatched(tm
     result = wrappers.export_clean_data(
         qc,
         decisions=[
-            {"start": str(idx[0]), "end": str(idx[-1]), "verdict": "normal",
+            {"start": str(idx[0]), "end": str(idx[-1]), "difficulty": "clear", "verdict": "normal",
              "action": "keep", "reason": "rest"},
-            {"start": str(idx[50]), "verdict": "anomaly", "anomaly_type": "spike",
+            {"start": str(idx[50]), "difficulty": "clear", "verdict": "anomaly", "anomaly_type": "spike",
              "action": "delete", "reason": "spike"},
-            {"start": "2019-01-01T00:00:00", "verdict": "normal",
+            {"start": "2019-01-01T00:00:00", "difficulty": "clear", "verdict": "normal",
              "action": "keep", "reason": "typo, matches nothing"},
         ],
     )
@@ -667,9 +733,9 @@ def test_a_blanket_span_is_labelled_as_one_and_reported(tmp_path):
     idx = qc.data.to_pandas().index
 
     result = wrappers.export_clean_data(qc, decisions=[
-        {"start": str(idx[0]), "end": str(idx[-1]), "verdict": "normal",
+        {"start": str(idx[0]), "end": str(idx[-1]), "difficulty": "clear", "verdict": "normal",
          "action": "keep", "reason": "the rest"},
-        {"start": str(idx[50]), "verdict": "anomaly", "anomaly_type": "spike",
+        {"start": str(idx[50]), "difficulty": "clear", "verdict": "anomaly", "anomaly_type": "spike",
          "action": "delete", "reason": "robust_z 40, width 1"},
     ])
 

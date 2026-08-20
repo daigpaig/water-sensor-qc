@@ -391,7 +391,7 @@ def test_cli_flag_log_carries_the_agents_decisions(mock_anthropic, tmp_path):
     resp2 = _tool_step(
         "export_clean_data",
         {"decisions": [
-            {"start": spike_at, "verdict": "anomaly", "anomaly_type": "spike",
+            {"start": spike_at, "difficulty": "clear", "verdict": "anomaly", "anomaly_type": "spike",
              "action": "delete", "reason": "500 NTU, 1 sample, robust_z 30"},
         ]},
         "c2",
@@ -433,15 +433,30 @@ def test_cli_flag_log_carries_the_agents_decisions(mock_anthropic, tmp_path):
     assert '"flags"' not in str(exported[0]["content"])
 
 
+def _truncated_turn():
+    """A turn that spent its whole budget thinking: `content` is a lone thinking block."""
+    truncated = MagicMock()
+    truncated.stop_reason = "max_tokens"
+    truncated.usage = _mock_usage(500, 16000)
+    thinking_block = MagicMock()
+    thinking_block.type = "thinking"
+    truncated.content = [thinking_block]
+    truncated.model_dump.return_value = {"mock": "truncated"}
+    return truncated
+
+
 @patch("src.agent.anthropic.Anthropic")
 @patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test_key"})
-def test_a_truncated_thinking_turn_stops_the_run_instead_of_poisoning_it(mock_anthropic, tmp_path):
-    """A turn that hits max_tokens mid-thought must not go onto the history.
+def test_a_truncated_thinking_turn_is_retried_and_never_appended(mock_anthropic, tmp_path):
+    """A turn that hits max_tokens mid-thought is asked for again, not appended.
 
     Its content is a lone `thinking` block, and the API rejects an assistant message
     whose final block is `thinking` — so appending it makes the NEXT call 400 with an
-    error that says nothing about the real cause. Seen on 08041770_l1 (2026-08-13),
-    where it killed a run 14 steps in.
+    error that says nothing about the real cause (08041770_l1, 2026-08-13).
+
+    Not appending it has a useful consequence: the history is unchanged, so the turn
+    can simply be requested again. Ending the run instead discarded 15 completed steps
+    on 01467200_l1 (2026-08-19) when the export turn ran out of budget while planning.
     """
     from src.agent import run_agent
 
@@ -450,24 +465,49 @@ def test_a_truncated_thinking_turn_stops_the_run_instead_of_poisoning_it(mock_an
 
     mock_client = MagicMock()
     mock_anthropic.return_value = mock_client
-
-    truncated = MagicMock()
-    truncated.stop_reason = "max_tokens"
-    truncated.usage = _mock_usage(500, 16000)
-    thinking_block = MagicMock()
-    thinking_block.type = "thinking"
-    truncated.content = [thinking_block]
-    truncated.model_dump.return_value = {"mock": "truncated"}
-
-    # If the loop appended the truncated turn it would call the API again; a single
-    # response in side_effect means a second call raises StopIteration and fails here.
-    _wire_stream(mock_client, [truncated])
+    _wire_stream(mock_client, [_truncated_turn(), _truncated_turn()])
 
     _, _, report, summary = run_agent(qc, max_steps=5, log_dir=str(tmp_path))
 
-    assert mock_client.messages.stream.call_count == 1
-    assert "max_tokens" in report or "token" in report.lower()
-    assert summary.steps == 1
+    # Retried once, then gave up — not five attempts, and not one.
+    assert mock_client.messages.stream.call_count == 2
+    assert "twice" in report
+
+    # The nudge is a USER message: the truncated assistant turn itself must never
+    # reach the history, or the retry 400s on the block the API refuses to accept.
+    sent = mock_client.messages.stream.call_args_list[-1].kwargs["messages"]
+    assert all(m["role"] != "assistant" for m in sent)
+    assert "export_clean_data" in sent[-1]["content"]
+
+
+@patch("src.agent.anthropic.Anthropic")
+@patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test_key"})
+def test_a_run_continues_normally_after_recovering_from_a_truncated_turn(
+    mock_anthropic, tmp_path
+):
+    """The retry is a real second chance — the run goes on to finish."""
+    from src.agent import run_agent
+
+    idx = pd.date_range("2024-01-01", periods=20, freq="15min")
+    qc = saqc.SaQC(pd.DataFrame({"value": range(20)}, index=idx))
+
+    finished = MagicMock()
+    finished.stop_reason = "end_turn"
+    finished.usage = _mock_usage(500, 200)
+    text_block = MagicMock()
+    text_block.type = "text"
+    text_block.text = "Report: nothing was flagged."
+    finished.content = [text_block]
+    finished.model_dump.return_value = {"mock": "finished"}
+
+    mock_client = MagicMock()
+    mock_anthropic.return_value = mock_client
+    _wire_stream(mock_client, [_truncated_turn(), finished])
+
+    _, _, report, summary = run_agent(qc, max_steps=5, log_dir=str(tmp_path))
+
+    assert "Report: nothing was flagged." in report
+    assert "twice" not in report
 
 
 @patch("src.agent.anthropic.Anthropic")
@@ -503,3 +543,61 @@ def test_an_api_error_mid_loop_does_not_discard_the_run(mock_anthropic, tmp_path
 
     assert "stopped at step 1" in report
     assert summary.steps == 1          # the completed step is still accounted for
+
+def test_a_mid_stream_failure_is_retried_rather_than_ending_the_run():
+    """The SDK cannot retry once bytes are flowing, so this layer must.
+
+    An httpx.ReadTimeout while the final export response streamed killed a 14-step run
+    on 01467200_l1 (2026-08-18) — it is not an anthropic.APIError, so it escaped the
+    handler that exists to break gracefully.
+    """
+    import httpx
+    from src import agent as agent_module
+
+    class _Stream:
+        def __init__(self, message): self.message = message
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+        def get_final_message(self): return self.message
+
+    calls = {"n": 0}
+
+    class _Messages:
+        def stream(self, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ReadTimeout("the read operation timed out")
+            return _Stream("final")
+
+    class _Client:
+        messages = _Messages()
+
+    monkey = agent_module._STREAM_BACKOFF_SECONDS
+    agent_module._STREAM_BACKOFF_SECONDS = 0.0
+    try:
+        assert agent_module._stream_message(_Client(), model="m") == "final"
+        assert calls["n"] == 2                      # failed once, succeeded on the retry
+    finally:
+        agent_module._STREAM_BACKOFF_SECONDS = monkey
+
+
+def test_a_stream_that_keeps_failing_raises_so_the_run_can_export_what_it_has():
+    """Exhausted retries must surface as an exception the caller catches, not a hang."""
+    import httpx
+    import pytest
+    from src import agent as agent_module
+
+    class _Messages:
+        def stream(self, **kwargs):
+            raise httpx.ReadTimeout("still timing out")
+
+    class _Client:
+        messages = _Messages()
+
+    monkey = agent_module._STREAM_BACKOFF_SECONDS
+    agent_module._STREAM_BACKOFF_SECONDS = 0.0
+    try:
+        with pytest.raises(httpx.HTTPError):
+            agent_module._stream_message(_Client(), model="m")
+    finally:
+        agent_module._STREAM_BACKOFF_SECONDS = monkey

@@ -10,10 +10,10 @@ Implemented in Phase 3 (see CLAUDE.md §12).
 CLI
 ---
     # run the agent on an injected dataset
-    python -m src.agent data/injected/03447687/l2/03447687_l2.csv
+    python -m src.agent data/injected/02054550/l2/02054550_l2.csv
 
     # specify an output directory (default: beside the input file)
-    python -m src.agent data/injected/03447687/l2/03447687_l2.csv --output-dir results/
+    python -m src.agent data/injected/02054550/l2/02054550_l2.csv --output-dir results/
 """
 
 import argparse
@@ -21,10 +21,12 @@ import json
 import datetime
 import os
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import anthropic
+import httpx
 import pandas as pd
 import saqc
 from dotenv import load_dotenv
@@ -42,6 +44,11 @@ from src.agent_tools import context
 # v0.9: decisions carry an explicit `verdict` (anomaly/normal) + `anomaly_type`. The
 #       verdict, not the action, is now what §10 scores — PHASE 5 splits "what is it"
 #       from "what do I do about it".
+# v0.11: noisy-stretch thresholds retuned for 5-min data (3/5 -> 2/8, refit on gauges
+#        we do not score); noise_profile from inspect_dataset read in PHASE 1; "a flag is
+#        a candidate, not a verdict" and "isolation is not proof" added to §3 SPIKE;
+#        `difficulty` required with a calibration target, because it defaulted to "clear"
+#        on 145 of 147 spans and those deletions were wrong 37.8% of the time.
 # v0.8: decisions carry `difficulty` + `deliberation`; blanket spans are labelled
 #       as such per row, so a considered call is distinguishable from a sweep.
 # v0.7: slope_context retuned to a 45-min window and exposed as a tool; the SPIKE
@@ -50,7 +57,7 @@ from src.agent_tools import context
 #       override a specific verdict.
 # v0.5: phases replace the fixed STEP script (only inspect-first, range-before-spikes and
 #       export-last are forced); three context primitives exposed as tools.
-SYSTEM_PROMPT_VERSION = "v0.10-draft"
+SYSTEM_PROMPT_VERSION = "v0.11-draft"
 
 # The model is a CLAUDE.md §2 golden rule — do not change it without changing §2.
 MODEL = "claude-sonnet-4-6"
@@ -64,7 +71,16 @@ MODEL = "claude-sonnet-4-6"
 # wasted the turn and produced an assistant message the API refuses to accept back
 # (see the max_tokens branch in the loop). The guard there handles it; the headroom
 # makes it rare.
-MAX_TOKENS = 32000
+#
+# Raised 32000 -> 64000 (2026-08-19): 32k was still not enough for the EXPORT turn,
+# which is the longest of the run — the agent plans a decision span per flagged
+# segment and emits them all in one tool call. Measured on 01467200_l1: it spent the
+# whole 32,000 deliberating over ~177 spans ("about 177 total, which feels like too
+# many for a single export call") and never emitted the call, so a 15-step run ended
+# with nothing exported. `claude-sonnet-4-6` accepts up to 128,000 output tokens and
+# this client already streams, which is what large max_tokens requires, so the
+# headroom is free. Cost is unaffected — max_tokens is a ceiling, not a reservation.
+MAX_TOKENS = 64000
 
 # Sonnet 4.6 pricing (USD per million tokens) — update if the model changes.
 _COST_PER_M_INPUT = 3.0
@@ -237,6 +253,22 @@ the main defence against a mis-parameterised detector wrecking a run.
     ratio is <= 0.8, the burden shifts: KEEP unless you have some other specific reason,
     and say what that reason is.
 
+    ISOLATION IS NOT PROOF. A flag with no other flags near it tells you the DETECTOR
+    fired once here; it says nothing about the SHAPE of the data at that point. Those are
+    different objects, and confusing them is a documented failure of this run: a point was
+    deleted as an "isolated single-sample flag, consistent with spike pattern seen
+    throughout this record" when the excursion was in fact six samples wide, sat on a
+    rising limb, and was ordinary water. UniLOF routinely fires on one row of a broad
+    feature. Before deleting, check width_samples and samples_to_recover from the row you
+    actually measured — never infer the shape from the flag's isolation, and never from
+    what other points in the record looked like.
+
+    A FLAG IS A CANDIDATE, NOT A VERDICT. Your verdict is the run's answer and is what
+    gets scored; the detector only nominated the point. If you have not measured a point,
+    you are not in a position to delete it — describe_points takes up to 300 timestamps in
+    one call at about 90 tokens each, so measuring an entire detector's output costs a
+    fraction of one wasted deletion.
+
     Call slope_context when a point is narrow and high-z and you are about to delete it —
     it measures the rise and fall gradients directly at the 45-minute scale where they
     separate. Leave n_before/n_after at 3: the signal REVERSES past about 90 minutes,
@@ -259,10 +291,17 @@ the main defence against a mis-parameterised detector wrecking a run.
         are moving. A real artifact jumps far beyond them (median 17x). A false positive is
         doing exactly what everything around it is doing (median 1.6x).
 
-    THE RULE: noise_ratio > 3 AND step_sigmas_local < 5 means the point is not separable
-    from its surroundings. Measured, that is a false positive about four times in five —
-    it spares 76.7% of false positives at a cost of 3.0% of genuine spikes. describe_points
-    labels these "noisy-stretch" rather than "spike".
+    THE RULE: noise_ratio > 2 AND step_sigmas_local < 8 means the point is not separable
+    from its surroundings. Measured on this project's 5-minute bases, fitted on gauges we
+    do not score: it spares 60.2% of false positives at a cost of 4.1% of genuine spikes.
+    describe_points labels these "noisy-stretch" rather than "spike" — when you see that
+    label, the tool has already applied this rule for you, and deleting the point anyway
+    means overriding a measurement, which you must justify explicitly.
+
+    (An earlier version of this rule used 3 and 5. Those were fitted on the retired 15-min
+    gauges, whose false positives sat at noise_ratio ~11; on 5-minute data they fire on
+    almost nothing. If you are ever tempted to reason from remembered thresholds rather
+    than the numbers in front of you, that is the failure mode.)
 
     Then call noise_context ONCE on any point inside the cluster. It tells you two things
     you cannot get otherwise. First, WHY the stretch is busy: variation_kind "noise-like"
@@ -335,7 +374,9 @@ the main defence against a mis-parameterised detector wrecking a run.
 
 Utility
   inspect_dataset      Summary: rows, time range, inferred frequency, NaN count/%, and per
-                       column min/max/mean/std. ALWAYS call this first, before anything else.
+                       column min/max/mean/std. ALSO returns noise_profile: which calendar
+                       stretches of THIS record are noisier than its own typical window.
+                       ALWAYS call this first, before anything else.
   get_flag_summary     Counts of flagged timestamps, broken down by the tool that flagged them.
   export_clean_data    Emits the final data with a flag column AND writes the flag log.
                        Call this last, and pass `decisions` — see PHASE 7.
@@ -504,6 +545,14 @@ PHASE 1 — INSPECT (always first, exactly once)
       what you will scale every data-unit parameter to.
     - The NaN percentage, which tells you how much of the run will be about gaps.
     - Whether the max looks physically plausible or suggests an over-range fault.
+    - WHERE THE RECORD IS NOISY, from noise_profile: how much of it is elevated, and the
+      calendar bounds of the widest stretches. Note them now, before any detector runs.
+      This matters because every per-point measurement you will get is scaled to the
+      WHOLE record, so inside these stretches ordinary water reads as extreme. A flagged
+      point that falls inside one is a candidate for "normal, keep", not for deletion,
+      unless it stands out from its immediate neighbours as well — see §3, SPIKE, "THE
+      OTHER HARD CASE". Deleting inside a noisy stretch is where this run has historically
+      lost the most precision.
   Then sketch a ROUGH plan in two or three sentences: which failure types this series looks
   likely to have, which detector you will open with, and the starting parameter you have
   scaled from the numbers above. Keep it short and hold it loosely — you cannot see the data
@@ -665,8 +714,22 @@ PHASE 7 — SUMMARISE AND EXPORT
   undecided and which of your spans matched no flagged row at all. If either is non-zero,
   spend one more call on a corrected export.
 
-  SAY WHICH CALLS WERE CLOSE, AND SHOW YOUR WORKING ON THOSE. Every decision takes a
-  `difficulty` of "clear" or "judgement-call", and a judgement call must carry a
+  SAY WHICH CALLS WERE CLOSE, AND SHOW YOUR WORKING ON THOSE. Every decision REQUIRES a
+  `difficulty` of "clear" or "judgement-call" — there is no default and the export refuses
+  a decision without one. This field is not bookkeeping: it is the review queue. The
+  finished product hands a human the calls you were not sure about, so a run that marks
+  everything "clear" has not been confident, it has been unhelpful — it leaves the reviewer
+  nothing to check and no way to find your mistakes.
+
+  CALIBRATE IT HONESTLY. On a typical record something like 10-15% of decisions should be
+  judgement calls. Measured on the run before this instruction existed: 145 of 147 spans
+  left the field unset, so the whole run read as clear-cut, and those deletions were WRONG
+  37.8% OF THE TIME. If your clear-marked decisions are wrong a third of the time, "clear"
+  meant nothing. Mark it a judgement call whenever a reasonable reviewer could disagree —
+  in particular any deletion inside a noisy stretch, any narrow excursion whose fall
+  decays, and any point where two measurements pointed opposite ways.
+
+  A judgement call must carry a
   `deliberation` — several sentences of the reasoning a reviewer would need to check you:
   which measurements pointed which way, what you weighed against what, what you
   considered and rejected, and what would have changed your mind. `reason` states the
@@ -729,6 +792,39 @@ def _get_tool_function(tool_name: str):
     raise ValueError(f"Tool {tool_name} not found in wrappers or context.")
 
 
+# A mid-stream read failure is retried here because the SDK cannot retry it: once the
+# response has started arriving, `client.max_retries` no longer applies. Measured
+# 2026-08-18 on 01467200_l1 — an `httpx.ReadTimeout` while the final
+# export_clean_data response was streaming ended the process with 14 completed steps
+# unexported. Two things were wrong and both are fixed: the exception is not an
+# `anthropic.APIError`, so it escaped the handler that exists to break gracefully,
+# and nothing re-issued the request.
+_STREAM_ATTEMPTS = 3
+_STREAM_BACKOFF_SECONDS = 5.0
+
+
+def _stream_message(client: "anthropic.Anthropic", **kwargs):
+    """One streaming request, retrying a failure that happens *during* the stream.
+
+    Re-issuing is safe: the request is the whole conversation so far, so a retry asks
+    the same question again rather than continuing a half-received answer. Anything
+    the SDK already handles (429/5xx before the first byte) never reaches here.
+    """
+    for attempt in range(1, _STREAM_ATTEMPTS + 1):
+        try:
+            with client.messages.stream(**kwargs) as stream:
+                return stream.get_final_message()
+        except httpx.HTTPError as exc:
+            if attempt == _STREAM_ATTEMPTS:
+                raise
+            print(
+                f"  stream failed ({type(exc).__name__}: {exc}); "
+                f"retrying {attempt}/{_STREAM_ATTEMPTS - 1}",
+                file=sys.stderr,
+            )
+            time.sleep(_STREAM_BACKOFF_SECONDS * attempt)
+
+
 def run_agent(
     qc: saqc.SaQC,
     max_steps: int = 25,
@@ -778,8 +874,16 @@ def run_agent(
     log_path = log_dir_path / f"run_{timestamp}.jsonl"
 
     def _log_event(event: dict):
+        # §2 requires a timestamp on every logged call, and it was missing: without
+        # it a prompt-cache miss cannot be told from a TTL expiry after the fact.
+        # Measured on 01467200_l1 (2026-08-19), step 9 rewrote a 122,796-token
+        # prefix (0 cache reads, $0.46 — 21% of the run) and the log could not say
+        # whether the gap before it exceeded the cache TTL. First key, so it reads
+        # first in the file.
+        stamped = {"timestamp": datetime.datetime.now().isoformat(timespec="seconds")}
+        stamped.update(event)
         with open(log_path, "a") as f:
-            f.write(json.dumps(event, default=str) + "\n")
+            f.write(json.dumps(stamped, default=str) + "\n")
 
     _log_event({"event": "system_prompt", "content": SYSTEM_PROMPT, "version": SYSTEM_PROMPT_VERSION})
 
@@ -794,6 +898,10 @@ def run_agent(
     total_cache_write_tokens = 0
     total_cache_read_tokens = 0
     completed_steps = 0
+
+    # A per-turn token overrun is retried once (see the max_tokens branch below); a
+    # second one in the same run means the nudge did not help and the run stops.
+    truncated_once = False
 
     for step in range(max_steps):
         _log_event({"event": "api_call", "step": step, "messages": messages})
@@ -810,7 +918,8 @@ def run_agent(
             # idle-connection timeout that forced the old 16k cap in the first place.
             # get_final_message() returns the same object create() did, so everything
             # downstream — content, stop_reason, usage, model_dump — is unchanged.
-            with client.messages.stream(
+            response = _stream_message(
+                client,
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
                 # Adaptive thinking, not a fixed budget: the fixed-budget form
@@ -837,13 +946,19 @@ def run_agent(
                 # Interpolating anything per-run into either would silently invalidate
                 # the whole cache — check cache_read_input_tokens in the run summary if
                 # you ever touch them.
-                cache_control={"type": "ephemeral"},
+                # ttl "1h", not the 5-minute default. A single step here can spend
+                # minutes generating (step 8 of the 2026-08-19 run emitted 25,179
+                # output tokens), and when a step outlives the TTL the next request
+                # re-writes the WHOLE prefix at 1.25x instead of reading it at 0.1x.
+                # That is what step 9 did: 122,796 written, 0 read, $0.46 of a $2.21
+                # run. A 1h write costs 2x rather than 1.25x, which is the cheaper
+                # trade the moment one such miss is avoided.
+                cache_control={"type": "ephemeral", "ttl": "1h"},
                 system=SYSTEM_PROMPT,
                 messages=messages,
                 tools=TOOL_SCHEMAS,
-            ) as stream:
-                response = stream.get_final_message()
-        except anthropic.APIError as exc:
+            )
+        except (anthropic.APIError, httpx.HTTPError) as exc:
             # Reaching here means the SDK already exhausted `max_retries` on anything
             # retryable, so this is terminal for the run either way. Say which kind it
             # was: a transient overload that outlasted the retries is worth re-running,
@@ -851,7 +966,7 @@ def run_agent(
             # finds out.
             transient = isinstance(
                 exc, (anthropic.RateLimitError, anthropic.InternalServerError,
-                      anthropic.APIConnectionError)
+                      anthropic.APIConnectionError, httpx.TransportError)
             ) or "overloaded" in str(exc).lower()
             _log_event({"event": "api_error", "step": step, "transient": transient,
                         "error": f"{type(exc).__name__}: {exc}"})
@@ -894,11 +1009,31 @@ def run_agent(
             _log_event({
                 "event": "max_tokens_truncation", "step": step,
                 "content_types": [b.type for b in response.content],
+                "retried": not truncated_once,
             })
+            # The truncated turn is deliberately NOT appended, so the history is exactly
+            # what it was before this call — which means the turn can simply be asked
+            # for again. Ending the run here instead threw away 15 completed steps on
+            # 01467200_l1 because the export turn ran out of budget while planning.
+            # A plain retry would likely truncate the same way, so the nudge names the
+            # cause: it is deliberating over too many spans to fit in one call.
+            if not truncated_once:
+                truncated_once = True
+                messages.append({"role": "user", "content": (
+                    "Your last turn hit the per-turn token limit while still planning "
+                    "and produced no tool call, so nothing was recorded. Do not plan "
+                    "further. Call export_clean_data now, consolidating your decisions "
+                    "into the smallest number of spans that still says something true "
+                    "about each flagged segment: group adjacent segments you would "
+                    "treat identically into one span rather than writing one per "
+                    "segment, and keep individual spans only where the verdict or the "
+                    "reasoning genuinely differs."
+                )})
+                continue
             final_report = (
                 f"Run stopped at step {step}: the model reached the {MAX_TOKENS:,}-token "
-                "per-turn limit mid-thought and produced no usable output for that turn. "
-                "Everything up to this point stands; nothing after it was decided."
+                "per-turn limit mid-thought and produced no usable output for that turn, "
+                "twice. Everything up to this point stands; nothing after it was decided."
             )
             break
 

@@ -161,13 +161,21 @@ def inspect_dataset(qc: saqc.SaQC, field: str = "value") -> dict:
     df = df.reset_index()
     df.rename(columns={"index": DATETIME_COL}, inplace=True)
     summary = summarise_series(df, value_col=field)
+    # Where the sensor is noisy, as part of the FIRST thing every run sees (§8).
+    # A flagged point is judged against the record-wide scale unless the run knows
+    # its neighbourhood is busy — which is how 104 ordinary readings were deleted
+    # on 01467200_l1. Making this a returned measurement rather than a prompt
+    # instruction is deliberate: the agent had per-point noise_ratio in every
+    # describe_points row already and did not act on it.
+    noise = context.noise_profile(df.set_index(DATETIME_COL)[field])
     return {
         "tool": "inspect_dataset",
         "params": {"field": field},
         "n_rows": summary.n_rows,
-        "message": "Dataset inspected.",
+        "message": "Dataset inspected. " + noise.get("message", ""),
         "qc": qc,
-        "summary": summary.to_dict()
+        "summary": summary.to_dict(),
+        "noise_profile": {k: v for k, v in noise.items() if k not in ("tool", "params")},
     }
 
 
@@ -397,6 +405,10 @@ def _build_flag_log(
     sources = pd.Series("", index=stamps, dtype=object)
     verdicts = pd.Series("", index=stamps, dtype=object)
     anomaly_types = pd.Series("", index=stamps, dtype=object)
+    # Which span claimed each row (its author order), or -1. `rationale_source` says
+    # a row was swept up by a blanket; this says by WHICH one and how wide it was,
+    # which is what an auditor needs to see to judge whether the row was really judged.
+    claimed_by = pd.Series(-1, index=stamps, dtype=int)
 
     # Validate everything before applying anything, so a bad span late in the list
     # cannot leave a half-written log behind.
@@ -418,7 +430,21 @@ def _build_flag_log(
         if end < start:
             raise ValueError(f"decisions[{i}] ends ({end}) before it starts ({start}).")
 
-        difficulty = str(decision.get("difficulty", "clear")).strip().lower()
+        # REQUIRED, with no default. It used to default to "clear", and the result
+        # was that the field carried no information at all: measured on the
+        # 2026-08-20 run, 145 of 147 spans left it unset, so 98.6% of the run was
+        # implicitly "clear-cut" — and those deletions were wrong 37.8% of the time.
+        # A default that manufactures a confidence claim on the agent's behalf is
+        # worse than no field, because it reads as a judgement nobody made.
+        if "difficulty" not in decision or decision.get("difficulty") in (None, ""):
+            raise ValueError(
+                f"decisions[{i}] is missing `difficulty`. Every decision must say "
+                f"whether it was clear-cut or a judgement call — there is no default. "
+                f"Use one of: {', '.join(DIFFICULTIES)}. Mark it 'judgement-call' "
+                "whenever a reasonable reviewer could disagree; those are the spans a "
+                "human will be asked to check."
+            )
+        difficulty = str(decision["difficulty"]).strip().lower()
         if difficulty not in DIFFICULTIES:
             raise ValueError(
                 f"decisions[{i}] has difficulty={decision.get('difficulty')!r}; "
@@ -462,6 +488,9 @@ def _build_flag_log(
         covered = within & actions.isna().to_numpy()
         if not covered.any():
             continue
+        span["reach"] = int(within.sum())
+        span["claimed"] = int(covered.sum())
+        claimed_by[covered] = span["order"]
         actions[covered] = span["action"]
         reasons[covered] = span["reason"]
         deliberations[covered] = span["deliberation"]
@@ -497,6 +526,11 @@ def _build_flag_log(
     n_keep_overridden = int(overridden.sum())
     sources[imputed_rows] = "deterministic"
     sources[undecided_rows] = "deterministic"
+    # Code decided these, so attributing them to a span the agent wrote would be a
+    # lie — including for a `keep` span the imputer overrode (counted separately as
+    # n_keep_rewritten_to_impute).
+    claimed_by[imputed_rows] = -1
+    claimed_by[undecided_rows] = -1
 
     # A row the filler wrote a value into was missing, and §5 is explicit that every
     # missing run is a gap — so the verdict here is a fact about the data, not a call
@@ -511,9 +545,11 @@ def _build_flag_log(
     verdicts[undecided_rows] = UNDECIDED
     anomaly_types[undecided_rows] = ""
 
+    by_order = {span["order"]: span for span in spans}
     entries = []
     for i, stamp in enumerate(stamps):
         source = sources.iloc[i] or "deterministic"
+        span = by_order.get(int(claimed_by.iloc[i]))
         entries.append({
             "datetime": stamp.strftime("%Y-%m-%dT%H:%M:%S"),
             "flagged_by": flagged_by.loc[stamp],
@@ -530,6 +566,16 @@ def _build_flag_log(
                 source, actions.loc[stamp], flagged_by.loc[stamp], reasons.loc[stamp]
             ),
             "deliberation": deliberations.iloc[i],
+            # The span that claimed this row. `n_flagged_rows_in_span` is its whole
+            # reach and `n_rows_claimed` what survived narrower spans, so a reader can
+            # see at a glance whether this row was judged or absorbed.
+            "decided_by": None if span is None else {
+                "start": span["start"].strftime("%Y-%m-%dT%H:%M:%S"),
+                "end": span["end"].strftime("%Y-%m-%dT%H:%M:%S"),
+                "n_flagged_rows_in_span": span["reach"],
+                "n_rows_claimed": span["claimed"],
+                "difficulty": span["difficulty"],
+            },
         })
     stats = {
         "n_entries": len(entries),

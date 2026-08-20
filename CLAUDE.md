@@ -79,6 +79,9 @@ deployment, Docker, CI beyond a basic test run).
 │   │   └── <gauge>/l<level>/  # the §5 triple, filed by gauge then level
 │   ├── comparison/       # same sensor either side of the approval boundary (§9.3)
 │   │   └── <gauge>/      #   *_approved.csv, *_provisional.csv, *_manifest.json
+│   ├── legacy_15min/     # the RETIRED 15-min bases + their injected datasets (§9)
+│   │   ├── raw/          #   approved/ + provisional/ 15-min pulls (gitignored)
+│   │   └── injected/     #   the nine 15-min §5 triples (tracked; see its README)
 │   └── review/           # candidate proposals (gitignored) + reviewed labels (§9.1)
 ├── src/                  # grouped by AUDIENCE — see the note below the tree
 │   ├── inspect_data.py   # load + validate the §5 contracts + summarise (shared foundation)
@@ -97,7 +100,8 @@ deployment, Docker, CI beyond a basic test run).
 │       ├── visualize_injected.py # plot injected datasets with anomaly labels
 │       ├── visualize_log.py # replay one logs/*.jsonl run: flags per iteration (§8)
 │       ├── spike_audit.py # one run's SPIKE decisions case by case, with evidence (§10.1)
-│       ├── decision_audit.py # click ANY point: what happened to it and why (§10.1)
+│       ├── decision_audit.py # click ANY point: why it got the verdict it got (§10.1)
+│       ├── provenance.py # rebuilds one point's story from the run log (§10.1)
 │       ├── param_sweep.py # sweep one param, score vs labels, plot (§7.2)
 │       ├── candidates.py # propose anomalies in a "clean" series for review (§9.1)
 │       └── review.py     # keyboard-driven labelling page + merge back to labels (§9.1)
@@ -113,7 +117,16 @@ deployment, Docker, CI beyond a basic test run).
 │   ├── tune_candidates.py     # picks the §9.1 proposal thresholds
 │   ├── tune_spike_recall.py   # sweeps the §9.1 spike params for >=95% recall
 │   ├── probe_candidate_recall.py # candidates.py recall vs the injected labels
+│   ├── screen_5min_turbidity.py # national catalog sweep for 5-min turbidity (§9)
+│   ├── screen_5min_stage2.py  # measures each candidate's ACTUAL cadence (§9)
+│   ├── screen_5min_stage3.py  # approval/completeness/calmness per candidate (§9)
+│   ├── check_cadence_stability.py # guards the §9.1 phantom-NaN trap
+│   ├── find_precip.py         # nearest instantaneous rain gauges to a site (§9.4)
+│   ├── verify_precip.py       # confirms those series really cover the window (§9.4)
+│   ├── compare_candidate_recall.py # §9.1 recall, 5-min vs the retired 15-min set
 │   ├── tune_noise_context.py  # picks the §7.4 noise window + rule thresholds
+│   ├── tune_noise_spare_rule.py # refits §7.4 for 5-min data, on gauges we don't score
+│   ├── probe_cache_ttl.py     # is `ttl` accepted on top-level cache_control? (§8)
 │   ├── probe_noise_reads_like.py # the §7.4 noisy-stretch guard's hit rates
 │   └── tune_zscore.py         # flagZScore min_residuals on quantised data (§7.1)
 └── logs/                 # JSONL API logs (gitignored)
@@ -194,7 +207,8 @@ longer emitted; drift is removed and this file existed only to feed `correctDrif
 ```
 
 **`flagged_datetimes` is a SAMPLE, not the whole set** (2026-08-10). It is capped at
-`wrappers.MAX_FLAGGED_DATETIMES` (250) and **evenly spaced across the record** — a head would
+`wrappers.MAX_FLAGGED_DATETIMES` (**1000**, not the 250 this line claimed until 2026-08-20)
+and **evenly spaced across the record** — a head would
 put every point the agent inspects in the first weeks of a two-year series. `n_flagged` /
 `n_flagged_total` stay exact; `n_flagged_datetimes_shown` says how many came back, and the
 `message` says so loudly whenever it truncates, because an agent that believes it received
@@ -222,6 +236,21 @@ narrowest covering span wins. Details the contract above did not say:
   produce identically-shaped entries otherwise, and **every run so far has had a blanket absorb
   points the agent had actually measured** — the log could not show that. `rationale` is a
   sentence a reader can act on; for the deterministic cases it is generated in code.
+- **Each entry also carries `decided_by`** (2026-08-18): the span that claimed the row —
+  its `start`/`end`, its `difficulty`, `n_flagged_rows_in_span` (its whole reach) and
+  `n_rows_claimed` (what survived narrower spans). `rationale_source` already said *that*
+  a row was swept up by a blanket; this says by **which** span and how wide it was, which
+  is what an auditor needs in order to tell a judgement from an absorption. It is `null`
+  wherever `rationale_source` is `deterministic`, because pinning a code decision on a
+  span the agent wrote would credit it with a judgement it never made.
+- **`difficulty` is REQUIRED and has no default** (2026-08-20). It defaulted to `"clear"`,
+  and the field was consequently inert: measured on the 2026-08-19 run, **145 of 147 spans
+  omitted it**, so 98.6% of the run read as clear-cut — and those deletions were **wrong
+  37.8% of the time**. A default that manufactures a confidence claim nobody made is worse
+  than no field, because §10.1's review queue is built from exactly this signal. Required,
+  it calibrates: on the next run 12.1% of spans were judgement calls, and those were wrong
+  66.7% vs 27.8% for `clear` — 2.4x, which is what makes the queue worth reviewing. Note
+  `clear` is still wrong 27.8% of the time: directionally calibrated, not yet sufficient.
 - **A decision marked `difficulty: "judgement-call"` MUST carry a `deliberation`** and
   `export_clean_data` raises without one (§13, fail loudly). `reason` states the conclusion;
   `deliberation` shows the working — what pointed which way, what was weighed, what would have
@@ -448,13 +477,18 @@ principle: **raise a sensitivity threshold when the base is spiky/variable or an
 sparse (favor precision); lower it when anomalies are dense or the base is calm (favor
 recall).**
 
-> ⚠ **These ranges were swept against the pre-2026-07-31 datasets and have NOT been re-run**
-> since the §9 frequency cut (`0.8/2/3.5` → `0.15/0.4/0.8`) and the spike-magnitude floor
-> raise (2× → 5×). Both changes push the same direction the table's own rule predicts:
-> anomalies are now ~5× sparser, which favors **higher** thresholds for precision, while
-> spikes are uniformly larger, which means a higher `flag_spike_unilof`/`flag_zscore`
-> threshold now costs less recall than it used to. Treat every number below as a stale
-> starting point and re-run `param_sweep` before quoting any of it as tuned.
+> ⚠ **Every number below was swept on the retired 15-min gauges and is now doubly stale.**
+> First, it predates the 2026-07-31 frequency cut (`0.8/2/3.5` → `0.15/0.4/0.8`) and
+> spike-magnitude floor raise (2× → 5×) — both push the same way the table's own rule
+> predicts: anomalies are ~5× sparser, favouring **higher** thresholds for precision, and
+> spikes are uniformly larger, so a higher `flag_spike_unilof`/`flag_zscore` threshold costs
+> less recall than it used to. Second, and more disruptive, **the bases moved to a 5-minute
+> step on 2026-08-18 (§9)**. The `window` entries are durations and carry over unchanged,
+> but anything counted in **samples** now spans a third of the time it did: `flag_spike_unilof`'s
+> `n≈20` neighbourhood was 5 hours and is now 100 minutes, which is a different question about
+> the data, not the same one measured more finely. The gauges are new too, so the data-unit
+> thresholds (`flag_zscore`, `flag_constants`, `flag_jumps`) need rescaling to the new series'
+> robust spread regardless. Re-run `param_sweep` before quoting any of this as tuned.
 
 | Tool · param | range (default) | increase (↑) when | decrease (↓) when |
 | --- | --- | --- | --- |
@@ -493,6 +527,14 @@ the hint. Exposing them costs nothing but a schema — `agent.py`'s dispatch alr
 its schema to `schemas.py::TOOL_SCHEMAS` and it is callable. They are single-question
 instruments: one call, one timestamp, one measurement, so the prompt tells the agent to triage
 with `describe_points` first and spend one of these only where a decision turns on a specific
+number. **`describe_points` describes up to `DEFAULT_MAX_POINTS` (100) per call, ceiling
+`MAX_POINTS_CEILING` (300)** — raised from 20 on 2026-08-20, which was the binding limit on
+how much of a detector's output a run ever measured (§7.5). Cost is ~90 tokens/point and
+**flat with batch size** (measured 20/100/263 points: 93/91/90), so measuring a detector's
+whole output costs a fraction of one wrong deletion. It is agent-settable but capped:
+`MAX_FLAGGED_DATETIMES` is 1000, so an uncapped call could return ~90k tokens in one result.
+Truncation and clamping are both reported, never silent, and the message names the cap that
+was APPLIED rather than the one requested
 number. `noise_context` is the exception to "one timestamp": one call anywhere inside a busy
 stretch characterises the whole stretch and returns its bounds.
 
@@ -613,6 +655,34 @@ wrong. Rules, as what they buy and cost:
   drops **34.6%** of the wrong `spike` hints (179 → 117 of 621), on true injected spikes it
   costs **3.0%** (164 → 159 of 168), and on unflagged normal rows it changes **nothing**.
   This supersedes the "spike 87/120, 11 storm-peak FP" figure above for the spike branch.
+- **RE-TUNED FOR THE 5-MIN BASES (2026-08-20), and the old numbers fire on nothing.** The
+  rule above (`noise_ratio > 3 and step_sigmas_local < 5`) spares **0 of 104** surviving
+  false positives on 01467200_l1: it was fitted on the retired 15-min gauges, whose FP
+  population was storm limbs at median `noise_ratio` **11.3**, and the 5-min FP population
+  sits at median **2.2**. The separator still holds — FP median `noise_ratio` 2.2 vs true
+  spike 0.9, FP median `step_sigmas_local` 8.4 vs 14.9 — so only the thresholds moved.
+  Refitted over 2,892 FPs / 392 true spikes pooled from 02054550 l1/l2 and 040851385 l1/l2,
+  **never the gauge reported on** (`scratchpad/tune_noise_spare_rule.py`), maximising FPs
+  spared subject to losing ≤5% of true spikes:
+
+  | rule | FPs spared | spikes lost |
+  | --- | ---: | ---: |
+  | `noise_ratio > 2.0 and step_sigmas_local < 8` | 60.2% | 4.1% |
+
+  Live as `context.ELEVATED_NOISE_RATIO` / `LOCAL_STEP_UNREMARKABLE`. **Mind the transfer
+  gap**: 60.2% sparing where fitted, **33%** held out on 01467200_l1 (34 of 104 FPs, and
+  **0** of 57 true spikes). The direction carries; the magnitude does not fully. Fitting
+  these on the gauge you then score is fitting to the test set — don't.
+- **`inspect_dataset` returns a `noise_profile`** (2026-08-20): which calendar stretches of
+  the record are noisier than its own typical window, via `context.noise_profile`. **Rolling,
+  not fixed blocks** — a fixed grid dilutes a stretch that straddles a boundary and can push
+  it under threshold in both halves. Contiguous runs are **bridged at the window width**,
+  because a rolling threshold flickers across one storm and reports it as hundreds of
+  fragments (796 → 419 episodes on 01467200_l1, widest 3.7 days). ~116 ms and ~800 tokens
+  for a 210k-row series. The §7.4 warning that `rolling().apply(mad)` costs seconds does not
+  apply: this runs once per run and uses pandas' native rolling median, not `.apply`.
+  It is a *returned measurement* rather than a prompt instruction on purpose — the agent
+  already had per-point `noise_ratio` in every `describe_points` row and did not act on it.
 - **`noise_ratio` and `step_sigmas_local` ride in every `describe_points` row**, because this
   failure is only visible *across* a cluster — no single row shows it. `episode_start` /
   `episode_end` bound the elevated stretch so the agent can write one §5 decision span over
@@ -621,6 +691,37 @@ wrong. Rules, as what they buy and cost:
   into non-overlapping blocks and taking a `nanmedian` along an axis. The obvious
   `rolling().apply(mad)` is O(n·w) in Python and takes seconds per call on a two-year 15-min
   series; this is ~10 ms, which is what makes 100 points in one `describe_points` call viable.
+
+---
+
+### 7.5 Spike precision: what actually moved it (2026-08-20)
+
+Spike precision was **0.227** — the run deleted 194 real readings for every 173 correct
+ones. Two causes, fixed and **measured separately** so each is attributable. Recall never
+moved (0.905 throughout) and true positives held at 173, so both fixes are pure precision.
+
+| | baseline | A: tool | B: decision |
+| --- | ---: | ---: | ---: |
+| spike precision | 0.227 | 0.354 | **0.460** |
+| spike recall | 0.905 | 0.905 | **0.905** |
+| false positives | 194 | 104 | **67** |
+| macro-F1 | 0.577 | 0.614 | **0.639** |
+
+**A — the tool limit.** `describe_points` capped at 20 points/call, so the run measured
+**45 of 10,463 decided rows (0.43%)** and deleted 367 spikes having inspected 33. Raising
+the default to 100 took measurement to **263 of 263 flagged points in two calls**, and
+removed 90 FPs. The diagnostic that proved the mechanism: after the fix, **100% of the
+surviving FPs had been measured** (104/104) versus 33% of the true positives — the "deleted
+a point it never looked at" failure was gone, and what remained was misjudgement.
+
+**B — the decision layer.** Three changes, of which the guard re-tune (§7.4) carries most
+of the weight: it relabels 34 FPs `noisy-stretch` and **0** true spikes. Plus the §7.4
+`noise_profile` at step 0, and `difficulty` made required (§5).
+
+**What is NOT the cause, having been checked:** `level_shift` scores 0/117 in every run and
+is untouched by either fix — it is the single largest macro-F1 drag (0.639 would be ~0.85
+without that zero) and remains open. And the surviving 67 FPs are not a coverage problem:
+they were measured, cited real numbers, and were still wrong.
 
 ---
 
@@ -665,6 +766,16 @@ Measured on the 2026-08-10 run (15 steps, $4.91):
   pattern. Verified: `scratchpad/probe_prompt_cache.py` shows 15,546 tokens (tools + system)
   written then read back. Cache reads bill at ~0.1×, writes at ~1.25×, and `RunSummary` now
   tracks all three and **warns when a multi-step run records zero cache reads**.
+- **The cache TTL is `1h`, not the 5-minute default** (2026-08-20). A single step here can
+  spend minutes generating — one emitted 25,179 output tokens — and when a step outlives the
+  TTL the next request re-writes the WHOLE prefix at 1.25x instead of reading it at 0.1x.
+  Measured on the 2026-08-19 run: step 9 wrote 122,796 tokens with **zero** cache reads,
+  $0.46 of a $2.21 run. A 1h write costs 2x rather than 1.25x, which is the cheaper trade
+  the moment one such miss is avoided; the next run had **0** misses with two inter-call
+  gaps over 300s. `ttl` is accepted on the TOP-LEVEL `cache_control` (the docs show it on
+  content blocks) — `scratchpad/probe_cache_ttl.py` confirms before a run depends on it.
+- **Every logged event carries a `timestamp`** (2026-08-20). §2 required it and it was
+  missing, which is why the miss above could not be told from a TTL expiry after the fact.
 - **This only holds while the prefix is byte-stable.** `tools` renders first and `system`
   second, so interpolating a timestamp, run id or dataset name into `SYSTEM_PROMPT`, or
   varying `TOOL_SCHEMAS` between calls, silently invalidates everything. Re-run the probe
@@ -673,6 +784,27 @@ Measured on the 2026-08-10 run (15 steps, $4.91):
 - **A cheaper model is not available for this workload.** Haiku 4.5's context window is 200K;
   that run's final request was **263,345 input tokens**. It would not fit, quite apart from
   the §2 golden rule pinning `claude-sonnet-4-6` (1M context).
+
+**A run is 15+ sequential API calls, so one failure anywhere throws away everything
+before it.** Three layers guard that, and they cover different failures — do not collapse
+them:
+
+- `max_retries=8` on the client (above the SDK default of 2), for a request that fails
+  *before* the response starts. Measured 2026-08-13: an `overloaded_error` at step 15 of
+  15, one call before `export_clean_data`, discarded a complete run.
+- **`_stream_message` retries a failure that happens DURING the stream**, because the SDK
+  cannot: once bytes are arriving, `max_retries` no longer applies. Measured 2026-08-18 on
+  01467200_l1 — an `httpx.ReadTimeout` while the long final export response was streaming
+  ended the process with 14 completed steps unexported. Re-issuing is safe: the request is
+  the whole conversation so far, so a retry re-asks rather than resuming a half-received
+  answer.
+- The `except` around the call catches **`httpx.HTTPError` as well as
+  `anthropic.APIError`** and `break`s, so the run exports what it has. This is why the
+  above mattered twice over: `httpx.ReadTimeout` is not an `anthropic.APIError`, so it
+  escaped the handler written for exactly this situation and killed the process instead.
+
+Note the limit: the §5 flag log is produced *by* `export_clean_data`, so a run that dies
+before the agent calls it has no flag log to salvage, however gracefully it stops.
 
 **Adaptive thinking is ON** (`thinking={"type": "adaptive"}`, 2026-08-01). Without it the
 log records only the prose the model writes for the reader, not its reasoning, and
@@ -685,7 +817,13 @@ log records only the prose the model writes for the reader, not its reasoning, a
 - **`display` is deliberately unset.** It defaults to `summarized` on 4.6 and the parameter
   only arrived with 4.7. If `MODEL` ever moves to 4.7+ the default flips to `omitted` and
   the thinking text comes back **empty** — pass `display="summarized"` at the same time.
-- **`max_tokens` caps thinking + response together**, so it was raised 4096 → 16000. A run
+- **`max_tokens` caps thinking + response together**, so it was raised 4096 → 16000 →
+  32000 → **64000** (2026-08-20). The EXPORT turn is the longest of the run — the agent
+  plans one decision span per flagged segment and emits them in a single call — and at
+  32k it spent the whole budget deliberating over ~177 spans and never emitted the call,
+  ending a 15-step run with nothing exported. `claude-sonnet-4-6` accepts **128,000**
+  output tokens and this client already streams (which large `max_tokens` requires), so
+  the headroom is free; `max_tokens` is a ceiling, not a reservation. A run
   that truncates mid-report is the symptom of setting this too low.
 - **Thinking blocks must be returned to the API unchanged** on the next turn. `agent.py`
   appends the whole `response.content`, which is already correct — do not "optimise" it into
@@ -699,8 +837,8 @@ The model id is a §2 golden rule and lives in one place, `agent.py::MODEL`. It 
 ## 9. Data strategy
 
 - **Real data:** USGS NWIS via the `dataretrieval` package (primary — cleanly scriptable);
-  ECCC (secondary — may be a manual download). Target ~2 years, 15-min/hourly, 2–3 gauges
-  per variable. Start with **one variable** (turbidity or specific conductance).
+  ECCC (secondary — may be a manual download). Target ~2 years at **5-min** sampling, 2–3
+  gauges per variable. Start with **one variable** (turbidity or specific conductance).
 - **Approved data is the base — but "approved" ≠ "no spikes".** Record processing (TM 1-D3,
   §9.2) applies fouling and calibration-drift corrections and deletes *clearly erroneous*
   data, but it **keeps real turbidity spikes** — a storm first-flush or resuspension event is
@@ -717,18 +855,44 @@ The model id is a §2 golden rule and lives in one place, `agent.py::MODEL`. It 
   by-eye clean-segment selection. The §9.1 candidate/review tooling stays available for
   auditing a spikier or provisional base if one is ever used, but the default calm bases don't
   need it.
-- **The three default gauges** (all **100% approved, consistent 15-min, ≥95% complete, and
-  calm** — ≤0.04% real base spikes — over 2023-07→2025-07; regime spread moderate→high):
-  `03447687` French Broad R nr Fletcher, NC (S. Appalachia; moderate, median ~8 FNU; ~95%
-  complete; ~25 base spikes); `02198840` Savannah R at I-95 nr Port Wentworth, GA (tidal
-  river; moderate-high, ~13 FNU, ~9× range; ~99% complete; 0 base spikes); `08041770` LNVA
-  Canal at Beaumont, TX (managed canal; high, ~28 FNU, ~5× range; ~99% complete; ~1 base
-  spike). Replaced `02203603` (South R, Atlanta) and `02198955` (Middle R, tidal): 100%
-  approved and dense but too **flashy** — 120 (0.18%) and 637 (0.91%) real base spikes.
-  Earlier retired: `12340500` (Blackfoot, 35% missing), `06818000` (Missouri, 14% missing),
-  `11501000` (Sprague, mostly provisional). No clean *low/clear* base survived all filters —
-  clear rivers are spring/mountain-fed (winter gaps or provisional), so the spread is
-  moderate→high, not low→high.
+- **Sampling is 5-minute** (2026-08-18). The bases were 15-min until then; the retired
+  series and the nine datasets injected into them are kept under `data/legacy_15min/`
+  (see its README). Cadence is not cosmetic: several §7 measurements are expressed in
+  **samples** rather than time — `flag_spike_unilof`'s `n≈20` neighbourhood,
+  `slope_context`'s 3-sample window — so at 5 minutes each of those spans a third of the
+  time it used to. Every number in §7.2, §7.3 and §7.4 was measured on 15-min series and
+  is now a **stale starting point**, not a tuned value.
+- **The three default gauges** (all **100% approved, consistent 5-min, ≥95% complete, and
+  calm** over 2023-07→2025-07; regime spread low→moderate):
+  `02054550` Roanoke R at Salem, VA (Blue Ridge Appalachian headwater; **low**, median
+  ~1.9 FNU; 96.0% complete; 0.31% base spikes); `01467200` Delaware R at Penn's Landing,
+  Philadelphia, PA (Mid-Atlantic tidal urban estuary; **moderate**, ~6.5 FNU; 96.6%
+  complete; 0.10% base spikes); `040851385` Fox R at Green Bay, WI (Great Lakes river
+  mouth; **high**, ~11.3 FNU; 95.4% complete; 0.41% base spikes). All three hold a 5-min
+  modal step in **every one of the 25 months** in the window (≥98.7% of steps), so
+  re-gridding cannot manufacture the phantom gaps §9.1 warns about.
+- **How they were chosen, and why the pool is this small.** `scratchpad/screen_5min_*.py`
+  swept all 52 states' NWIS series catalogs: **1,737** turbidity (`63680`) instantaneous
+  series nationwide, 700 with a ≥2-year record still active mid-2025. Cadence **cannot be
+  read from the catalog** — `count_nu` is *days* of record for a unit-value series, not a
+  sample count, so every series computes to a nonsense 1440-min step; it has to be measured
+  from the timestamps. Doing so found **519 at 15-min and only 57 at ≤5 min**, of which
+  **13** also clear approval + completeness + a 2-year span. That is the entire national
+  pool, and it is why the spread is now low→moderate: **no ≤5-min gauge clears the gates
+  with a median above ~12 FNU**, so the retired set's ~28 FNU high end has no 5-min
+  counterpart. Base-spike share is measured identically for every candidate —
+  `flagUniLOF(n=20, thresh=1.5)` over the re-gridded approved series — which is *not* the
+  method behind the retired gauges' quoted "≤0.04%"; re-measured that way the retired three
+  score 0.41 / 0.12 / 0.06%, so the new three sit inside the same band rather than being
+  three times worse.
+- Retired as 5-min candidates: `072632996` (Lk Maumelle AR) is the calmest series in the
+  country at 0.034% and 98.4% complete, but **no USGS rain gauge within ~110 km covers our
+  window** (every nearby one begins 2026-04), and rainfall is decision-relevant context
+  (§9.4); `01585075` (Foster Branch MD, 11.6 FNU) and `01579550` (Susquehanna MD) are
+  strong but would have put two of three gauges in the same Mid-Atlantic region.
+  Earlier 15-min retirements, kept for the record: `02203603` / `02198955` (too **flashy** —
+  0.18% and 0.91% real base spikes), `12340500` (Blackfoot, 35% missing), `06818000`
+  (Missouri, 14% missing), `11501000` (Sprague, mostly provisional).
 - **Synthetic injection:** inject all four types at recorded locations into the approved
   bases; save the labels (§5). Build **three contamination levels** with a **fixed random
   seed** for reproducibility.
@@ -736,19 +900,23 @@ The model id is a §2 golden rule and lives in one place, `agent.py::MODEL`. It 
   only** (spike, plateau, gap), where "percent of rows" is a natural unit. `level_shift` is
   driven by episode count instead (1 / 2 / 3), and its row-share is a reported consequence
   rather than a target — so a dataset's **total** anomalous share exceeds its headline level,
-  partly via *natural* gaps carried in from the base. Level 3 now lands at 5.6 / 2.4 / 1.7%
-  on 03447687 / 02198840 / 08041770 (natural-gap share is 4.6 / 1.4 / 0.6%, which now
-  *dominates* the total on 03447687). (These per-type rates were toned down in stages —
+  partly via *natural* gaps carried in from the base. On the 5-min bases level 3 lands at
+  5.1 / 4.5 / 5.6% on 02054550 / 01467200 / 040851385, and the natural-gap share
+  (4.1 / 3.4 / 4.6%) now *dominates* the total on all three — the injected point budget is
+  0.8%. (On the retired 15-min bases the same figures were 5.6 / 2.4 / 1.7%.)
+  (These per-type rates were toned down in stages —
   `3 / 7 / 12` → `2 / 5 / 9` → `0.8 / 2 / 3.5` → the current `0.15 / 0.4 / 0.8`
   (2026-07-31) — to look like real, sparsely-anomalous records. At 3.5% the level-3 series
   was visibly speckled on a plot, which makes detection easier than the real problem.)
   Read per-type counts from the manifest/labels; never infer them from the level number.
-- **Level 1 is now thin by design — check `n_events` before trusting a per-type score.**
-  At 0.15% a dataset carries ~11–13 spike events, **1–2 plateau events**, and 3–4 injected
-  gap events across two years. That is the intended realism, but per-type precision/recall
-  on plateau at level 1 rests on one or two events, so it is noisy and a single miss swings
-  it to 0. Score plateau on levels 2–3, or pool levels. All nine datasets still report
-  `point_budget_met: true` and `types_missing: []`.
+- **Level 1 is thin by design — check `n_events` before trusting a per-type score.**
+  The level is a share of *rows*, so tripling the sampling rate tripled the event counts at
+  the same contamination: on the 5-min bases level 1 carries **~30 spike events, 1–2 plateau
+  events, and ~4 injected gap events** across two years (it was ~11–13 / 1–2 / 3–4 at
+  15-min). Spike is now comfortably scoreable at level 1; **plateau still is not** — it rests
+  on one or two events, so a single miss swings its precision/recall to 0. Score plateau on
+  levels 2–3, or pool levels. All nine datasets report `point_budget_met: true` and
+  `types_missing: []`.
 - **Spike magnitude is log-uniform 5–15× the local robust scale** (`SPIKE_MAGNITUDE_SCALE`).
   The floor was raised from 2× (2026-07-31): below ~5× an injected spike sits inside the
   local noise band and is not identifiable as an anomaly even by eye, so scoring a detector
@@ -817,15 +985,30 @@ python -m src.workbench.review merge  data/raw/provisional/<gauge>.csv <decision
     ~2,500 spike segments, which is past one-by-one human review. Reviewing a provisional base
     means setting `--max-per-type` explicitly and accepting the recall that buys.
   `tests/test_candidates.py::test_candidate_type_recall_on_injected_datasets` holds the line at
-  95% per type per dataset. **These recall figures predate the 2026-07-31 regeneration and
-  have not been re-measured** — the whole `tests/test_candidates.py` file is currently failing
-  for an unrelated environment reason (see the §9 note below), so the numbers here are the last
-  known-good ones, not a current reading. As recorded then: **green for spike, gap; red for
-  level_shift** (2.8–27.9% — `flagJumps` marks a step's *edge* while the §5 label covers the
-  whole injected window, so row-recall cannot be high; open, see the level_shift bullet below)
-  **and for plateau on 03447687_l1** (88.6%; every other dataset is 95.2–100%). Note the
-  frequency cut makes plateau recall at level 1 rest on 1–2 events, so that figure will be far
-  noisier than it was.
+  95% per type per dataset. **Re-measured 2026-08-18** on the 5-min bases *and* on the retired
+  15-min ones, with the identical metric, so the two are comparable
+  (`scratchpad/compare_candidate_recall.py`; medians across the nine datasets in each set):
+
+  | type | 15-min (retired) | 5-min (current) | verdict |
+  | --- | ---: | ---: | --- |
+  | spike | 100% | 100% | green (98.2–100% on every dataset) |
+  | gap | 100% | 100% | green by construction (NaN mask, not a detector) |
+  | plateau | 100% | 96.1% | **amber** — under 95% on 4/9 now, was 3/9 |
+  | level_shift | 16.1% | 35.8% | **red**, and structurally so |
+
+  **These failures are not caused by the move to 5-min data — they pre-date it.** The same
+  assertions fail on the legacy 15-min datasets: **21 failing parametrisations there against
+  18 now**, and level_shift's median recall more than doubled. So the cadence change slightly
+  *improved* the picture; it did not break it. Do not spend time bisecting the 5-min switch
+  looking for the cause.
+
+  level_shift is red for the reason the level_shift bullet below gives, and no threshold fixes
+  it: `flagJumps` marks a step's **edge** while the §5 label covers the **whole injected
+  window**, so row-recall is bounded by (edge width / window length) and cannot approach 95%.
+  Scoring it per *row* is measuring the wrong thing — an event-level or onset-tolerance metric
+  is the real repair, and until that exists the assertion is a known-red reminder rather than a
+  regression signal. Plateau's amber is thinner than it looks: level 1 carries only 1–2 plateau
+  events (§9), so a single clipped event moves a dataset's recall by tens of percent.
 - **Only spike, plateau and level_shift are reviewed — gaps are never queued.** Whether a
   value is missing is not a judgement call, and §5 is explicit that *every* missing run is
   `anomaly_type=gap`, so putting gaps in the queue only invites a reviewer to press "normal"
@@ -881,7 +1064,11 @@ python -m src.workbench.review merge  data/raw/provisional/<gauge>.csv <decision
   usual `// 1_000_000` yielded *seconds* and `spike_audit.py` plotted a two-year series
   entirely inside 1970. Use `index.as_unit("ms").astype("int64")`, which is explicit about
   the unit whatever the source resolution. The axis is the only place this shows, so it
-  survives every test that checks the data rather than the picture.
+  survives every test that checks the data rather than the picture. **A context window
+  expressed in SAMPLES is the same class of bug** (2026-08-18): `CONTEXT_SAMPLES = 96`
+  read "24 h" on the 15-min bases and became 8 h the moment the project moved to 5-min
+  ones, so the detail plot silently stopped showing the surroundings a storm-vs-spike
+  call depends on. Both audit pages now derive it from the series' own median step.
 - **`merge` writes the §5 labels contract** with `source=natural` and an empty `true_value`:
   these anomalies were already in the record, so no uncontaminated value exists for them
   and they are scoreable for detection but not for imputation (§5, §10). It **refuses**
@@ -1023,6 +1210,51 @@ manifest to `data/comparison/<gauge>/`.
   feeds `src.datasets.inject`, which globs `data/raw/approved/` and only that (§9). The CSVs are
   gitignored and regenerable; `data/comparison/README.md` is committed.
 
+### 9.4 Precipitation (checked 2026-08-18 — available, not yet pulled)
+
+Rain is the one piece of evidence that settles the hardest call the agent makes. §7.3
+measured that a storm peak and a spike are separated by *width* and *recovery time*, and
+§7.4 that a whole noisy stretch is one event rather than dozens — but all of that is inferred
+from the turbidity series' own shape. A rain record is **exogenous**: it can confirm that
+water genuinely moved, which no amount of looking at the sensor's own trace can.
+
+**No 5-min turbidity gauge in the country records precipitation at the same site** — checked
+against the national series catalog, **0 of 57**. So it has to come from a nearby station.
+`scratchpad/find_precip.py` searches NWIS by bounding box for instantaneous `00045`
+("precipitation, total, inches") series and ranks by great-circle distance;
+`scratchpad/verify_precip.py` then **pulls the window and measures it**, which is not
+optional — many gauges near our sites advertise a long period of record but only began
+reporting instantaneous values in **2026-04**, well after our window. The catalog alone
+would have reported those as available.
+
+Verified over 2023-07-01 → 2025-07-01, all **100% approved**:
+
+| Turbidity gauge | Nearest usable rain gauge | Dist | Step | Complete |
+| --- | --- | ---: | ---: | ---: |
+| `02054550` Roanoke, VA | `371520080015100` MET STN Hidden Valley, Roanoke | 7.0 km | **5-min** | 99.8% |
+| `01467200` Delaware R, PA | `01473169` Valley Creek at Valley Forge | 31.1 km | 15-min | 99.8% |
+| `040851385` Fox R, WI | `04085108` East River nr Greenleaf | 18.6 km | **5-min** | 98.7% |
+
+- **Roanoke is the strong case**: three independent 5-min met stations within 11 km, all
+  ≥99.5% complete, so a rain signal can be corroborated across stations rather than trusted
+  from one bucket.
+- **Delaware is the weak case** and the weakness is twofold. The nearest full-window gauge is
+  31 km away across a metropolitan area, and the site is a **tidal** estuary whose turbidity
+  is driven by tidal resuspension as much as by runoff — so rainfall is *less* diagnostic
+  there than at the other two, not merely harder to source. The 19.9 km Bridgeboro NJ station
+  is 6-min but starts 2024-10 and is provisional; it covers barely a third of the window.
+- **A rain gauge kilometres away is a proxy, not a measurement.** Convective summer storms
+  are patchy at exactly the scale of these separations, so "no rain recorded" is much weaker
+  evidence than "rain recorded" — an asymmetry any tool built on this must respect rather
+  than treating absence as refutation.
+
+**Nothing has been pulled.** This is a documented availability check; wiring precipitation
+into the pipeline would mean a `src/datasets/pull_precip.py`, a place for it in the §5
+contracts, and a §7 context tool that reads it — none of which exist, and the last would
+change what the agent is given rather than how it reasons. Note also that the "one variable
+per run" golden rule (§2) governs the *QC target*; rain would be read-only context, not a
+second variable to clean, but that reading should be confirmed before building on it.
+
 ---
 
 ## 10. Evaluation
@@ -1046,6 +1278,47 @@ manifest to `data/comparison/<gauge>/`.
 - **Ablation:** disable tool subsets to show which matter.
 - **Splitting:** first 80% of each series as context, last 20% as held-out test. Never shuffle.
 - Also report on a small **manually labelled real** segment and discuss synthetic-vs-real gap.
+
+### 10.1 Auditing one point: why did it get that verdict? (2026-08-18)
+
+A macro-F1 says the run was wrong somewhere. **§1 also requires the tool to explain
+itself per point**, and that is a different artefact from a score: a reader must be able
+to click any timestamp — flagged or not — and get, in plain language, how the run
+arrived at its answer there. `src/workbench/decision_audit.py` is that page and
+`src/workbench/provenance.py` is the engine; `spike_audit.py` is the narrower,
+spike-only ancestor of both.
+
+**The verdict is the headline, not the action.** The page used to show only what was
+*done* to a value, which cannot express the §5.1 split — a gap correctly identified and
+left unfilled (`anomaly` + `keep`) read identically to real water the agent rejected
+(`normal` + `keep`). Both the header and the panel now carry `verdict`/`anomaly_type`.
+
+**Four situations, deliberately worded differently** — the failure mode this replaces is
+all four rendering as a blank or as the same blank-ish row:
+
+| the point was… | what the page says |
+| --- | --- |
+| flagged, called an anomaly | which detector fired, at which step, **with which parameters**; which `describe_point(s)` call measured it and the numbers it returned; which decision span claimed it; the agent's own words |
+| flagged, called normal | the same trail, ending in the agent rejecting its own detector — §6 asks for exactly this, so it must read as a decision, not an omission |
+| flagged, undecided | no span covered it; no claim in either direction |
+| **never flagged** | a **roll-call**: every detector that ran, with its parameters, and the statement that none of them fired — so a detector miss is visibly upstream of the agent rather than an empty panel |
+
+- **The roll-call is the reason `provenance.py` exists.** A flag log only holds flagged
+  rows, so "no entry" silently covered both ordinary water and a labelled anomaly every
+  detector walked past. Naming the detectors that ran and stayed silent separates them.
+- **A blanket says so.** Where `rationale_source` is `blanket`, the panel states the
+  span's reach as a share of all flagged rows and that the point was swept up rather than
+  assessed — on the 2026-08-13 run that is **364 of 703 rows**, so without it most points
+  would show a paragraph of reasoning that was never about them.
+- **"Never measured" is reported as a different failure from "judged wrong."** No
+  `describe_point`/`describe_points`/context call covering the timestamp means the
+  decision was made without looking, which is a coverage problem, not a judgement one.
+- The narrative is generated in **Python, not JS**, so it is testable
+  (`tests/test_provenance.py`); the page only escapes it and renders `**bold**`. Roles are
+  emitted once per point as an array aligned with a single global call table — repeating
+  the 15-step trace per clickable point multiplied the page size for no added information.
+- Every field it reads degrades to a weaker story rather than a traceback when a log
+  predates it (`verdict` 2026-08-13, `decided_by` 2026-08-18).
 
 ---
 
