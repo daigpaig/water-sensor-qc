@@ -1,0 +1,38 @@
+{
+  "name": "01467200_l1",
+  "seed": 42,
+  "level": 1,
+  "level_name": "low",
+  "n_rows": 210816,
+  "target_point_pct": 0.15,
+  "actual_point_pct": 0.148,
+  "point_budget_met": true,
+  "types_missing": [],
+  "scoreable": true,
+  "total_anomalous_rows": 7525,
+  "total_anomalous_pct": 3.569,
+  "natural_gap_rows": 7096,
+  "natural_gap_pct": 3.366,
+  "by_type": {
+    "spike": {
+      "n_events": 31,
+      "n_rows": 63,
+      "pct_rows": 0.03
+    },
+    "plateau": {
+      "n_events": 2,
+      "n_rows": 123,
+      "pct_rows": 0.058
+    },
+    "level_shift": {
+      "n_events": 1,
+      "n_rows": 117,
+      "pct_rows": 0.055
+    },
+    "gap": {
+      "n_events": 4,
+      "n_rows": 7222,
+      "pct_rows": 3.426
+    }
+  }
+}

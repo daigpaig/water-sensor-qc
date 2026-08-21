@@ -96,14 +96,14 @@ min/max/mean/std).
 
 ```bash
 # Check the series contract (datetime + value; extras like qualifier are kept)
-PYTHONPATH=. python -m src.inspect_data validate data/raw/approved/03447687_turbidity_63680.csv
+PYTHONPATH=. python -m src.inspect_data validate data/raw/approved/02054550_turbidity_63680.csv
 
 # Print a human-readable summary
-PYTHONPATH=. python -m src.inspect_data summarise data/raw/approved/03447687_turbidity_63680.csv
+PYTHONPATH=. python -m src.inspect_data summarise data/raw/approved/02054550_turbidity_63680.csv
 
 # Same summary as JSON; --reindex turns missing timestamps into NaN rows
-PYTHONPATH=. python -m src.inspect_data summarise data/raw/approved/03447687_turbidity_63680.csv --json
-PYTHONPATH=. python -m src.inspect_data summarise data/raw/approved/03447687_turbidity_63680.csv --reindex
+PYTHONPATH=. python -m src.inspect_data summarise data/raw/approved/02054550_turbidity_63680.csv --json
+PYTHONPATH=. python -m src.inspect_data summarise data/raw/approved/02054550_turbidity_63680.csv --reindex
 
 # Validate an injected labels file (when those exist)
 PYTHONPATH=. python -m src.inspect_data validate-labels data/injected/<gauge>/l<level>/<name>_labels.csv
@@ -144,7 +144,7 @@ The agent runs an autonomous ReAct loop on a dataset, deciding which tools to ca
 
 ```bash
 # Run the agent on a dataset (requires ANTHROPIC_API_KEY in .env)
-PYTHONPATH=. python -m src.agent data/injected/03447687/l1/03447687_l1.csv
+PYTHONPATH=. python -m src.agent data/injected/02054550/l1/02054550_l1.csv
 
 # View the tests for the agent loop and token tracking
 PYTHONPATH=. pytest tests/test_agent.py -v
@@ -158,16 +158,16 @@ We evaluate the agent's performance by scoring its anomaly detection (F1) and ga
 
 ```bash
 # Score a specific agent run's log against the dataset
-PYTHONPATH=. python -m src.evaluate data/injected/03447687/l1/03447687_l1.csv \
+PYTHONPATH=. python -m src.evaluate data/injected/02054550/l1/02054550_l1.csv \
     --log logs/run_20260801_131008.jsonl \
-    --decisions data/injected/03447687/l1/03447687_l1_flags.json \
-    --clean data/injected/03447687/l1/03447687_l1_clean.csv
+    --decisions data/injected/02054550/l1/02054550_l1_flags.json \
+    --clean data/injected/02054550/l1/02054550_l1_clean.csv
 
 # Run the fixed-pipeline "dumb" SaQC baseline for comparison
-PYTHONPATH=. python -m src.evaluate data/injected/03447687/l1/03447687_l1.csv --baseline
+PYTHONPATH=. python -m src.evaluate data/injected/02054550/l1/02054550_l1.csv --baseline
 
 # Run an ablation study (disabling specific tools)
-PYTHONPATH=. python -m src.workbench.ablation data/injected/03447687/l1/03447687_l1.csv \
+PYTHONPATH=. python -m src.workbench.ablation data/injected/02054550/l1/02054550_l1.csv \
     --disable flag_spike_unilof impute_rolling
 ```
 

@@ -19,11 +19,11 @@ Usage
     python -m src.workbench.param_sweep --list
 
     # sweep one parameter (uses the built-in default grid)
-    python -m src.workbench.param_sweep --dataset data/injected/03447687/l2/03447687_l2.csv \\
+    python -m src.workbench.param_sweep --dataset data/injected/02054550/l2/02054550_l2.csv \\
         --tool flag_spike_unilof --param thresh
 
     # your own grid, zoomed to a window
-    python -m src.workbench.param_sweep --dataset data/injected/03447687/l2/03447687_l2.csv \\
+    python -m src.workbench.param_sweep --dataset data/injected/02054550/l2/02054550_l2.csv \\
         --tool flag_constants --param thresh --values 0,0.001,0.01,0.1 \\
         --start 2024-07-01 --end 2024-08-01
 """
@@ -165,8 +165,11 @@ TOOLS: dict[str, ToolSpec] = {
             "min_periods": [0, 2, 5, 10],
         },
         fixed={"thresh": 5.0, "window": "12h"},
-        note="thresh is in data units — scale it to the series' own spread. Tune on "
-        "EVENT recall: it marks the transition, not the whole shifted window.",
+        note="thresh is in data units and does NOT scale with the series' value spread "
+        "(§7.6): the workable threshold is 33x the robust sigma on 02054550 and 1.4x on "
+        "040851385. It scales with the series' own window-mean-difference distribution, "
+        "which context.jump_scale measures. Tune on EVENT recall: it marks the "
+        "transition, not the whole shifted window.",
         tolerance=8,
     ),
     "impute_rolling": ToolSpec(

@@ -167,15 +167,26 @@ def inspect_dataset(qc: saqc.SaQC, field: str = "value") -> dict:
     # on 01467200_l1. Making this a returned measurement rather than a prompt
     # instruction is deliberate: the agent had per-point noise_ratio in every
     # describe_points row already and did not act on it.
-    noise = context.noise_profile(df.set_index(DATETIME_COL)[field])
+    series = df.set_index(DATETIME_COL)[field]
+    noise = context.noise_profile(series)
+    # What counts as a big step IN THIS RECORD, for flag_jumps.thresh (§7.6).
+    # thresh is in data units and nothing else the summary reports can size it:
+    # the p99 of the 3h jump statistic is 2.9 x the value MAD on 01467200 and
+    # 1.4 x on 040851385, but 33 x on 02054550. A run that sized it
+    # from `std` instead set thresh at roughly the 60th percentile of ordinary
+    # window-to-window movement, got 2,865 flags, and blanket-kept all of them.
+    jumps = context.jump_scale(series)
     return {
         "tool": "inspect_dataset",
         "params": {"field": field},
         "n_rows": summary.n_rows,
-        "message": "Dataset inspected. " + noise.get("message", ""),
+        "message": (
+            "Dataset inspected. " + noise.get("message", "") + " " + jumps.get("message", "")
+        ),
         "qc": qc,
         "summary": summary.to_dict(),
         "noise_profile": {k: v for k, v in noise.items() if k not in ("tool", "params")},
+        "jump_scale": {k: v for k, v in jumps.items() if k not in ("tool", "params")},
     }
 
 
@@ -796,11 +807,27 @@ def flag_zscore(qc: saqc.SaQC, field: str = "value", method='standard', window=N
     return _build_result("flag_zscore", params, qc, qc_out, field)
 
 
-def flag_jumps(qc: saqc.SaQC, field: str = "value", thresh=0.0, window=None) -> dict:
+def flag_jumps(qc: saqc.SaQC, field: str = "value", thresh=None, window=None) -> dict:
     """
     Flags permanent jumps in the data. For example, if the sensor is bumped into a different
     position and the readings suddenly jump up and stay there forever.
+
+    `thresh` is the minimum difference between the mean of the preceding `window` and the
+    mean of the following one, in data units. It has NO portable default -- the workable
+    value is 6.2 / 13.8 / 75.7 FNU on the three project gauges -- so it is required, and
+    `inspect_dataset`'s `jump_scale` block measures it for the series at hand (§7.6).
+    `thresh=0` flags every change point in the record and is rejected rather than run.
     """
+    if thresh is None or window is None:
+        raise ValueError(
+            "flag_jumps needs both thresh and window; take them from inspect_dataset's "
+            "jump_scale block (recommended_thresh / recommended_window)."
+        )
+    if thresh <= 0:
+        raise ValueError(
+            f"flag_jumps thresh must be > 0, got {thresh}: a non-positive threshold flags "
+            "every change point in the record."
+        )
     params = {"thresh": thresh, "window": window}
     qc_out = qc.flagJumps(field, thresh=thresh, window=window)
     return _build_result("flag_jumps", params, qc, qc_out, field)

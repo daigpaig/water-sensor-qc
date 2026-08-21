@@ -115,7 +115,7 @@ DATASET_NAME_RE = re.compile(r"^(?P<gauge>.+)_l(?P<level>[1-9]\d*)$")
 
 
 def dataset_dir(outdir: Path, name: str) -> Path:
-    """``data/injected`` + ``03447687_l2`` -> ``data/injected/03447687/l2``.
+    """``data/injected`` + ``02054550_l2`` -> ``data/injected/02054550/l2``.
 
     Raises ``ValueError`` on a name that is not ``<gauge>_l<level>`` rather than
     silently filing the dataset somewhere unfindable.
@@ -124,7 +124,7 @@ def dataset_dir(outdir: Path, name: str) -> Path:
     if m is None:
         raise ValueError(
             f"dataset name {name!r} is not '<gauge>_l<level>', so it cannot be "
-            "filed by gauge/level. Pass a name like '03447687_l2'."
+            "filed by gauge/level. Pass a name like '02054550_l2'."
         )
     return outdir / m["gauge"] / f"l{m['level']}"
 
@@ -204,8 +204,14 @@ PLACEMENT_MARGIN_ROWS = 4
 # this are real outages and do block placement.
 SPANNABLE_DROPOUT_ROWS = 2
 
-# Rolling window (in rows) for the local scale used to size magnitudes.
-LOCAL_SCALE_WINDOW_ROWS = 192  # 2 days at 15-min
+# Rolling window for the local scale used to size magnitudes. Expressed as a
+# DURATION, like every other window here, because it is a statement about how much
+# river history should inform an anomaly's size — two days of it — not about a
+# sample count. It was `LOCAL_SCALE_WINDOW_ROWS = 192  # 2 days at 15-min` until
+# 2026-08-18; when the bases moved to a 5-minute step that same 192 rows silently
+# became 16 hours, shrinking the window the magnitudes are drawn against without
+# anything in the code or the manifest saying so.
+LOCAL_SCALE_WINDOW_HOURS = 48.0
 
 # The local scale is a rolling MAD, clamped to a band around the series' global
 # MAD. Both bounds matter: without the floor, a quiet stretch of a clear river
@@ -800,7 +806,9 @@ def inject_series(
     base = pd.to_numeric(df[value_col], errors="coerce").to_numpy(dtype=float)
     values = base.copy()
     natural_gaps = _natural_gap_mask(base)
-    scale = _local_scale(base, LOCAL_SCALE_WINDOW_ROWS)
+    scale = _local_scale(
+        base, _rows_per(pd.Timedelta(hours=LOCAL_SCALE_WINDOW_HOURS), step)
+    )
 
     # Only real outages block placement. Isolated dropouts stay unblocked so
     # segment anomalies can span them the way they do in reality; the per-type

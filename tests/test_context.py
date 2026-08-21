@@ -416,3 +416,65 @@ def test_describe_points_batches_a_hundred_by_default_and_clamps_beyond_the_ceil
     assert "max_points=300" in clamped["message"]
     assert "clamped from the 5000" in clamped["message"]
     assert clamped["params"]["max_points_requested"] == 5000
+
+
+# ---------------------------------------------------------------------------
+# jump_scale (§7.6) -- flag_jumps' threshold, measured on the series
+# ---------------------------------------------------------------------------
+def _stepped(n: int = 800, level: float = 10.0, step: float = 8.0) -> pd.Series:
+    """Calm baseline with one sustained step half way through."""
+    s = _calm(n, level=level)
+    s.iloc[n // 2:] += step
+    return s
+
+
+def test_jump_scale_reproduces_the_statistic_flagjumps_thresholds():
+    """The suggested thresh must be on the same axis as flagJumps' own decision.
+
+    A threshold set at the p99 of the measured statistic must therefore leave
+    roughly the top 1% of change points flagged -- far fewer than the series has
+    rows, which a threshold guessed in data units does not guarantee.
+    """
+    s = _stepped()
+    out = ctx.jump_scale(s)
+    assert out["recommended_window"] == ctx.JUMP_RECOMMENDED_WINDOW
+    thresh = out["recommended_thresh"]
+
+    qc = saqc.SaQC(pd.DataFrame({"value": s}))
+    flagged = qc.flagJumps("value", thresh=thresh, window=out["recommended_window"])
+    n = int((flagged.flags["value"] > 0).sum())
+    assert 0 < n < 0.05 * len(s), f"{n} flags on {len(s)} rows at the p99 threshold"
+
+
+def test_jump_scale_quantiles_are_ordered_and_finite():
+    out = ctx.jump_scale(_stepped())
+    for window, block in out["by_window"].items():
+        assert block["p50"] <= block["p90"] <= block["p99"] <= block["p99_9"], window
+        assert block["suggested_thresh"] > 0, window
+
+
+def test_jump_scale_scales_with_the_series_not_with_a_constant():
+    """The whole point of the block: the same shape at 100x the scale gives 100x thresh.
+
+    A fixed "1-5 FNU" suggestion cannot do this, which is why a run set thresh at
+    roughly the 60th percentile of ordinary movement and flagged 2,865 rows.
+    """
+    small = ctx.jump_scale(_stepped(level=10.0, step=8.0))["recommended_thresh"]
+    large = ctx.jump_scale(_stepped(level=1000.0, step=800.0))["recommended_thresh"]
+    assert large > 10 * small
+
+
+def test_jump_scale_observes_only():
+    """No flags, no mutation -- it is a measurement (§7.3)."""
+    qc = saqc.SaQC(pd.DataFrame({"value": _stepped()}))
+    before = qc.flags["value"].copy()
+    out = ctx.jump_scale(qc)
+    assert "qc" not in out
+    pd.testing.assert_series_equal(before, qc.flags["value"])
+
+
+def test_jump_scale_survives_a_constant_series():
+    flat = pd.Series(5.0, index=_index(200))
+    out = ctx.jump_scale(flat)
+    assert out["recommended_thresh"] in (None, 0.0)
+    assert "message" in out

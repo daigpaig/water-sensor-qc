@@ -245,6 +245,39 @@ def build_payload(series: pd.Series, cases: list[dict], title: str,
     values = [None if not np.isfinite(v) else round(float(v), 3)
               for v in series.to_numpy()]
 
+    # Intern the explanations. Every case carried its own full copy, and the text is
+    # overwhelmingly shared: the agent writes ~70 distinct reasons and they are stamped
+    # onto every row a decision span covers, so a 13,897-case page serialised the same
+    # paragraphs thousands of times and reached 56 MB. Cases now hold an index into a
+    # table of distinct explanations.
+    explain_table: list[dict] = []
+    explain_index: dict[str, int] = {}
+    # The agent's own words are interned too, and for the same reason: `reason`,
+    # `rationale` and `deliberation` are span-level text stamped onto every row the
+    # span covers, so a single 4,597-row span stored one paragraph 4,597 times.
+    words_table: list[dict] = []
+    words_index: dict[str, int] = {}
+    WORDS = ("reason", "rationale", "rationale_source", "deliberation")
+    for case in cases:
+        if "e" in case:      # idempotent: build_payload may be called twice on one list
+            continue
+        blob = json.dumps(case.pop("explain"), sort_keys=True)
+        idx = explain_index.get(blob)
+        if idx is None:
+            idx = len(explain_table)
+            explain_index[blob] = idx
+            explain_table.append(json.loads(blob))
+        case["e"] = idx
+
+        words = {k: case.pop(k, "") for k in WORDS}
+        wblob = json.dumps(words, sort_keys=True)
+        widx = words_index.get(wblob)
+        if widx is None:
+            widx = len(words_table)
+            words_index[wblob] = widx
+            words_table.append(words)
+        case["w"] = widx
+
     counts = {c: sum(1 for k in cases if k["category"] == c) for c in CATEGORIES}
     trace = trace if trace is not None else Trace()
     # Every point that is not a case has the identical story — no detector fired,
@@ -260,6 +293,8 @@ def build_payload(series: pd.Series, cases: list[dict], title: str,
     return {
         "title": title,
         "calls": call_table(trace),
+        "explanations": explain_table,
+        "words": words_table,
         "quiet": quiet,
         "epoch_ms": epoch_ms,
         "values": values,
@@ -515,6 +550,8 @@ const SRC_LABEL = {
 };
 
 function rationaleBlock(c) {
+  const w = D.words[c.w] || {};
+  c = Object.assign({}, c, w);          // resolve the interned text for this case
   const [colour, gloss] = SRC_LABEL[c.rationale_source] || ["#64748b", ""];
   let h = "";
   if (c.rationale_source) {
@@ -571,7 +608,7 @@ function setTab(t) { tab = t; draw(); }
 
 function renderPanel(at, c) {
   const row = (k, v) => `<div class="row"><div class="k">${k}</div><div>${v}</div></div>`;
-  const x = c ? c.explain : D.quiet;
+  const x = c ? D.explanations[c.e] : D.quiet;
   const tabs = `<div class="tabs">
       <div class="tab ${tab==="why"?"on":""}" onclick="setTab('why')">why this verdict</div>
       <div class="tab ${tab==="trace"?"on":""}" onclick="setTab('trace')">what the run did (${D.calls.length} steps)</div>

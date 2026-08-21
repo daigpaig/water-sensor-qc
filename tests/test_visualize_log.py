@@ -212,6 +212,98 @@ def test_build_payload_reads_ground_truth_labels(tmp_path):
     assert payload["truth"] == {"spike": [2, 3], "gap": [5]}
 
 
+# --------------------------------------------------------------------------- verdicts
+def _flag_log(tmp_path: Path, entries: list[dict]) -> Path:
+    path = tmp_path / "gauge_l1_flags.json"
+    path.write_text(json.dumps(entries))
+    return path
+
+
+def test_parse_run_finds_the_flag_log_the_run_recorded(tmp_path):
+    """The verdicts live in a separate artefact; the log says where."""
+    events = _two_step_events(True) + [
+        {"event": "run_summary", "steps": 2, "flags_path": "data/agent_runs/gauge_l1_flags.json"}
+    ]
+    run = vl.parse_run(events, tmp_path / "run_x.jsonl")
+    assert run.flags_path == "data/agent_runs/gauge_l1_flags.json"
+
+    # A run that never exported has no verdicts to show, and must say so rather
+    # than silently drawing an empty layer.
+    assert vl.parse_run(_two_step_events(True), tmp_path / "run_x.jsonl").flags_path is None
+
+
+def test_verdict_layer_keys_anomalies_by_the_agents_own_type(tmp_path):
+    """§5.1: the type scored is the agent's classification, so it drives the colour."""
+    series_path = _series_csv(tmp_path)
+    series = vl.load_series(series_path)
+    index = pd.DatetimeIndex(series.index)
+
+    layer = vl._verdict_layer(index, [
+        {"datetime": "2024-01-01T00:30:00", "verdict": "anomaly", "anomaly_type": "spike",
+         "action": "delete", "reason": "narrow, high z", "flagged_by": "flagUniLOF"},
+        {"datetime": "2024-01-01T01:00:00", "verdict": "normal", "action": "keep",
+         "reason": "storm limb"},
+        {"datetime": "2024-01-01T01:15:00", "verdict": "undecided", "action": "undecided",
+         "reason": ""},
+        {"datetime": "2024-01-01T01:30:00", "verdict": "anomaly", "anomaly_type": "gap",
+         "action": "impute", "reason": "short gap"},
+    ])
+
+    assert set(layer) == {"anomaly:spike", "normal", "undecided", "anomaly:gap"}
+    assert layer["anomaly:spike"][0]["i"] == 2
+    assert layer["anomaly:spike"][0]["a"] == "delete"
+    assert layer["anomaly:spike"][0]["by"] == "flagUniLOF"
+    # undecided must NOT be folded into normal: one is a judgement, the other is
+    # a row nobody looked at, and §10 needs them distinguishable.
+    assert layer["undecided"][0]["i"] == 5
+
+
+def test_verdict_layer_drops_timestamps_outside_the_series(tmp_path):
+    """A flag log paired with the wrong series must not invent row positions."""
+    series = vl.load_series(_series_csv(tmp_path))
+    layer = vl._verdict_layer(pd.DatetimeIndex(series.index), [
+        {"datetime": "1999-01-01T00:00:00", "verdict": "anomaly", "anomaly_type": "spike"},
+        {"datetime": "2024-01-01T00:30:00", "verdict": "anomaly", "anomaly_type": "spike"},
+    ])
+    assert layer == {"anomaly:spike": [{"i": 2, "a": "", "t": "spike", "by": "", "src": "", "r": ""}]}
+
+
+def test_build_payload_carries_the_verdict_layer(tmp_path):
+    series_path = _series_csv(tmp_path)
+    run = vl.parse_run(_two_step_events(True), tmp_path / "run_x.jsonl")
+    entries = [{"datetime": "2024-01-01T00:30:00", "verdict": "anomaly",
+                "anomaly_type": "spike", "action": "delete", "reason": "x"}]
+
+    payload = vl.build_payload(
+        run, vl.load_series(series_path), series_path, None, entries
+    )
+    assert payload["verdicts"]["anomaly:spike"][0]["i"] == 2
+
+    # No flag log at all -> an empty layer, and the page turns the toggle off.
+    bare = vl.build_payload(run, vl.load_series(series_path), series_path)
+    assert bare["verdicts"] == {}
+
+
+def test_resolve_flags_path_prefers_the_explicit_override(tmp_path):
+    run = vl.parse_run(_two_step_events(True), tmp_path / "run_x.jsonl")
+    explicit = _flag_log(tmp_path, [{"datetime": "2024-01-01T00:30:00", "verdict": "normal"}])
+
+    assert vl.resolve_flags_path(run, explicit) == explicit
+    with pytest.raises(FileNotFoundError):
+        vl.resolve_flags_path(run, tmp_path / "nope.json")
+    # Recorded but since moved: not an error, just no layer.
+    run.flags_path = str(tmp_path / "gone.json")
+    assert vl.resolve_flags_path(run, None) is None
+
+
+def test_load_flag_log_rejects_a_non_list(tmp_path):
+    """An empty verdict layer reads as 'the agent concluded nothing' — fail loudly."""
+    bad = tmp_path / "bad_flags.json"
+    bad.write_text(json.dumps({"datetime": "2024-01-01T00:30:00"}))
+    with pytest.raises(ValueError, match="not a §5 flag log"):
+        vl.load_flag_log(bad)
+
+
 def test_autodetect_needs_more_than_row_count(tmp_path):
     """Every injected dataset shares a row count and time range, so the mean and
     NaN count are what actually identify one. A wrong match is worse than none."""

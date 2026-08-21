@@ -13,6 +13,10 @@ env/
 data/raw/**
 # Provisional-vs-approved comparison pulls (regenerate: `python -m src.datasets.pull_comparison`)
 data/comparison/**
+# Legacy 15-min raw pulls, retired when the project moved to 5-min bases.
+# Same rule as data/raw/: the CSVs are regenerable from NWIS, the injected
+# datasets beside them are hand-generated ground truth and stay tracked.
+data/legacy_15min/raw/**
 logs/*
 
 # Keep the gitignored directories in the tree
@@ -45,3 +49,10 @@ __pycache__/
 # Agent run artefacts (cleaned CSV + report). Regenerable by re-running the
 # agent; the JSONL log they came from is gitignored above.
 data/agent_runs/
+
+# 5-min gauge screening scratch (scratchpad/screen_5min_*.py). The national
+# series-catalog dump (~230MB) and the per-site probe cache (~255MB) are
+# regenerable from NWIS; the small screening RESULT tables beside them are not
+# ignored, since they are the evidence for the §9 gauge choice.
+scratchpad/out/screen_5min_catalog.csv
+scratchpad/out/probe5/

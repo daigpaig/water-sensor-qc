@@ -478,15 +478,24 @@ _FLAG_JUMPS = {
     "description": (
         "Detects permanent level shifts: a sudden step-change where the sensor jumps to a "
         "new level and stays there (e.g. sensor physically displaced, bad recalibration, "
-        "sediment accumulation). "
-        "WARNING — this tool is an aid, not a reliable classifier (§7.2). There are only ~3 "
-        "level_shift episodes per dataset, and flag_jumps also fires on sharp storm limbs and "
-        "recovery ramps. Treat its flags as 'look here' signals; the agent must reason about "
-        "context before deciding to delete or keep each flagged segment. "
-        "Practical range for thresh: 1–5 NTU (default 2). "
-        "Increase thresh to cut false positives from storm ramps. "
-        "Decrease thresh to catch small but genuine level shifts. "
-        "window is required — use 1h–6h."
+        "sediment accumulation). It compares the MEAN of the window before each point with "
+        "the MEAN of the window after it, and flags where they differ by more than thresh. "
+        "SET thresh FROM inspect_dataset's jump_scale BLOCK — it measures that exact "
+        "difference on this record and reports its percentiles. Use "
+        "jump_scale.recommended_thresh with jump_scale.recommended_window. Do NOT set thresh "
+        "from the mean, the std, or a remembered NTU figure: measured on the three project "
+        "gauges, the workable threshold is 6.2, 13.8 and 75.7 NTU, and the last of those is "
+        "33x that gauge's robust sigma. A run that set thresh=2-3 NTU flagged 2,865 rows "
+        "across two years — every storm limb in the record — and could conclude nothing "
+        "from them. "
+        "WARNING — even correctly tuned, this tool is an aid, not a reliable classifier "
+        "(§7.2, §7.6). There are only ~1-3 level_shift episodes per dataset, and flag_jumps still "
+        "fires on sharp storm limbs and recovery ramps. At the recommended threshold expect "
+        "~150 candidates over a two-year record, of which a handful at most are real. Treat "
+        "its flags as 'look here' signals and triage them with describe_points / "
+        "level_shift_context (step_sharpness is the discriminator) before deciding. "
+        "Raise thresh to jump_scale's p99_9 if there are more candidates than you can "
+        "triage; lower it only if the result is empty."
     ),
     "input_schema": {
         "type": "object",
@@ -499,16 +508,21 @@ _FLAG_JUMPS = {
             "thresh": {
                 "type": "number",
                 "description": (
-                    "Minimum absolute step size (in data units) to flag as a jump. "
-                    "Practical range: 1–5 NTU for turbidity. Default 2."
+                    "Minimum difference between the mean of the preceding window and the mean "
+                    "of the following window, in data units, to flag as a jump. There is no "
+                    "portable default: take inspect_dataset's jump_scale.recommended_thresh "
+                    "(the p99 of this series' own window-mean difference). Across the project "
+                    "gauges that value is 6.2 / 13.8 / 75.7 NTU — a fixed number cannot serve "
+                    "all three."
                 ),
-                "default": 2.0,
             },
             "window": {
                 "type": ["string", "null"],
                 "description": (
-                    "Look-back/look-forward window as a pandas offset string, e.g. '1h', '3h'. "
-                    "Required — do not leave null."
+                    "Look-back/look-forward window as a pandas offset string. Required — do "
+                    "not leave null. Use jump_scale.recommended_window ('6h'), and take thresh "
+                    "from the SAME window's entry in jump_scale.by_window: the statistic is "
+                    "window-dependent, so a threshold measured at 3h is wrong at 12h."
                 ),
                 "default": None,
             },

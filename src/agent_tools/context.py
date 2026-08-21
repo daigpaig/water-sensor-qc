@@ -1573,6 +1573,108 @@ def noise_profile(
     }
 
 
+# --- flag_jumps' own scale (§7.6) -------------------------------------------
+# The windows offered to the agent. All four are cheap (three rolling means over
+# the record), so the block reports every one and lets the agent choose.
+JUMP_WINDOWS = ("1h", "3h", "6h", "12h")
+
+# The tuned defaults. `thresh` at the p99 of the series' OWN jump statistic, at a
+# 6h window, is the measured knee: 13/14 injected level_shift events on 01467200
+# for 134 candidates, and 131-162 candidates on every one of the nine datasets --
+# a stable budget, which no multiple of any static summary stat gives.
+JUMP_THRESH_QUANTILE = 0.99
+JUMP_RECOMMENDED_WINDOW = "6h"
+
+
+def _jump_statistic(series: pd.Series, window: str) -> np.ndarray:
+    """``|mean(previous window) - mean(next window)|`` at every timestamp.
+
+    This is exactly what ``flagJumps`` thresholds (SaQC 2.8
+    ``breaks.flagJumps`` -> ``_getChangePoints`` with
+    ``stat_func=|mean(x) - mean(y)|``), reproduced here so a threshold can be
+    quoted as a quantile of the series' own distribution rather than guessed in
+    data units. Backward window closed on the right, forward window open on the
+    left, matching SaQC's split.
+    """
+    s = series.dropna()
+    if len(s) < 2:
+        return np.array([], dtype=float)
+    bwd = s.rolling(window, min_periods=1).mean()
+    fwd = s[::-1].rolling(window, min_periods=1, closed="left").mean()[::-1]
+    return np.abs(bwd.to_numpy() - fwd.to_numpy())
+
+
+def jump_scale(
+    source,
+    field: str = VALUE_COL,
+    windows: tuple[str, ...] = JUMP_WINDOWS,
+    quantile: float = JUMP_THRESH_QUANTILE,
+) -> dict:
+    """How big is a *big* step in THIS record? -- flag_jumps' threshold, measured.
+
+    ``flag_jumps.thresh`` is in data units, and the run has no way to guess a
+    workable one. The old guidance ("1-5 FNU, scale it to the series") failed in
+    its unit, not merely its value: measured across the three 5-min gauges, the
+    p99 of the 3h jump statistic is 2.9 x the value MAD on 01467200 and 1.4 x on
+    040851385, but 33 x on 02054550, whose median is 1.9 FNU and whose storms
+    swing hundreds of FNU. A run that
+    reasoned "3.0 FNU is only 0.57 std" therefore set thresh at roughly the 60th
+    percentile of ordinary window-to-window movement, got 2,865 flags across two
+    years, correctly concluded they were storm limbs, and blanket-kept the lot --
+    which is how a dataset with three injected level shifts scores zero recall.
+
+    The fix is to measure the statistic flagJumps actually thresholds and quote a
+    quantile of it, because that is the only normaliser on the same axis as the
+    decision. At p99 the candidate count is 131-162 on every one of the nine
+    injected datasets; at a fixed multiple of the value MAD the same setting
+    ranges 58 to 4,054. ``scratchpad/tune_jumps_knee.py`` reproduces the sweep.
+
+    Observes only -- no flags, no mutation.
+    """
+    series = as_series(source, field).dropna()
+    params = {"field": field, "windows": list(windows), "quantile": quantile}
+    if len(series) < 3:
+        return {"tool": "jump_scale", "params": params, "by_window": {},
+                "message": "Series too short to measure a jump scale."}
+
+    by_window: dict[str, dict] = {}
+    for window in windows:
+        stat = _jump_statistic(series, window)
+        if stat.size == 0 or not np.isfinite(stat).any():
+            continue
+        by_window[window] = {
+            "p50": _round(float(np.nanquantile(stat, 0.50)), 3),
+            "p90": _round(float(np.nanquantile(stat, 0.90)), 3),
+            "p99": _round(float(np.nanquantile(stat, 0.99)), 3),
+            "p99_9": _round(float(np.nanquantile(stat, 0.999)), 3),
+            "suggested_thresh": _round(float(np.nanquantile(stat, quantile)), 3),
+        }
+
+    rec_window = JUMP_RECOMMENDED_WINDOW if JUMP_RECOMMENDED_WINDOW in by_window else (
+        next(iter(by_window), None)
+    )
+    rec_thresh = by_window[rec_window]["suggested_thresh"] if rec_window else None
+
+    msg = (
+        f"flag_jumps scale measured on this record. Start at thresh={rec_thresh}, "
+        f"window='{rec_window}' -- the p{quantile * 100:g} of this series' own "
+        "window-to-window mean difference. Do NOT set thresh from the mean or std: "
+        "a threshold below this leaves thousands of ordinary storm limbs flagged and "
+        "tells you nothing. If the result is still more candidates than you can "
+        "triage, step up to the p99_9 value for that window rather than guessing."
+    ) if rec_thresh is not None else "Jump scale is degenerate (constant series)."
+
+    return {
+        "tool": "jump_scale",
+        "params": params,
+        "statistic": "abs(mean(previous window) - mean(next window)) -- what flagJumps thresholds",
+        "by_window": by_window,
+        "recommended_window": rec_window,
+        "recommended_thresh": rec_thresh,
+        "message": msg,
+    }
+
+
 def describe_points(
     source,
     ats,

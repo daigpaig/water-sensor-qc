@@ -1,6 +1,7 @@
 """Pull continuous, USGS-**approved** turbidity time series from NWIS.
 
-Downloads instantaneous-value ("iv", sub-hourly / 15-min) turbidity for one or
+Downloads instantaneous-value ("iv", sub-hourly — the project bases are 5-min)
+turbidity for one or
 more stream gauges via the ``dataretrieval`` package and writes one tidy CSV per
 site to ``data/raw/approved/`` (gitignored per CLAUDE.md §4).
 
@@ -45,8 +46,7 @@ CLI
     # See what would be pulled, but download nothing:
     python -m src.datasets.pull_usgs --dry-run
 
-    # Pull the default 3-gauge, 2-year set (each verified to hold a >=90-day
-    # unbroken stretch at gaps <= 3h):
+    # Pull the default 3-gauge, 2-year, 5-minute set:
     python -m src.datasets.pull_usgs
 
     # Custom sites / window:
@@ -72,29 +72,41 @@ import pandas as pd
 
 # ---------------------------------------------------------------------------
 # Defaults (recommended gauges — see the discovery/verification notes).
-# Every default gauge over the default window is 100% USGS-APPROVED, samples at a
-# consistent 15-min step, is >=95% complete, AND has a CALM approved baseline —
-# very few real spikes in the base itself (all verified). "Approved" corrects
-# fouling/drift and deletes clearly-bad data but KEEPS real storm spikes, so a
-# flashy river's approved record is still spiky; unlabelled base spikes would score
-# as false positives (§9.1), hence the calm-baseline requirement. Regime spread
-# (moderate / high):
-#   03447687  French Broad R nr Fletcher, NC  -> S. Appalachia; moderate regime
-#                                                 (median ~8 FNU); ~95% complete;
-#                                                 ~25 base spikes (0.04%).
-#   02198840  Savannah R at I-95 nr Port Wentworth, GA -> tidal river; moderate-high
-#                                                 (median ~13 FNU, ~9x range);
-#                                                 ~99% complete; 0 base spikes.
-#   08041770  LNVA Canal at Beaumont, TX       -> managed canal; high regime
-#                                                 (median ~28 FNU, ~5x range);
-#                                                 ~99% complete; ~1 base spike.
-# Replaced 02203603 (South R, Atlanta) and 02198955 (Middle R, tidal): 100%
-# approved, 15-min, dense, but too FLASHY — 120 (0.18%) and 637 (0.91%) real spikes
-# in the base. Earlier retired: 12340500 (Blackfoot, 35% missing), 06818000
-# (Missouri, 14% missing), 11501000 (Sprague, mostly provisional).
+# Every default gauge over the default window samples at a consistent **5-minute**
+# step, is 100% USGS-APPROVED, is >=95% complete, AND has a CALM approved baseline.
+# "Approved" corrects fouling/drift and deletes clearly-bad data but KEEPS real
+# storm spikes, so a flashy river's approved record is still spiky; unlabelled base
+# spikes would score as false positives (§9.1), hence the calm-baseline requirement.
+#
+# The 5-min requirement is a hard filter on a small pool: of 1,737 turbidity (63680)
+# instantaneous series nationwide, only 57 sample at <=5 min, and only 13 of those
+# also clear approval + completeness + a 2-year span (scratchpad/screen_5min_*.py).
+# Regime spread (low / moderate / high), with base-spike share measured identically
+# for all candidates via flagUniLOF(n=20, thresh=1.5):
+#   02054550   Roanoke R at Salem, VA        -> Blue Ridge Appalachian headwater;
+#                                               LOW regime (median ~1.9 FNU);
+#                                               96.0% complete; 0.31% base spikes.
+#   01467200   Delaware R at Penn's Landing, PA -> Mid-Atlantic tidal urban estuary;
+#                                               MODERATE (median ~6.5 FNU);
+#                                               96.6% complete; 0.10% base spikes.
+#   040851385  Fox R at Green Bay, WI        -> Great Lakes river mouth; HIGH
+#                                               (median ~11.3 FNU); 95.4% complete;
+#                                               0.41% base spikes.
+# All three hold a 5-min modal step in every one of the 25 months in the window
+# (>=98.7% of steps), so re-gridding cannot manufacture phantom gaps (§9.1).
+#
+# Retired 2026-08-18 when the project moved to 5-min data; the 15-min series and the
+# datasets injected into them are kept under data/legacy_15min/ (see its README):
+#   03447687 French Broad R, NC (~8 FNU) | 02198840 Savannah R, GA (~13 FNU)
+#   08041770 LNVA Canal, TX (~28 FNU).
+# Note the 5-min pool tops out near ~12 FNU median: no gauge sampling at <=5 min
+# clears the §9 gates with a median above that, so the new spread is low->moderate
+# rather than the retired set's moderate->high.
+# Earlier retired: 02203603 / 02198955 (too flashy), 12340500 (35% missing),
+# 06818000 (14% missing), 11501000 (mostly provisional).
 # ---------------------------------------------------------------------------
 TURBIDITY_PARAM = "63680"
-DEFAULT_SITES: tuple[str, ...] = ("03447687", "02198840", "08041770")
+DEFAULT_SITES: tuple[str, ...] = ("02054550", "01467200", "040851385")
 DEFAULT_START = "2023-07-01"
 DEFAULT_END = "2025-07-01"
 # Approval status partitions data/raw: approved/ is what src.datasets.inject globs as its
@@ -108,7 +120,7 @@ DEFAULT_UNAPPROVED_OUTDIR = Path("data/raw/provisional")
 APPROVED_PREFIX = "A"
 
 # "Unbroken-stretch" reporting defaults. A stretch stays "unbroken" as long as no
-# internal gap exceeds `max_gap`, so a few scattered 15-min dropouts don't break
+# internal gap exceeds `max_gap`, so a few scattered single-sample dropouts don't break
 # an otherwise continuous span. This is now an informational gauge-quality report
 # (we inject into the whole approved series), not a carving step.
 DEFAULT_MAX_GAP = "3h"

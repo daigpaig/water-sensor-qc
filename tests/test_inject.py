@@ -416,14 +416,15 @@ def test_local_scale_is_bounded_by_the_global_scale() -> None:
     from src.datasets.inject import (
         LOCAL_SCALE_CAP_K,
         LOCAL_SCALE_FLOOR_K,
-        LOCAL_SCALE_WINDOW_ROWS,
+        LOCAL_SCALE_WINDOW_HOURS,
         _local_scale,
         _robust_scale,
     )
 
     values = np.abs(np.random.default_rng(0).normal(10.0, 2.0, 5000))
     values[2000:2100] += 500.0  # a storm
-    scale = _local_scale(values, LOCAL_SCALE_WINDOW_ROWS)
+    # 15-min rows here, so the 48-hour window is 192 samples.
+    scale = _local_scale(values, int(LOCAL_SCALE_WINDOW_HOURS * 60 / 15))
     g = _robust_scale(values)
 
     assert np.isfinite(scale).all()

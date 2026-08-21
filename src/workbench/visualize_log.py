@@ -26,7 +26,14 @@ What each iteration shows:
 * the ``message`` the tool returned (which carries caveats nothing else reports),
 * its flagged timestamps, drawn as rings over the series,
 * every flag from earlier iterations, in grey rings, so you can see what is new,
-* optionally the §5 ground-truth labels, so you can see what it *should* have hit.
+* optionally the §5 ground-truth labels, so you can see what it *should* have hit,
+* optionally the run's FINAL VERDICT per row, read from the §5 flag log.
+
+A flag and a verdict are different claims and the page keeps them apart. A flag says
+a detector fired; the verdict is what the run concluded about that row after looking
+at it, and §10 scores the verdict alone. They are drawn as separate layers for that
+reason — the interesting rows are the ones where they disagree, and a page that drew
+only flags could not show a run that flagged 2,595 rows and concluded nothing.
 
 Truth and action are kept in separate visual channels: **truth is a solid dot**,
 coloured by anomaly type, and **a flag is a hollow ring** in a colour no type
@@ -36,7 +43,7 @@ in a ring, bare dot, bare ring. Gaps carry no value to plot at, so gap labels an
 than silently vanishing.
 
 Keys: ``<-``/``->`` (or ``J``/``K``) step, ``C`` cumulative flags, ``G`` ground
-truth, ``Z`` zoom to this step's flags, ``R`` whole series.
+truth, ``V`` final verdicts, ``Z`` zoom to this step's flags, ``R`` whole series.
 
 CLI
 ---
@@ -45,7 +52,7 @@ CLI
 
     # a specific log and series
     python -m src.workbench.visualize_log logs/run_20260731_133616.jsonl \
-        --series data/injected/03447687/l1/03447687_l1.csv
+        --series data/injected/02054550/l1/02054550_l1.csv
 
 The log does not record which dataset was run, so the series is matched by row
 count and time range against ``data/injected`` when ``--series`` is omitted; pass
@@ -141,6 +148,14 @@ class RunLog:
     steps: list[Step]
     max_steps_reached: bool
     summary: dict | None  # the inspect_dataset summary, if the run called it
+    # Where export_clean_data wrote the §5 flag log, read from the run_summary
+    # event. The verdicts are NOT in this JSONL: the log records the `decisions`
+    # SPANS the agent passed, but §5 resolves those per row (narrowest span wins,
+    # uncovered rows become `undecided`), and that resolution happens inside
+    # export_clean_data. Re-deriving it here would be a second implementation of
+    # the rule that could disagree with the artefact, so the page reads the
+    # artefact instead. None if the run never exported.
+    flags_path: str | None = None
 
 
 def load_events(path: Path) -> list[dict]:
@@ -311,6 +326,11 @@ def parse_run(events: list[dict], path: Path) -> RunLog:
                 summary = call.extra["summary"]
                 break
 
+    flags_path = None
+    for event in events:
+        if event.get("event") == "run_summary" and event.get("flags_path"):
+            flags_path = str(event["flags_path"])
+
     return RunLog(
         path=path,
         prompt_version=prompt_version,
@@ -318,6 +338,7 @@ def parse_run(events: list[dict], path: Path) -> RunLog:
         steps=steps,
         max_steps_reached=any(e.get("event") == "max_steps_reached" for e in events),
         summary=summary,
+        flags_path=flags_path,
     )
 
 
@@ -327,6 +348,20 @@ def load_series(path: Path) -> pd.Series:
     df = pd.read_csv(path, parse_dates=[DATETIME_COL])
     series = df.set_index(DATETIME_COL)[VALUE_COL].sort_index()
     return series
+
+
+def load_flag_log(path: Path) -> list[dict]:
+    """Load a §5 flag log (``*_flags.json``): one entry per flagged row.
+
+    Returns the entries as written. Raises if the file is not a list, because a
+    silently-empty verdict layer is worse than a loud failure — the whole point
+    of the layer is to show what the run concluded, and an empty one reads as
+    "the agent decided nothing", which is a real and different outcome (§5).
+    """
+    entries = json.loads(path.read_text())
+    if not isinstance(entries, list):
+        raise ValueError(f"{path} is not a §5 flag log (expected a list of entries).")
+    return entries
 
 
 def load_labels(series_path: Path) -> pd.DataFrame | None:
@@ -421,11 +456,57 @@ def _grid(index: pd.DatetimeIndex) -> tuple[int, int, bool]:
     return t0, step, bool(step > 0 and np.all(deltas == step))
 
 
+def _verdict_layer(index: pd.DatetimeIndex, entries: list[dict]) -> dict:
+    """Group §5 flag-log entries into the page's verdict layer.
+
+    Keyed by the category the page draws: ``anomaly:<type>`` for a row the agent
+    called faulty (so the marker can take the same colour the truth dot uses for
+    that type, and a mis-classification shows up as two colours on one point),
+    plus ``normal`` and ``undecided``.
+
+    `undecided` is kept as its own category rather than folded into `normal`,
+    because §5 is explicit that they are not the same thing: one is a judgement,
+    the other is a row nobody looked at, and a page that drew them alike would
+    hide exactly the failure the field was added to expose.
+    """
+    by_stamp: dict[str, dict] = {}
+    for entry in entries:
+        stamp = entry.get("datetime")
+        if stamp:
+            by_stamp[str(stamp)] = entry
+
+    positions = index.get_indexer(pd.DatetimeIndex(pd.to_datetime(
+        pd.Series(list(by_stamp)), errors="coerce"
+    ).dropna()))
+
+    layer: dict[str, list[dict]] = {}
+    for stamp, pos in zip(by_stamp, positions):
+        if pos < 0:
+            continue                       # a log written against a different series
+        entry = by_stamp[stamp]
+        verdict = str(entry.get("verdict") or "undecided")
+        atype = str(entry.get("anomaly_type") or "")
+        key = f"anomaly:{atype or 'untyped'}" if verdict == "anomaly" else verdict
+        layer.setdefault(key, []).append({
+            "i": int(pos),
+            "a": str(entry.get("action") or ""),
+            "t": atype,
+            "by": str(entry.get("flagged_by") or ""),
+            "src": str(entry.get("rationale_source") or ""),
+            # The reason is the only free text here and logs run to thousands of
+            # rows, so it is clipped: the panel is for orientation, and
+            # decision_audit.py is the tool for reading one decision in full.
+            "r": str(entry.get("reason") or "")[:180],
+        })
+    return layer
+
+
 def build_payload(
     run: RunLog,
     series: pd.Series,
     series_path: Path,
     labels: pd.DataFrame | None = None,
+    flag_entries: list[dict] | None = None,
 ) -> dict:
     """JSON payload embedded in the page."""
     index = pd.DatetimeIndex(series.index)
@@ -490,6 +571,8 @@ def build_payload(
         "steps": steps,
         "truth": truth,
         "truth_colors": {k: v for k, v in ANOMALY_COLORS.items()},
+        "verdicts": _verdict_layer(index, flag_entries) if flag_entries else {},
+        "flags_file": Path(run.flags_path).name if run.flags_path else None,
     }
 
 
@@ -513,12 +596,32 @@ def build_html(payload: dict) -> str:
     )
 
 
+def resolve_flags_path(run: RunLog, explicit: Path | None) -> Path | None:
+    """Find the §5 flag log for this run: ``--flags`` first, then the log's own record.
+
+    ``export_clean_data`` reports where it wrote, and ``agent.py`` puts that in the
+    ``run_summary`` event, so a run that exported can usually find its own verdicts
+    with no argument. The path is relative to the repo root as the run recorded it;
+    if the artefact has since moved, ``--flags`` is the override.
+    """
+    if explicit is not None:
+        if not explicit.exists():
+            raise FileNotFoundError(f"--flags {explicit} does not exist.")
+        return explicit
+    if not run.flags_path:
+        return None
+    candidate = Path(run.flags_path)
+    return candidate if candidate.exists() else None
+
+
 def visualize_log(
     log_path: Path,
     series_path: Path | None = None,
     outdir: Path = DEFAULT_OUTDIR,
     show_truth: bool = True,
     open_browser: bool = True,
+    flags_path: Path | None = None,
+    show_verdicts: bool = True,
 ) -> Path:
     """Build the replay page for one log file and return where it was written."""
     run = parse_run(load_events(log_path), log_path)
@@ -545,7 +648,21 @@ def visualize_log(
     if show_truth and labels is None:
         print(f"  no labels file beside {series_path.name} — ground truth layer omitted")
 
-    payload = build_payload(run, series, series_path, labels)
+    entries = None
+    if show_verdicts:
+        resolved = resolve_flags_path(run, flags_path)
+        if resolved is None:
+            print(
+                "  no flag log found — verdict layer omitted. "
+                + ("This run never called export_clean_data, so it recorded no verdicts."
+                   if not run.flags_path
+                   else f"The run wrote {run.flags_path}, which is no longer there; pass --flags.")
+            )
+        else:
+            entries = load_flag_log(resolved)
+            print(f"  verdicts from {resolved} ({len(entries)} decided row(s))")
+
+    payload = build_payload(run, series, series_path, labels, entries)
     outdir.mkdir(parents=True, exist_ok=True)
     out = outdir / f"{log_path.stem}.html"
     out.write_text(build_html(payload))
@@ -582,6 +699,15 @@ def main(argv: list[str] | None = None) -> int:
         "--no-truth", action="store_true",
         help="Skip the ground-truth label layer even if a labels file exists.",
     )
+    parser.add_argument(
+        "--flags", type=Path,
+        help="§5 flag log (*_flags.json) holding the run's per-row verdicts "
+             "(default: the path the run itself recorded in its run_summary).",
+    )
+    parser.add_argument(
+        "--no-verdicts", action="store_true",
+        help="Skip the final-verdict layer even if a flag log is available.",
+    )
     parser.add_argument("--no-open", action="store_true", help="Do not open a browser.")
     args = parser.parse_args(argv)
 
@@ -597,6 +723,8 @@ def main(argv: list[str] | None = None) -> int:
         outdir=args.outdir,
         show_truth=not args.no_truth,
         open_browser=not args.no_open,
+        flags_path=args.flags,
+        show_verdicts=not args.no_verdicts,
     )
     return 0
 
@@ -717,6 +845,8 @@ _TEMPLATE = r"""<!doctype html>
   <span class="warn" id="capwarn"></span>
 </header>
 
+<p class="meta" id="verdictbar" style="padding: 0 20px; margin: 6px 0 0"></p>
+
 <main>
   <div class="card" id="steps"></div>
   <div>
@@ -730,6 +860,7 @@ _TEMPLATE = r"""<!doctype html>
   <button data-nav="1">Next<kbd>&rarr;</kbd></button>
   <button id="cumulative" class="on">Earlier flags<kbd>C</kbd></button>
   <button id="truth">Ground truth<kbd>G</kbd></button>
+  <button id="verdicts">Final verdict<kbd>V</kbd></button>
   <button id="zoom">Zoom to flags<kbd>Z</kbd></button>
   <button id="reset">Whole series<kbd>R</kbd></button>
 </div>
@@ -753,8 +884,17 @@ _TEMPLATE = r"""<!doctype html>
   <b>Solid dots are the truth</b> (<code>G</code>) — the §5 injected labels, one colour per
   anomaly type. <b>Rings are what the agent flagged</b>: dark for this iteration, grey for
   earlier ones. So a coloured dot inside a dark ring was <b>caught</b>, a bare coloured dot
-  was <b>missed</b>, and a bare ring is a <b>false positive</b>. Green diamonds are
-  point-context probes. Points with no value of their own — gaps, and anything
+  was <b>missed</b>, and a bare ring is a <b>false positive</b>.
+  <b>Squares are the run's final verdict</b> (<code>V</code>) from the §5 flag log — what it
+  concluded, not what any one iteration flagged, so they do not change as you step. A square
+  is coloured by the type <em>the agent</em> assigned, from the same palette as the truth
+  dots: <b>same colour as the dot underneath = detected and classified correctly</b>, a
+  different colour = it found something real and called it the wrong thing (§5.1 scores the
+  agent's own <code>anomaly_type</code>). Sky-blue squares are rows it inspected and called
+  <b>real water</b>; amber squares are <b>undecided</b> — flagged and never judged, which §10
+  counts as no claim at all. Hover any square for its action and reason; use
+  <code>python -m src.workbench.decision_audit</code> to read one decision in full.
+  Green diamonds are point-context probes. Points with no value of their own — gaps, and anything
   <code>flag_nan</code> hit — are drawn as ticks along the bottom, since a NaN cannot be
   plotted at its own height. Built by
   <code>python -m src.workbench.visualize_log</code>.
@@ -805,6 +945,9 @@ _TEMPLATE = r"""<!doctype html>
   // agent flagged against what is actually there, and a layer you have to know
   // to switch on reads as "there is no ground truth".
   let showTruth = Object.keys(D.truth).length > 0;
+  // Same reasoning as showTruth: the run's own conclusion is the thing you came
+  // to look at, so it is on wherever a flag log was found.
+  let showVerdicts = Object.keys(D.verdicts).length > 0;
   let plotted = false;
 
   // ---------------------------------------------------------------- flag sets
@@ -839,6 +982,21 @@ _TEMPLATE = r"""<!doctype html>
   const FLAG_PAST = "#94a3b8";  // ring: flagged by an earlier iteration
   const CTX = "#15803d";        // point-context probe (no truth type is green)
 
+  // THIRD CHANNEL: the run's FINAL VERDICT per row, from the §5 flag log — what
+  // the agent concluded, as opposed to what any one iteration flagged. Drawn as
+  // an open SQUARE so it cannot be confused with a flag ring or a context
+  // diamond, and it is step-independent: a verdict is a property of the run, not
+  // of the iteration you happen to be looking at.
+  //
+  // An `anomaly` verdict takes the colour of the type the AGENT assigned, from
+  // the same palette the truth dots use. That is the point of the layer: where
+  // the square and the dot underneath it are the same colour the agent both
+  // detected and classified the row correctly, and where they differ it found
+  // something real and called it the wrong thing (§5.1 scores the agent's own
+  // anomaly_type, so this distinction is the metric, not a detail).
+  const VERDICT_NORMAL = "#0ea5e9";     // called real water — no truth type is sky
+  const VERDICT_UNDECIDED = "#f59e0b";  // flagged, never adjudicated (§5)
+
   // A gap's value is NaN by definition, so plotting it at its own y draws
   // nothing at all — every gap label and every flag_nan hit would be invisible.
   // Those points go to a rug pinned just above the x axis instead.
@@ -846,7 +1004,7 @@ _TEMPLATE = r"""<!doctype html>
   // layers stack above it, so a labelled gap and a flag on the same NaN row read
   // as two ticks rather than one tick hiding another. Kept clear of the axis
   // line — at 0.02 a size-9 tick is half-clipped by it and looks absent.
-  const RUG = { truth: 0.05, past: 0.10, now: 0.15 };
+  const RUG = { truth: 0.05, past: 0.10, now: 0.15, verdict: 0.22 };
 
   function split(idx, rugY) {
     const here = { x: [], y: [] }, missing = { x: [], y: [] };
@@ -888,6 +1046,58 @@ _TEMPLATE = r"""<!doctype html>
     return out;
   }
 
+  // The verdict layer needs PER-POINT hover (each row carries its own action and
+  // reason), which markerTraces cannot express — its hovertemplate is one fixed
+  // label for the whole trace. Hence a parallel builder rather than a parameter.
+  function verdictTraces(key, rows) {
+    const isAnomaly = key.indexOf("anomaly:") === 0;
+    const type = isAnomaly ? key.slice(8) : "";
+    const color = isAnomaly
+      ? (D.truth_colors[type] || "#0f172a")
+      : (key === "normal" ? VERDICT_NORMAL : VERDICT_UNDECIDED);
+    const name = isAnomaly ? "verdict: " + type : "verdict: " + key;
+
+    const here = { x: [], y: [], t: [] }, missing = { x: [], y: [], t: [] };
+    for (const r of rows) {
+      const v = D.values[r.i];
+      const detail = [
+        isAnomaly ? "verdict: anomaly (" + (r.t || "untyped") + ")" : "verdict: " + key,
+        r.a ? "action: " + r.a : "",
+        r.by ? "flagged by: " + r.by : "",
+        r.src ? "rationale: " + r.src : "",
+        r.r ? "&mdash; " + r.r : "",
+      ].filter(Boolean).join("<br>");
+      const bucket = v === null ? missing : here;
+      bucket.x.push(at(r.i));
+      bucket.y.push(v === null ? RUG.verdict : v);
+      bucket.t.push(detail);
+    }
+
+    const out = [];
+    if (here.x.length) {
+      out.push({
+        type: "scattergl", mode: "markers", name: name,
+        x: here.x, y: here.y, text: here.t,
+        marker: { size: 13, symbol: "square-open", color: color, line: { width: 2 } },
+        hovertemplate: "%{x}<br>%{y}<br>%{text}<extra></extra>",
+      });
+    }
+    if (missing.x.length) {
+      out.push({
+        type: "scattergl", mode: "markers",
+        name: here.x.length ? name + " (no value)" : name,
+        showlegend: here.x.length === 0,
+        x: missing.x, y: missing.y, text: missing.t, yaxis: "y2",
+        marker: {
+          symbol: "line-ns-open", size: 9, color: color,
+          line: { width: 1.8, color: color },
+        },
+        hovertemplate: "%{x}<br>%{text}<br>value missing<extra></extra>",
+      });
+    }
+    return out;
+  }
+
   function tracesFor(k) {
     const traces = [{
       type: "scattergl", mode: "lines", name: "series",
@@ -917,6 +1127,14 @@ _TEMPLATE = r"""<!doctype html>
       traces.push(...markerTraces(stepIdx[k], "flagged this step", {
         size: 16, symbol: "circle-open", color: FLAG_NOW, line: { width: 2.2 },
       }, "flagged this step", RUG.now));
+    }
+
+    // Verdicts last: they are the run's conclusion, so they read on top of both
+    // the truth they are judged against and the flags they were drawn from.
+    if (showVerdicts) {
+      for (const [key, rows] of Object.entries(D.verdicts)) {
+        traces.push(...verdictTraces(key, rows));
+      }
     }
 
     const ctx = stepCtx[k];
@@ -1147,6 +1365,11 @@ _TEMPLATE = r"""<!doctype html>
     $("truth").classList.toggle("on", showTruth);
     drawPlot();
   });
+  $("verdicts").addEventListener("click", () => {
+    showVerdicts = !showVerdicts;
+    $("verdicts").classList.toggle("on", showVerdicts);
+    drawPlot();
+  });
   $("zoom").addEventListener("click", zoomToFlags);
   $("reset").addEventListener("click", resetZoom);
 
@@ -1157,6 +1380,7 @@ _TEMPLATE = r"""<!doctype html>
     else if (k === "arrowleft" || k === "j") { select(sel - 1); ev.preventDefault(); }
     else if (k === "c") $("cumulative").click();
     else if (k === "g") $("truth").click();
+    else if (k === "v") $("verdicts").click();
     else if (k === "z") zoomToFlags();
     else if (k === "r") resetZoom();
   });
@@ -1174,6 +1398,27 @@ _TEMPLATE = r"""<!doctype html>
   if (D.max_steps_reached) $("capwarn").textContent = "hit the call cap";
   $("truth").disabled = !showTruth;
   $("truth").classList.toggle("on", showTruth);
+  $("verdicts").disabled = !showVerdicts;
+  $("verdicts").classList.toggle("on", showVerdicts);
+  if (showVerdicts) {
+    // Tally by category so the header states the run's answer in words. A run
+    // with `undecided` rows is the case worth surfacing loudest: those are rows
+    // it flagged and never adjudicated, which §10 scores as no claim at all.
+    const counts = {};
+    let total = 0;
+    for (const [key, rows] of Object.entries(D.verdicts)) {
+      counts[key] = rows.length;
+      total += rows.length;
+    }
+    const parts = Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, n]) => n + " " + k.replace("anomaly:", ""));
+    $("verdictbar").textContent =
+      total + " decided row(s) from " + (D.flags_file || "flag log") + ": " + parts.join(", ")
+      + (counts.undecided ? "  \u2014 undecided rows were flagged but never judged" : "");
+  } else {
+    $("verdictbar").textContent = "";
+  }
 
   buildList();
   select(0);  // draws both plots, so the handlers below have something to bind to

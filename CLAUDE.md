@@ -128,7 +128,11 @@ deployment, Docker, CI beyond a basic test run).
 │   ├── tune_noise_spare_rule.py # refits §7.4 for 5-min data, on gauges we don't score
 │   ├── probe_cache_ttl.py     # is `ttl` accepted on top-level cache_control? (§8)
 │   ├── probe_noise_reads_like.py # the §7.4 noisy-stretch guard's hit rates
-│   └── tune_zscore.py         # flagZScore min_residuals on quantised data (§7.1)
+│   ├── tune_zscore.py         # flagZScore min_residuals on quantised data (§7.1)
+│   ├── tune_jumps.py          # flag_jumps thresh as a multiple of the value MAD (§7.6)
+│   ├── tune_jumps_scale.py    # why no static summary stat can size that thresh (§7.6)
+│   ├── tune_jumps_quantile.py # thresh as a quantile of flagJumps' OWN statistic (§7.6)
+│   └── tune_jumps_knee.py     # the recall-vs-candidate knee that set the default (§7.6)
 └── logs/                 # JSONL API logs (gitignored)
 ```
 
@@ -348,7 +352,7 @@ Detection:
 | `flag_plateau`      | `flagPlateau`    | `min_length` **required by SaQC** (wrapper defaults `'1h'`), `max_length`, `min_jump`, `granularity` |
 | `flag_spike_unilof` | `flagUniLOF`     | `n=20`, `thresh=None`, `density='auto'`, `slope_correct=True`|
 | `flag_zscore`       | `flagZScore`     | `method='standard'\|'modified'`, `window`, `thresh=3`        |
-| `flag_jumps`        | `flagJumps`      | `thresh`, `window` — both required                           |
+| `flag_jumps`        | `flagJumps`      | `thresh`, `window` — both required, no defaults; take them from `inspect_dataset`'s `jump_scale` (§7.6) |
 | `flag_nan`          | `flagNAN`        | (field only)                                                 |
 
 Action: `impute_rolling` (`interpolateByRolling`; `window` required, `func='median'`,
@@ -497,7 +501,7 @@ recall).**
 | `flag_range` · `min`/`max` | `min=0`, `max` **1000–2000** | raise `max` if it clips real extremes | lower `max` only to catch a known over-range fault. *Physical gate, not a sensitivity knob.* |
 | `flag_constants` · `thresh` (`window` 3–12h) | **≤0.05** (0.01) | only if the noise sd is unusually large | keep small — `>0.5` swallows the series (§7.1). *≤0.05 robust on every gauge.* |
 | `flag_plateau` · `min_length` | **1–3h** (1h) | — | — *Crash-prone/data-dependent (§7.1); finds little. Wrap it; rely on `flag_constants`.* |
-| `flag_jumps` · `thresh` | **1–5** (2) | to cut false positives (precision stays ~1–5% regardless) | to catch all episodes at low thresh. *"Look here" aid only — can't be tuned reliably (~3 level_shift episodes/dataset; fires on storm limbs, §9.1).* |
+| `flag_jumps` · `thresh` | **`jump_scale.recommended_thresh`** from `inspect_dataset` — 6.2 / 13.8 / 75.7 FNU on the three gauges (§7.6) | to `p99_9` if there are more candidates than you can triage | only if the result is empty. *Never a raw number: the old "1–5" row is what produced a 2,865-flag run. "Look here" aid regardless (~1–3 level_shift episodes/dataset; fires on storm limbs, §9.1).* |
 | `impute_rolling` · `window` (`func='median'`) | **1–6h** (3h) | to fill longer gaps (↑coverage but ↑RMSE) | for accuracy on short gaps. *Beats linear only on the calmest gauge at 3h — open issue (§11).* |
 
 Data-unit thresholds (`flag_zscore`, `flag_constants`, `flag_jumps`) don't transfer between
@@ -692,8 +696,6 @@ wrong. Rules, as what they buy and cost:
   `rolling().apply(mad)` is O(n·w) in Python and takes seconds per call on a two-year 15-min
   series; this is ~10 ms, which is what makes 100 points in one `describe_points` call viable.
 
----
-
 ### 7.5 Spike precision: what actually moved it (2026-08-20)
 
 Spike precision was **0.227** — the run deleted 194 real readings for every 173 correct
@@ -722,6 +724,82 @@ of the weight: it relabels 34 FPs `noisy-stretch` and **0** true spikes. Plus th
 is untouched by either fix — it is the single largest macro-F1 drag (0.639 would be ~0.85
 without that zero) and remains open. And the surviving 67 FPs are not a coverage problem:
 they were measured, cited real numbers, and were still wrong.
+
+### 7.6 `flag_jumps.thresh` — the unit was wrong, not just the number (2026-08-20)
+
+**A run set `thresh=3.0` FNU on 01467200, got 2,865 flags spread evenly over two years,
+correctly read them as storm limbs, and blanket-`keep`ed every one** — so a dataset with
+three injected level shifts scored zero recall, and the flag log recorded the agent
+concluding there were no level shifts at all. Its stated reasoning was that 3.0 FNU "is
+only 0.57 std for this gauge (mean=7.72, std=5.23)". That reasoning is the bug, twice over.
+
+- **`std` is not the series' spread on a storm-driven river.** 02054550 reports std **28.1**
+  FNU against a median of **1.9** and a robust sigma of **1.3**, because a handful of storm
+  peaks reach 800. A threshold set at "half a std" there sits at twenty times the water's
+  ordinary movement. `inspect_dataset` now reports `median` and `robust_sigma` alongside
+  `mean`/`std` for exactly this, and §2 of the prompt tells the agent to scale from the
+  robust pair.
+- **But no static summary stat can size this parameter at all** — including the robust one.
+  `flagJumps` thresholds `|mean(previous window) − mean(next window)|`, and at a 3 h window
+  the p99 of that statistic is **2.9 × `robust_sigma`** on 01467200 and **1.4 ×** on
+  040851385 — but **33 ×** on 02054550. The gauge needing the *highest*
+  threshold is the one with the *lowest* median: Roanoke sits at 1.9 FNU and swings hundreds
+  in storms. A multiplier tuned on any one gauge is wrong by an order of magnitude on another.
+  (`scratchpad/tune_jumps.py`, `tune_jumps_scale.py`.)
+
+**The fix is to measure the statistic flagJumps actually thresholds and quote a quantile of
+it**, because that is the only normaliser on the same axis as the decision.
+`context.jump_scale` reproduces the statistic (`_getChangePoints` with
+`stat_func=|mean(x)−mean(y)|`; backward window closed right, forward open left) and reports
+its p50/p90/p99/p99.9 per window, plus `recommended_thresh` = **p99 at a 6 h window**.
+`inspect_dataset` returns the block, so the agent reads the number rather than deriving it.
+
+**What the quantile buys, measured** (`scratchpad/tune_jumps_quantile.py`, `tune_jumps_knee.py`;
+all nine 5-min datasets, event-level recall against the injected `level_shift` labels):
+
+| rule | candidates per dataset | events found |
+| --- | ---: | ---: |
+| `thresh = 2 FNU` (the old suggestion) | 704 – 4,054 | agent gave up; 0 |
+| `thresh = 1 × robust_sigma`, 6 h | 670 – 6,674 | 22/33 |
+| `thresh = 3 × robust_sigma`, 6 h | 34 – 3,754 | 6/33 |
+| **`thresh = p99` of the 6 h jump statistic** | **131 – 162** | **14/33** |
+| `thresh = p99.5`, 6 h | 45 – 80 | 8/33 |
+
+**Read the candidate column, not the recall column.** The quantile rule's contribution is
+that the candidate count is *stable across gauges* — 131–162 everywhere, against a 12×
+spread in the raw threshold (6.2 / 13.8 / 75.7 FNU) — which is what makes the output
+triageable at all. Every fixed multiple of a static stat gives a count that varies by two
+orders of magnitude between gauges, and on at least one of them it is always unusable.
+6 h is the knee: 3 h and 12 h both cost recall at the same candidate count.
+
+**Recall is capped by the injection, not by the tuning, and the cap is severe.** §9 sizes an
+injected shift at 2–5 × the *local* scale, itself clamped to `[0.1, 3] × global MAD` — so a
+shift placed in a calm week is a fraction of the global scale. Realised magnitudes:
+
+| gauge | injected shift | p99 of its 6 h jump statistic | best events found |
+| --- | ---: | ---: | ---: |
+| 01467200 Delaware | 3.4 – 16.4 FNU | 6.2 | **13/14** |
+| 040851385 Fox | 2.3 – 9.8 FNU | 13.8 | 1/11 (5/11 at 3 h, p98) |
+| 02054550 Roanoke | 0.4 – 1.5 FNU | 75.7 | **0/8 at every setting swept** |
+
+On Roanoke the injected shifts are ~1/50 of the record's ordinary window-to-window movement.
+No threshold can find them, and one that flagged them would flag tens of thousands of storm
+rows first. **That is an injection-design problem, not a detector-tuning one**, and it is the
+same wall §9.1 hit from the review side — do not spend another pass tuning `thresh` against
+those eight events. If level_shift recall is to improve further, the lever is sizing the
+injected magnitude against the series' *jump* scale rather than its local value scale.
+
+**Expect ~150 candidates and at most a handful of real ones even when correctly tuned.** That
+is this detector's nature on storm-driven turbidity (§9.1: across 78 reviewed level_shift
+candidates the human rejected every one). The prompt now says so, and tells the agent to
+triage with `describe_points` / `level_shift_context` — `step_sharpness` is the
+discriminator — rather than treating the count as a tuning signal. What it must *not* do is
+conclude "there are no level shifts here" from an over-flagged run: that is the parameter
+talking, and it is what happened.
+
+**`flag_jumps` now rejects `thresh <= 0` and a missing `window`** rather than defaulting
+(§13). The wrapper's old `thresh=0.0` default would have flagged every change point in the
+record, and the schema's `default: 2.0` is what the model reached for.
 
 ---
 

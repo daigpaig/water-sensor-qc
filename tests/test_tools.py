@@ -797,3 +797,43 @@ def test_impute_rolling_does_not_overwrite_a_flagged_reading():
     assert got.iloc[40:43].notna().all(), "the genuine gap was not filled"
     # The imputer's own flag history must now count only what it actually filled.
     assert result["n_flagged"] == result["n_imputed"] == 3
+
+
+def test_flag_jumps_rejects_a_threshold_that_flags_everything():
+    """§13 fail loudly: thresh<=0 or a missing window is a mis-set parameter, not a run.
+
+    thresh has no portable default -- it is 6.2 / 13.8 / 75.7 FNU on the three project
+    gauges -- so silently defaulting it produced runs that flagged thousands of storm
+    limbs and concluded nothing (§7.6).
+    """
+    idx = pd.date_range("2024-01-01", periods=300, freq="15min")
+    qc = saqc.SaQC(pd.DataFrame({"value": np.linspace(1.0, 2.0, 300)}, index=idx))
+    with pytest.raises(ValueError, match="must be > 0"):
+        wrappers.flag_jumps(qc, thresh=0.0, window="1h")
+    with pytest.raises(ValueError, match="jump_scale"):
+        wrappers.flag_jumps(qc, thresh=1.0)
+
+
+def test_inspect_dataset_measures_the_flag_jumps_threshold():
+    """inspect_dataset must hand the run a usable flag_jumps.thresh (§7.6)."""
+    idx = pd.date_range("2024-01-01", periods=800, freq="15min")
+    rng = np.random.default_rng(0)
+    values = 10.0 + rng.normal(0, 0.05, 800)
+    values[400:] += 8.0
+    qc = saqc.SaQC(pd.DataFrame({"value": values}, index=idx))
+
+    res = wrappers.inspect_dataset(qc)
+    block = res["jump_scale"]
+    thresh = block["recommended_thresh"]
+    assert thresh > 0
+    assert block["recommended_window"] in block["by_window"]
+
+    # It has to be a threshold flag_jumps can actually be run with.
+    out = wrappers.flag_jumps(res["qc"], thresh=thresh,
+                              window=block["recommended_window"])
+    assert 0 < out["n_flagged"] < 0.05 * len(idx)
+
+    # And the summary must carry the robust pair the prompt tells the agent to
+    # scale from -- `std` alone is what produced the 2,865-flag run.
+    stats = res["summary"]["columns"]["value"]
+    assert stats["median"] is not None and stats["robust_sigma"] > 0

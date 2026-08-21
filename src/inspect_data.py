@@ -21,7 +21,7 @@ Usage from Python
 -----------------
     from src.inspect_data import load_series, summarise_series, validate_series_frame
 
-    df = load_series("data/raw/approved/03447687_turbidity_63680.csv")
+    df = load_series("data/raw/approved/02054550_turbidity_63680.csv")
     summary = summarise_series(df)
 """
 from __future__ import annotations
@@ -33,7 +33,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
+
+# MAD -> standard-deviation-comparable scale, the same constant context.py uses.
+MAD_TO_SIGMA = 1.4826
 
 # ---------------------------------------------------------------------------
 # Column contracts (CLAUDE.md §5)
@@ -75,6 +79,14 @@ class ColumnStats:
     std: float | None
     n_nan: int
     pct_nan: float
+    # Robust location and spread, alongside mean/std rather than instead of them.
+    # On a storm-driven series the two disagree by more than an order of magnitude
+    # -- 02054550 has std 28.1 FNU against a median of 1.9 and a robust sigma of
+    # 1.3 -- so a parameter scaled from `std` is scaled from a handful of storm
+    # peaks. An agent run sized flag_jumps.thresh that way and flagged 2,865 rows
+    # (§7.6). Anything set in data units should be read off these two.
+    median: float | None = None
+    robust_sigma: float | None = None
 
 
 @dataclass(frozen=True)
@@ -341,6 +353,13 @@ def _column_stats(series: pd.Series) -> ColumnStats:
     valid = numeric.dropna()
     if valid.empty:
         return ColumnStats(None, None, None, None, n_nan, pct)
+    median = float(valid.median())
+    # MAD rescaled to be comparable with a standard deviation. Falls back to the
+    # std where the MAD is zero, which happens on a quantised series whose middle
+    # half sits on one value (§7.1) -- a zero here would divide-by-zero downstream.
+    mad = float((valid - median).abs().median()) * MAD_TO_SIGMA
+    if not (np.isfinite(mad) and mad > 0):
+        mad = float(valid.std(ddof=1)) if len(valid) > 1 else 0.0
     return ColumnStats(
         min=float(valid.min()),
         max=float(valid.max()),
@@ -348,6 +367,8 @@ def _column_stats(series: pd.Series) -> ColumnStats:
         std=float(valid.std(ddof=1)) if len(valid) > 1 else 0.0,
         n_nan=n_nan,
         pct_nan=pct,
+        median=median,
+        robust_sigma=mad,
     )
 
 
@@ -427,6 +448,7 @@ def format_summary(summary: SeriesSummary) -> str:
         lines.append(
             f"  {name}: min={stats.min} max={stats.max} "
             f"mean={stats.mean} std={stats.std} "
+            f"median={stats.median} robust_sigma={stats.robust_sigma} "
             f"nan={stats.n_nan} ({stats.pct_nan:.2f}%)"
         )
     return "\n".join(lines)

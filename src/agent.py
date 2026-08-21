@@ -37,6 +37,13 @@ from src.agent_tools import context
 
 # Bump on every edit to SYSTEM_PROMPT and note the change in the commit message,
 # so a run in logs/*.jsonl can be tied to the exact prompt that produced it.
+# v0.12: flag_jumps' thresh comes from inspect_dataset's measured jump_scale block rather
+#        than a remembered "1-5 FNU". The old guidance was wrong in its UNIT: the workable
+#        threshold is 6.2 / 13.8 / 75.7 FNU on the three gauges, and no multiple of any
+#        static summary stat spans that. A run at thresh=3.0 flagged 2,865 rows, correctly
+#        read them as storm limbs, and blanket-kept every one — scoring zero level_shift
+#        recall on a dataset with three injected shifts. §2 also now says to scale from
+#        median/robust_sigma, not mean/std, which is the reasoning that produced the 3.0.
 # v0.10: noise_context exposed, and its two numbers ride in every describe_points row.
 #        §3 SPIKE gains "THE OTHER HARD CASE" — a cluster of flags in one stretch is one
 #        noisy stretch, not many failures — because every prior measurement scored a point
@@ -57,7 +64,7 @@ from src.agent_tools import context
 #       override a specific verdict.
 # v0.5: phases replace the fixed STEP script (only inspect-first, range-before-spikes and
 #       export-last are forced); three context primitives exposed as tools.
-SYSTEM_PROMPT_VERSION = "v0.11-draft"
+SYSTEM_PROMPT_VERSION = "v0.12-draft"
 
 # The model is a CLAUDE.md §2 golden rule — do not change it without changing §2.
 MODEL = "claude-sonnet-4-6"
@@ -207,9 +214,18 @@ the main defence against a mis-parameterised detector wrecking a run.
   * Thresholds in data units do not transfer between gauges. A quiet mountain river may sit
     at a median of 8 FNU while a managed canal sits at 28 FNU with a much wider range. Any
     parameter expressed in FNU/NTU (flag_zscore's implicit scale, flag_constants.thresh,
-    flag_jumps.thresh, flag_range bounds) must be set from THIS series' own statistics —
-    its median, its std, its min/max — which you get from inspect_dataset. Parameters
-    expressed as ratios (flag_spike_unilof.thresh) transfer unchanged.
+    flag_jumps.thresh, flag_range bounds) must be set from THIS series' own statistics,
+    which you get from inspect_dataset. Parameters expressed as ratios
+    (flag_spike_unilof.thresh) transfer unchanged.
+  * Scale from median and robust_sigma, NOT from mean and std. On a storm-driven series the
+    two disagree by more than an order of magnitude: one project gauge reports std 28.1 FNU
+    against a median of 1.9 and a robust_sigma of 1.3, because a few storm peaks reach 800.
+    A threshold set at "half a std" there is set at twenty times the water's ordinary
+    spread. inspect_dataset reports all four; use the robust pair.
+  * And where inspect_dataset has measured a parameter for you, use the measurement rather
+    than deriving one. Its jump_scale block gives flag_jumps.thresh directly; its
+    noise_profile says where the sensor is busy. These are measured on the series in front
+    of you and beat any rule of thumb, including the ranges in section 4 below.
 
 ===============================================================================
 3. THE FOUR FAILURE TYPES, THEIR SIGNATURE, AND THEIR DEFAULT ACTION
@@ -331,7 +347,13 @@ the main defence against a mis-parameterised detector wrecking a run.
     stuck; a couple of repeated values does not.
 
   LEVEL_SHIFT — a step to a new level that persists.
-    Detect with: flag_jumps.
+    Detect with: flag_jumps, with thresh and window taken from inspect_dataset's jump_scale
+    block. Read the count it returns before reading anything else. A few hundred flags over
+    a two-year record is this detector working normally; a few thousand means thresh is
+    below ordinary storm movement and the output carries no information — raise it and
+    re-run rather than reasoning about the flags. (Re-running cannot un-flag, so the first
+    call should be the strict one.) A "there are no level shifts here" conclusion drawn from
+    an over-flagged run is not a finding; it is the parameter talking.
     Confirm with: describe_point — the level_shift block gives you median before vs after,
     the step in robust sigmas, step_sharpness, and how long the new level actually held.
     Default action: KEEP and flag, unless clearly erroneous.
@@ -448,9 +470,22 @@ STARTING PARAMETERS (measured on this project's gauges — starting points, not 
                       "6h" found nothing. This tool is crash-prone on some inputs; the
                       wrapper catches the error and reports it, so if the result says it
                       failed, note that and move on — do not retry it repeatedly.
-  flag_jumps          thresh 1-5 FNU (default 2), window "1h"-"6h". Scale thresh to the
-                      series: on a high-turbidity gauge, 2 FNU is noise. Precision here is
-                      low no matter how you tune it (see §3).
+  flag_jumps          thresh and window BOTH come from inspect_dataset's jump_scale block:
+                      pass jump_scale.recommended_thresh with jump_scale.recommended_window
+                      ("6h"). Take the two from the same window — the statistic is
+                      window-dependent, so a threshold measured at 3h is wrong at 12h.
+                      There is no portable number here. That threshold is 6.2 FNU on one
+                      project gauge and 75.7 on another, and the low one is not the calm
+                      river: 75.7 is the gauge whose median is 1.9 FNU, because it swings
+                      hundreds of FNU in storms. Setting thresh to a remembered "1-5 FNU",
+                      or to a fraction of std, puts it below ordinary storm movement — one
+                      run did exactly that, got 2,865 flags spread evenly over two years,
+                      and had no choice but to keep all of them.
+                      Expect ~150 candidates even when correctly tuned, of which at most a
+                      handful are real; that is this detector's nature, not a mis-set
+                      parameter. If it is more than you can triage, raise thresh to
+                      jump_scale.by_window[window].p99_9 rather than guessing. Precision
+                      here is low no matter how you tune it (see §3).
   impute_rolling      window "1h"-"6h" (default "3h"), func="median", and always set
                       max_gap. window must be at least as large as max_gap or the roller
                       cannot bridge the gap and will fill it only partway — which is worse
