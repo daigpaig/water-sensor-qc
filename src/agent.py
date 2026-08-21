@@ -34,9 +34,14 @@ from dotenv import load_dotenv
 from src.agent_tools.schemas import TOOL_SCHEMAS
 from src.agent_tools import wrappers
 from src.agent_tools import context
+from src.agent_tools import precipitation
 
 # Bump on every edit to SYSTEM_PROMPT and note the change in the commit message,
 # so a run in logs/*.jsonl can be tied to the exact prompt that produced it.
+# v0.13: every spike verdict is audited against rainfall (precip_context_points, §7.7) —
+#        outside evidence for the points the series alone cannot settle; ramp_context adds
+#        the multi-hour shape above slope_context's 45-min window; slope_context's window
+#        is a DURATION now, since 3 samples silently meant 15 min on 5-min bases.
 # v0.12: flag_jumps' thresh comes from inspect_dataset's measured jump_scale block rather
 #        than a remembered "1-5 FNU". The old guidance was wrong in its UNIT: the workable
 #        threshold is 6.2 / 13.8 / 75.7 FNU on the three gauges, and no multiple of any
@@ -64,7 +69,7 @@ from src.agent_tools import context
 #       override a specific verdict.
 # v0.5: phases replace the fixed STEP script (only inspect-first, range-before-spikes and
 #       export-last are forced); three context primitives exposed as tools.
-SYSTEM_PROMPT_VERSION = "v0.12-draft"
+SYSTEM_PROMPT_VERSION = "v0.13-draft"
 
 # The model is a CLAUDE.md §2 golden rule — do not change it without changing §2.
 MODEL = "claude-sonnet-4-6"
@@ -285,6 +290,30 @@ the main defence against a mis-parameterised detector wrecking a run.
     one call at about 90 tokens each, so measuring an entire detector's output costs a
     fraction of one wasted deletion.
 
+    BEFORE ANY SPIKE VERDICT, AUDIT IT AGAINST RAINFALL. Collect every timestamp you
+    intend to call a spike and pass them ALL to precip_context_points in one call —
+    including the ones that look clear-cut. That is not a formality: the points you are
+    most confident about from the series alone are exactly the ones outside evidence can
+    overturn, and some of them look like errors to the eye too. Turbidity rises because
+    rain washes sediment in, so an excursion with rain behind it has a physical cause.
+
+    HOW MUCH THAT ANSWER IS WORTH, IN BOTH DIRECTIONS. The nearest station with full
+    coverage is about 31 km away, and a summer storm cell is often smaller than that. So:
+      * RAIN BEFORE THE POINT is strong evidence the excursion is real. Deleting it anyway
+        needs a specific reason you state.
+      * NO RAIN is WEAK evidence. The cell may simply have missed the station. It does not
+        license a deletion on its own — it only fails to support the excursion.
+      * NO DATA is not "no rain". If the result says precipitation is unavailable, say so
+        and decide on the series alone; do not read it as dry weather.
+    Points you are NOT calling spikes do not need this audit.
+
+    Call ramp_context when a point is narrow and high-z but the surrounding HOURS look
+    like they were going somewhere. slope_context sees 45 minutes; a storm peak can be the
+    top of a climb lasting three hours, and nothing else you have looks that far back. A
+    long, steady rise into the point is evidence it is the top of something real. Weigh it
+    with width and recovery rather than alone — measured on this project's injected data
+    the ramp shapes of real and injected excursions overlap heavily.
+
     Call slope_context when a point is narrow and high-z and you are about to delete it —
     it measures the rise and fall gradients directly at the 45-minute scale where they
     separate. Leave n_before/n_after at 3: the signal REVERSES past about 90 minutes,
@@ -399,6 +428,11 @@ Utility
                        column min/max/mean/std. ALSO returns noise_profile: which calendar
                        stretches of THIS record are noisier than its own typical window.
                        ALWAYS call this first, before anything else.
+  ramp_context         How long the series took to CLIMB to a point and to come back down —
+                       the shape ABOVE the 90-minute scale that slope_context measures.
+  precip_context_points  Was it raining? Checks a LIST of timestamps against nearby rainfall.
+                       MANDATORY on every point you are about to call a spike (see §3, SPIKE).
+  precip_context       The one-point version of the above.
   get_flag_summary     Counts of flagged timestamps, broken down by the tool that flagged them.
   export_clean_data    Emits the final data with a flag column AND writes the flag log.
                        Call this last, and pass `decisions` — see PHASE 7.
@@ -824,7 +858,12 @@ def _get_tool_function(tool_name: str):
         return getattr(wrappers, tool_name)
     if hasattr(context, tool_name):
         return getattr(context, tool_name)
-    raise ValueError(f"Tool {tool_name} not found in wrappers or context.")
+    # precipitation lives in its own module: it is the one tool whose evidence comes
+    # from OUTSIDE the turbidity series (§7.7), so it does not belong with the shape
+    # measurements in context.py.
+    if hasattr(precipitation, tool_name):
+        return getattr(precipitation, tool_name)
+    raise ValueError(f"Tool {tool_name} not found in wrappers, context or precipitation.")
 
 
 # A mid-stream read failure is retried here because the SDK cannot retry it: once the

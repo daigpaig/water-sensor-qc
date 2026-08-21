@@ -1098,6 +1098,87 @@ _IMPUTE_ROLLING = {
 # Public list — pass this directly to the Anthropic Messages API `tools` argument
 # ---------------------------------------------------------------------------
 
+_RAMP_CONTEXT = {
+    "name": "ramp_context",
+    "description": (
+        "Measures the SHAPE ABOVE the 90-minute scale: how long the series took to climb "
+        "to this point, and how long it took to come back down. slope_context looks 45 "
+        "minutes either side, which separates a debris strike from a small flush; this "
+        "looks hours, which is what separates a storm PEAK from both. A point at the top "
+        "of a climb lasting hours is the top of something the water was already doing; an "
+        "artifact is not climbing to anything. Reach for it when a point is narrow and "
+        "high-z and you are about to delete it but the surrounding hours look like they "
+        "were going somewhere. Returns rise/fall duration in minutes, magnitude, and a "
+        "monotonic_fraction (share of steps moving the expected way; 1.0 is a clean climb, "
+        "0.5 is noise). It reports evidence and does not decide: on this project's "
+        "INJECTED data the two populations overlap heavily, because spikes are injected on "
+        "top of rising limbs about as often as real water sits on them, so weigh a ramp "
+        "alongside width, recovery and noise rather than on its own."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "field": {"type": "string", "default": "value",
+                      "description": "Column holding the measurements. Default 'value'."},
+            "at": {"type": "string",
+                   "description": "Timestamp to measure around, ISO 8601. Must exist in the series."},
+            "max_window": {"type": "string", "default": "6h",
+                           "description": ("How far either side to look for the foot of the "
+                                           "ramp. Default '6h'; widen only for a very slow "
+                                           "river.")},
+        },
+        "required": ["at"],
+    },
+}
+
+_PRECIP_CONTEXT_POINTS = {
+    "name": "precip_context_points",
+    "description": (
+        "WAS IT RAINING? Checks a LIST of timestamps against nearby rainfall — the one "
+        "piece of evidence that comes from OUTSIDE the turbidity series. Turbidity rises "
+        "because rain washes sediment in, so an excursion with rain behind it has a "
+        "physical cause and an artifact does not. USE THIS ON EVERY POINT YOU ARE ABOUT TO "
+        "CALL A SPIKE, including the ones that look clear-cut — that is the whole point: "
+        "the calls that look obvious from the series alone are exactly the ones this can "
+        "overturn. Points you are NOT calling spikes do not need it. Reports several lag "
+        "windows before each point (0-1h, 1-3h, 3-12h) because rain leads turbidity by an "
+        "amount that depends on the catchment. TWO LIMITS RIDE WITH EVERY ANSWER: the "
+        "nearest station with full coverage is about 31 km away, so PRESENCE of rain is "
+        "strong evidence and ABSENCE is weak — a summer storm cell can miss the station "
+        "entirely. And if no data has been pulled the result says so explicitly; that is "
+        "never the same as 'it did not rain'."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "ats": {"type": "array", "items": {"type": "string"},
+                    "description": ("Timestamps to check, ISO 8601. Pass every timestamp "
+                                    "you intend to give a spike verdict.")},
+            "max_points": {"type": "integer", "default": 300,
+                           "description": "Maximum timestamps per call. Default 300."},
+        },
+        "required": ["ats"],
+    },
+}
+
+_PRECIP_CONTEXT = {
+    "name": "precip_context",
+    "description": (
+        "Rainfall around ONE timestamp — the single-point version of "
+        "precip_context_points. Use it when a single decision turns on whether it rained; "
+        "for auditing a set of spike candidates use the batch form instead. Returns rain "
+        "totals over 0-1h, 1-3h and 3-12h before the point plus 3h after, and names the "
+        "station and its distance so you can weigh how much the answer is worth."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "at": {"type": "string", "description": "Timestamp to check, ISO 8601."},
+        },
+        "required": ["at"],
+    },
+}
+
 TOOL_SCHEMAS: list[dict] = [
     # Utility
     _INSPECT_DATASET,
@@ -1119,6 +1200,10 @@ TOOL_SCHEMAS: list[dict] = [
     _RECOVERY_CONTEXT,
     _LEVEL_SHIFT_CONTEXT,
     _NOISE_CONTEXT,
+    _RAMP_CONTEXT,
+    # Outside evidence (§7.6)
+    _PRECIP_CONTEXT_POINTS,
+    _PRECIP_CONTEXT,
     # Action
     _IMPUTE_ROLLING,
 ]

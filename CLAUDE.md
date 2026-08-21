@@ -78,6 +78,7 @@ deployment, Docker, CI beyond a basic test run).
 │   ├── injected/         # synthetic datasets + label files (injected straight from raw)
 │   │   └── <gauge>/l<level>/  # the §5 triple, filed by gauge then level
 │   ├── comparison/       # same sensor either side of the approval boundary (§9.3)
+│   ├── precip/           # nearby rainfall per gauge (gitignored, regenerable) (§7.7)
 │   │   └── <gauge>/      #   *_approved.csv, *_provisional.csv, *_manifest.json
 │   ├── legacy_15min/     # the RETIRED 15-min bases + their injected datasets (§9)
 │   │   ├── raw/          #   approved/ + provisional/ 15-min pulls (gitignored)
@@ -90,8 +91,10 @@ deployment, Docker, CI beyond a basic test run).
 │   ├── datasets/         # writes everything under data/
 │   │   ├── pull_usgs.py  # pull approved-only turbidity from NWIS -> data/raw/approved (§9)
 │   │   ├── pull_comparison.py # pull one series in BOTH approval states -> data/comparison (§9.3)
+│   │   ├── pull_precip.py # nearby rainfall -> data/precip/<gauge>/ (§7.7)
 │   │   └── inject.py     # synthetic anomaly injection (4 types, 3 levels, seeded)
 │   ├── agent_tools/      # AGENT-facing: the §7 inventory, handed to the Messages API
+│   │   ├── precipitation.py # rainfall near a point — the only OUTSIDE evidence (§7.7)
 │   │   ├── schemas.py    # JSON tool schemas for the Messages API
 │   │   ├── wrappers.py   # SaQC-wrapping tool functions (§5 result dict)
 │   │   └── context.py    # point-context measurements: storm vs artifact (§7.3)
@@ -126,6 +129,9 @@ deployment, Docker, CI beyond a basic test run).
 │   ├── compare_candidate_recall.py # §9.1 recall, 5-min vs the retired 15-min set
 │   ├── tune_noise_context.py  # picks the §7.4 noise window + rule thresholds
 │   ├── tune_noise_spare_rule.py # refits §7.4 for 5-min data, on gauges we don't score
+│   ├── tune_ramp_rule.py      # fits §7.3's ramp thresholds, same held-out discipline
+│   ├── find_precip.py         # searches NWIS for rain gauges near a turbidity gauge (§7.7)
+│   ├── verify_precip.py       # proves a candidate really covers the project window (§7.7)
 │   ├── probe_cache_ttl.py     # is `ttl` accepted on top-level cache_control? (§8)
 │   ├── probe_noise_reads_like.py # the §7.4 noisy-stretch guard's hit rates
 │   ├── tune_zscore.py         # flagZScore min_residuals on quantised data (§7.1)
@@ -358,6 +364,11 @@ Detection:
 Action: `impute_rolling` (`interpolateByRolling`; `window` required, `func='median'`,
 `min_periods=0`). There is no `correct_drift` wrapper — drift is removed (§9.2).
 
+Outside evidence: `precip_context`, `precip_context_points` — the only tools whose input
+is not the turbidity series, and the only ones with their own module
+(`src/agent_tools/precipitation.py`). Auditing every spike verdict against rainfall is
+mandatory in the prompt; see §7.7 for why, and for why it cannot move the synthetic score.
+
 Context: `describe_point`, `describe_points` — thin pass-throughs in `wrappers.py` to the
 §7.3 measurements. They observe only: no `qc` key in the result, caller's SaQC unchanged.
 The five exposed primitives (`slope_context`, `excursion_context`, `recovery_context`,
@@ -581,6 +592,34 @@ as truth; `scratchpad/demo_point_context.py` reproduces the table):**
   few wide windows. `slope_context`'s default is therefore **3 samples**, and so is
   `describe_point`'s, so the compact `describe_points` row carries a usable ratio.
   `scratchpad/tune_slope_window.py` reproduces the sweep.
+- **`slope_context`'s window is a DURATION, not a sample count** (fixed 2026-08-20). The
+  optimum above is **45 minutes**, written as "3 samples" because that data was 15-minute.
+  When the project moved to 5-min bases the default silently became **15 minutes** — a
+  third of the intended width — and this section warns in terms that the signal REVERSES
+  at the wrong width. Measured on 01467200_l1 at 2023-07-09 22:50, a gradual 2.5 h rise
+  the run deleted as a spike: at 15 min it read `ratio 0.54, symmetric` (artifact); at 45
+  min, `ratio 3.09, gradual_before` (storm). `SLOPE_WINDOW` is now resolved against the
+  series' own sampling step, so it is 3 samples at 15-min and 9 at 5-min. **Any tuned
+  constant expressed in samples has this bug latent in it** — check the others if the
+  cadence changes again.
+- **`ramp_context` measures the shape ABOVE that scale** (2026-08-20): how long the series
+  took to climb to the point and to come back down, over hours rather than minutes.
+  Nothing else looks further back than 90 minutes, so a storm peak sitting on top of a
+  three-hour rise was invisible to every existing measurement.
+  - Steadiness is a **directness ratio**, |net change| / sum|step changes| — not a share
+    of steps going the right way. That fraction reads 0.5 on a clean climb approached
+    across flat baseline (the flat steps count against it) and collapses on a real ramp
+    with one dip. Directness is immune to both.
+  - **The separation runs OPPOSITE to the intuition, and it was measured, not assumed**:
+    a true injected spike reads directness **0.75** — a clean jump straight up from its
+    foot — while real water flagged in error reads **0.28**, having meandered up. So the
+    water-like shape is a long *wandering* climb, and the rule spares a deletion when
+    `rise >= 30 min AND directness <= 0.3` (fitted on 02054550 + 040851385, never the
+    gauge we report on; `scratchpad/tune_ramp_rule.py`).
+  - **It is weak — 23.1% of FPs spared at 4.8% of true spikes**, against 60.2%/4.1% for
+    the §7.4 noise rule. The populations overlap because §9 injects spikes on top of
+    rising limbs about as often as real water sits on them. Treat a ramp as one piece of
+    evidence, never a decider, and expect it to matter more on real records.
 - **Width and robust_z cannot separate a small flush from an artifact** — this is why the
   ratio matters. Both are 1–3 samples wide, and the flush often has the *higher* z (measured:
   a flush at robust_z 21.8 against an artifact at 14.1). Width and recovery remain the right
@@ -800,6 +839,43 @@ talking, and it is what happened.
 **`flag_jumps` now rejects `thresh <= 0` and a missing `window`** rather than defaulting
 (§13). The wrapper's old `thresh=0.0` default would have flagged every change point in the
 record, and the schema's `default: 2.0` is what the model reached for.
+
+---
+
+### 7.7 Rainfall: evidence from outside the series (2026-08-20)
+
+Every other tool reasons about the turbidity series. For a class of points that is not
+enough — they look like errors to the eye as well as to the detectors, and only outside
+evidence settles them. `src/agent_tools/precipitation.py` supplies it; the prompt makes
+auditing **every** spike verdict against rainfall mandatory, including the clear-cut ones,
+because the calls that look obvious from the series alone are the ones this can overturn.
+
+- **No 5-min turbidity gauge records its own rain** — 0 of 57 in the national catalog
+  (`scratchpad/find_precip.py`). So rain always comes from a *nearby* station, and how
+  near is a property of the evidence that travels with every answer.
+- **For 01467200 the nearest station with full window coverage is 31.1 km away**
+  (01473169 Valley Creek, 15-min, 99.8% complete, 100% approved). A closer one exists
+  (19.9 km, 6-min) but starts 2024-10, so both are pulled and the query prefers the
+  nearest station that actually has data at the timestamp. `verify_precip.py` establishes
+  this — the site catalog's begin/end describes the SITE, and several nearby gauges
+  advertise a long record while only reporting instantaneous values recently.
+- **The asymmetry is the point.** A summer convective cell is often 5-15 km across, so at
+  31 km: rain **present** is strong evidence the excursion is real; rain **absent** is
+  weak and licenses nothing. Both the tool text and the prompt say so.
+- **"No data" must never read as "no rain".** That is the dangerous failure here — it
+  would read as evidence FOR deleting a point. Missing data returns `available: false`
+  with no `rained` key at all, and a test holds the line.
+- Rain leads turbidity by an amount that depends on the catchment, so rather than assume
+  a lag the tool reports **0-1h, 1-3h and 3-12h** before the point and lets the agent judge.
+- Pull with `python -m src.datasets.pull_precip <gauge>` -> `data/precip/<gauge>/`.
+
+**IT CANNOT MOVE THE SYNTHETIC BENCHMARK, AND THAT IS NOT A BUG.** Measured on the
+Part B run: of deleted rows, 18% of false positives had rain in the preceding 12h versus
+16% of true injected spikes. No separation — because §9 injects spikes at random
+locations regardless of weather, so a synthetic "true spike" inherits the background rain
+rate. Precipitation can only pay off on real records, which is exactly the synthetic-vs-
+real gap §10 asks us to report. Do not read a flat spike-precision number here as the
+tool failing.
 
 ---
 

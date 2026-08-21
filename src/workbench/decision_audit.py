@@ -414,6 +414,26 @@ const BLURB = {
 };
 const VERDICT_COLOR = {anomaly:"#f87171", normal:"#4ade80", undecided:"#f59e0b"};
 const $ = (id) => document.getElementById(id);
+
+// react() then FORCE a resize. #detail is the `1fr` row of a 100vh grid, so it has no
+// settled height at first paint; Plotly measures the div during that first synchronous
+// draw, gets a pre-layout height, and bakes it into the SVG. Measured here: a 720px SVG
+// inside a 402px cell, overflowing by 318px and painting straight over #panel — the
+// panel was rendered, correctly positioned, and invisible underneath the chart, which
+// is exactly as confusing as it sounds. `responsive: true` does not help: it only
+// re-measures on a window resize event, and a page that is never resized never gets one.
+function plot(id, traces, layout, config) {
+  const done = Plotly.react(id, traces, layout, config);
+  const fix = () => { const gd = $(id); if (gd && gd.data) Plotly.Plots.resize(gd); };
+  if (done && done.then) done.then(fix); else fix();
+  requestAnimationFrame(fix);
+}
+addEventListener("resize", () => {
+  for (const id of ["overview", "detail"]) {
+    const gd = $(id);
+    if (gd && gd.data) Plotly.Plots.resize(gd);
+  }
+});
 const iso = (ms) => new Date(ms).toISOString().slice(0, 19);   // naive round-trip
 const f2 = (v, n=2) => (v === null || v === undefined) ? "&mdash;" : (+v).toFixed(n);
 const byAt = new Map(D.cases.map(c => [c.at, c]));
@@ -462,7 +482,7 @@ function overview() {
       marker:{ color:COLOR[c], size:c==="kept"?4:7, opacity:c==="kept"?0.5:0.95 },
     });
   }
-  Plotly.react("overview", traces, {
+  plot("overview", traces, {
     margin:{l:52,r:16,t:6,b:22}, paper_bgcolor:"#0f1115", plot_bgcolor:"#0f1115",
     font:{color:"#9aa3b2",size:10}, showlegend:false,
     xaxis:{gridcolor:"#1d212b"}, yaxis:{gridcolor:"#1d212b"},
@@ -500,7 +520,7 @@ function showPoint(at) {
     traces.push({ x:[c.at], y:[c.true_value], mode:"markers", type:"scatter",
                   name:"true value", marker:{color:"#facc15", size:10, symbol:"x"} });
   }
-  Plotly.react("detail", traces, {
+  plot("detail", traces, {
     margin:{l:52,r:16,t:8,b:34}, paper_bgcolor:"#0f1115", plot_bgcolor:"#0f1115",
     font:{color:"#9aa3b2",size:11}, xaxis:{gridcolor:"#1d212b"},
     yaxis:{gridcolor:"#1d212b",title:"FNU"},

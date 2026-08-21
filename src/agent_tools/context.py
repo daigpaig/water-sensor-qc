@@ -78,6 +78,21 @@ _MAD_TO_SIGMA = 1.4826
 # pooled from 02054550 and 040851385 — never the gauge we report on — by
 # scratchpad/tune_noise_spare_rule.py, maximising FPs spared subject to losing at
 # most 5% of true spikes. See the noise_context docstring for the full table.
+# ramp_context: how long a climb has to last, and how steadily it has to move, before
+# the point on top of it reads as an event rather than an artifact. Fitted on 02054550
+# and 040851385, never on the gauge we report on (scratchpad/tune_ramp_rule.py), by the
+# same criterion as the §7.4 noise rule: most FPs spared at <=5% of true spikes lost.
+#
+# BE HONEST ABOUT HOW WEAK THIS IS. The two populations overlap heavily — true spike
+# rise median 180 min vs false positive 220 min, monotonic 0.39 vs 0.45 — because §9
+# injects spikes ON TOP OF whatever the series was doing, including rising limbs, so a
+# genuine injected spike sits on a ramp about as often as real water does. The fitted
+# rule spares 23.1% of false positives at 4.8% of true spikes, against 60.2%/4.1%
+# for the noise rule. Treat a ramp as ONE piece of evidence the agent weighs, never as
+# a decider — and expect it to matter more on real records than on injected ones.
+RAMP_MINUTES = 30.0
+RAMP_DIRECTNESS = 0.3
+
 ELEVATED_NOISE_RATIO = 2.0
 LOCAL_STEP_UNREMARKABLE = 8.0
 
@@ -254,18 +269,33 @@ def _result(tool: str, params: dict, ts: pd.Timestamp, message: str, **fields) -
 # ---------------------------------------------------------------------------
 # 1. Slope — the storm-vs-spike discriminator
 # ---------------------------------------------------------------------------
+SLOPE_WINDOW = "45min"
+
+
 def slope_context(
     source,
     at,
     field: str = VALUE_COL,
-    n_before: int = 3,
-    n_after: int = 3,
+    n_before: int | None = None,
+    n_after: int | None = None,
+    window: str = SLOPE_WINDOW,
 ) -> dict:
     """Gradient leading into *at* vs the gradient leading out of it.
 
-    ``n_before`` / ``n_after`` are counts of samples, each window *including* the
-    point itself, so the rise into the peak and the fall out of it are both
-    measured. At 15-min sampling, 3 samples = 45 minutes.
+    THE WINDOW IS A DURATION, AND THAT IS THE WHOLE POINT. §7.3 measured the
+    optimum at **45 minutes** and expressed it as "3 samples" because the data was
+    15-minute. When the project moved to 5-minute bases that default silently
+    became 15 minutes — a 3x narrower window — and §7.3 warns in terms that the
+    signal REVERSES at the wrong width. Measured on 01467200_l1 at
+    2023-07-09 22:50, a gradual 2.5h rise the run deleted as a spike:
+
+        default 3 samples (15 min at 5-min):  ratio 0.54  "symmetric"     -> spike
+        45 minutes (9 samples at 5-min):      ratio 3.09  "gradual_before" -> storm
+
+    So *window* is derived from the series' own sampling step, and `n_before` /
+    `n_after` remain as an explicit sample-count override for callers that really
+    want one. Each window *includes* the point itself, so the rise into the peak
+    and the fall out of it are both measured.
 
     THE WINDOW IS THE WHOLE BALLGAME, AND THE SIGNAL INVERTS WITH IT (measured
     2026-08-11 on 31 flush events vs 14 injected spikes, 03447687_l1). Separation,
@@ -297,7 +327,13 @@ def slope_context(
     series = as_series(source, field)
     ts = resolve_timestamp(series, at)
     pos = _pos(series, ts)
-    params = {"field": field, "n_before": n_before, "n_after": n_after}
+    if n_before is None or n_after is None:
+        span = pd.Timedelta(window)
+        step = pd.Series(series.index).diff().median()
+        derived = max(int(round(span / step)), 2) if step and step > pd.Timedelta(0) else 3
+        n_before = derived if n_before is None else n_before
+        n_after = derived if n_after is None else n_after
+    params = {"field": field, "n_before": n_before, "n_after": n_after, "window": window}
 
     before = series.iloc[max(0, pos - n_before + 1) : pos + 1]
     after = series.iloc[pos : pos + n_after]
@@ -1400,11 +1436,12 @@ def describe_point(
     source,
     at,
     field: str = VALUE_COL,
-    # 3 samples (45 min), matching slope_context: the fall/rise ratio in the row this
-    # builds only separates a flush event from an artifact at that scale, and inverts
-    # past ~90 min. See slope_context's docstring for the measured table.
-    n_before: int = 3,
-    n_after: int = 3,
+    # None -> derived from SLOPE_WINDOW (45 min) against the series' own sampling step,
+    # matching slope_context. Hard-coding 3 samples here meant 45 min on 15-min data and
+    # 15 min on 5-min data, and the fall/rise ratio inverts at the wrong width — see
+    # slope_context's docstring for the measured table.
+    n_before: int | None = None,
+    n_after: int | None = None,
     window: str = "6h",
     shift_window: str = "24h",
 ) -> dict:
@@ -1463,6 +1500,132 @@ DEFAULT_MAX_POINTS = 100
 # `MAX_FLAGGED_DATETIMES` is 1000, so an uncapped call could return ~90k tokens
 # in one result. 300 still covers a full detector output in a single call.
 MAX_POINTS_CEILING = 300
+
+
+def ramp_context(
+    source,
+    at,
+    field: str = VALUE_COL,
+    max_window: str = "6h",
+    smooth: str = "20min",
+) -> dict:
+    """How long did the series take to CLIMB to this point, and to come back down?
+
+    ``slope_context`` measures the gradient in the 45 minutes either side — the scale
+    that separates a debris strike from a small flush. This measures the scale ABOVE
+    that: the whole ramp. A storm peak is the top of a rise lasting hours; an artifact
+    is a value that was not climbing to anything.
+
+    The gap this closes, measured on 01467200_l1 at 2023-07-09 22:50 — turbidity 4.4
+    -> 7.7 over two and a half hours, peaking at 13.5, back to 3.5 within the hour:
+    every existing tool judged it on a window of 90 minutes or less, saw a narrow
+    excursion, and the run deleted it as a spike. Nothing measured the ramp it sat on
+    top of, because nothing looked further back than 90 minutes.
+
+    Walks out from the point over a smoothed copy (a rolling median, so single-sample
+    noise does not end the walk) to the lowest point within *max_window* on each side,
+    and reports how long each leg took and how steadily it moved. ``monotonic_fraction``
+    is the share of steps going the expected way — 1.0 is a clean climb, 0.5 is noise.
+
+    Reports numbers and a conservative label; it does not decide. A long, steady rise
+    is evidence the point is the top of something real, and evidence is what the agent
+    weighs (§7.3).
+    """
+    series = as_series(source, field).dropna()
+    ts = resolve_timestamp(series, at)
+    params = {"field": field, "max_window": max_window, "smooth": smooth}
+    if len(series) < 5 or ts not in series.index:
+        return {"tool": "ramp_context", "params": params, "at": str(ts),
+                "message": "Not enough data around this point to measure a ramp."}
+
+    span = pd.Timedelta(max_window)
+    step = pd.Series(series.index).diff().median()
+    win = max(int(round(pd.Timedelta(smooth) / step)), 1) if step and step > pd.Timedelta(0) else 3
+    # Smooth the NEIGHBOURHOOD, not the record. Rolling over a 210k-row series costs
+    # ~50 ms per call and nothing outside +/-max_window can affect the answer; a small
+    # pad keeps the centred window honest at the edges.
+    local = series.loc[ts - span - pd.Timedelta(smooth): ts + span + pd.Timedelta(smooth)]
+    smoothed = local.rolling(win, center=True, min_periods=1).median()
+
+    peak = float(series.loc[ts])
+
+    def leg(direction: int) -> dict:
+        """Walk out to the foot of the ramp and measure how DIRECTLY it got there.
+
+        The foot is the lowest smoothed value within *max_window*, but the walk stops
+        early if the series was ever as high as the point itself — past that we are
+        looking at a different, larger event, not the run-up to this one.
+
+        Steadiness is a DIRECTNESS ratio, |net change| / sum|step changes|, not a share
+        of steps going the right way. Two failures made that choice: a fraction-of-steps
+        measure reads 0.5 on a clean climb that happens to be approached across flat
+        baseline (the flat steps count against it), and it collapses on a real ramp with
+        one local dip in it. Directness is immune to both — flat stretches add nothing to
+        either side of the ratio, and a small dip costs only twice its own size. 1.0 is a
+        straight climb; 0.3 is a series wandering to the same place.
+        """
+        lo, hi = (ts - span, ts) if direction < 0 else (ts, ts + span)
+        seg = smoothed.loc[lo:hi]
+        if len(seg) < 3:
+            return {"minutes": None, "magnitude": None, "directness": None}
+
+        ordered = seg.iloc[::-1] if direction < 0 else seg
+        taller = np.flatnonzero(ordered.to_numpy() > peak)
+        if len(taller):
+            ordered = ordered.iloc[:taller[0]]        # stop at the larger event
+        if len(ordered) < 2:
+            return {"minutes": 0.0, "magnitude": 0.0, "directness": None}
+
+        foot_at = ordered.idxmin()
+        walk = smoothed.loc[foot_at:ts] if direction < 0 else smoothed.loc[ts:foot_at]
+        if len(walk) < 2:
+            return {"minutes": 0.0, "magnitude": 0.0, "directness": None}
+        diffs = walk.diff().dropna().to_numpy()
+        travelled = float(np.sum(np.abs(diffs)))
+        net = abs(float(walk.iloc[-1] - walk.iloc[0]))
+        return {
+            "minutes": _round(abs((ts - foot_at).total_seconds()) / 60.0, 0),
+            "magnitude": _round(peak - float(smoothed.loc[foot_at]), 2),
+            "directness": _round(net / travelled if travelled > 0 else None, 2),
+        }
+
+    rise, fall = leg(-1), leg(+1)
+
+    def wandering(part: dict) -> bool:
+        """A long approach that did NOT go straight there.
+
+        Note the direction, which is the opposite of the obvious guess and was measured
+        rather than assumed: a true injected spike reads directness 0.75 — a clean jump
+        straight up from its foot — while real water flagged in error reads 0.28, having
+        meandered its way up. So a *wandering* climb is the water-like shape.
+        """
+        return bool(part["minutes"] and part["minutes"] >= RAMP_MINUTES
+                    and part["directness"] is not None
+                    and part["directness"] <= RAMP_DIRECTNESS)
+
+    rising, falling = wandering(rise), wandering(fall)
+    if rising and falling:
+        label, why = "ramped", "wandered up and back down over hours — the shape of water moving"
+    elif rising:
+        label, why = "ramped-up", "wandered its way up over hours before this point"
+    elif falling:
+        label, why = "ramped-down", "wandered back down over hours after this point"
+    else:
+        label, why = "no-ramp", "no long, meandering approach — it went straight there, or nowhere"
+
+    msg = (
+        f"Rose {rise['magnitude']} over {rise['minutes']} min "
+        f"(directness {rise['directness']}), fell {fall['magnitude']} over "
+        f"{fall['minutes']} min (directness {fall['directness']}): {label} — {why}. "
+    )
+    msg += ("A long, meandering climb is what a catchment does; a displaced reading goes "
+            "straight up from wherever the series was. Evidence for REAL WATER."
+            if rising else
+            "Nothing long and meandering leads into this point, which is consistent with "
+            "an artifact — but check width, recovery and rainfall before concluding that.")
+    return {"tool": "ramp_context", "params": params, "at": str(ts),
+            "value": _f(peak), "rise": rise, "fall": fall,
+            "reads_like": label, "message": msg}
 
 
 def noise_profile(

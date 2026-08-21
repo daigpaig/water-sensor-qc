@@ -48,6 +48,10 @@ EXPECTED_TOOLS = {
     "recovery_context",
     "level_shift_context",
     "noise_context",
+    "ramp_context",
+    # Outside evidence (§7.7) — the only tools whose input is not the turbidity series.
+    "precip_context",
+    "precip_context_points",
     # Action
     "impute_rolling",
 }

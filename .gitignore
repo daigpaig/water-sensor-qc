@@ -13,6 +13,8 @@ env/
 data/raw/**
 # Provisional-vs-approved comparison pulls (regenerate: `python -m src.datasets.pull_comparison`)
 data/comparison/**
+# Nearby rainfall (regenerate: `python -m src.datasets.pull_precip <gauge>`) — §7.7
+data/precip/**
 # Legacy 15-min raw pulls, retired when the project moved to 5-min bases.
 # Same rule as data/raw/: the CSVs are regenerable from NWIS, the injected
 # datasets beside them are hand-generated ground truth and stay tracked.

@@ -478,3 +478,62 @@ def test_jump_scale_survives_a_constant_series():
     out = ctx.jump_scale(flat)
     assert out["recommended_thresh"] in (None, 0.0)
     assert "message" in out
+
+def test_the_slope_window_is_a_duration_so_it_survives_a_frequency_change():
+    """3 samples meant 45 min at 15-min sampling and 15 min at 5-min — a 3x error.
+
+    §7.3 measured the fall/rise ratio's optimum at 45 MINUTES and warns the signal
+    REVERSES at the wrong width. When the project moved to 5-minute bases the
+    sample-count default silently became a third of the intended window. Measured on
+    01467200_l1 at 2023-07-09 22:50, a gradual 2.5h rise the run deleted as a spike:
+    the 15-min view called it "symmetric" (ratio 0.54), the 45-min view called it
+    "gradual_before" (ratio 3.09).
+    """
+    for freq, expected in (("15min", 3), ("5min", 9), ("1min", 45)):
+        index = pd.date_range("2024-01-01", periods=400, freq=freq)
+        series = pd.Series(np.linspace(1.0, 9.0, 400), index=index)
+        params = ctx.slope_context(series, at=index[200])["params"]
+        assert params["n_before"] == params["n_after"] == expected, freq
+        assert params["window"] == ctx.SLOPE_WINDOW
+
+    # an explicit sample count still wins, for a caller that really wants one
+    index = pd.date_range("2024-01-01", periods=100, freq="5min")
+    series = pd.Series(np.linspace(1.0, 9.0, 100), index=index)
+    assert ctx.slope_context(series, at=index[50], n_before=4, n_after=4)["params"]["n_before"] == 4
+
+
+def test_ramp_context_measures_the_climb_a_45_minute_window_cannot_see():
+    """The shape above slope_context's scale: hours, not minutes."""
+    index = pd.date_range("2024-01-01", periods=200, freq="5min")
+    values = np.full(200, 5.0)
+    values[64:100] = np.linspace(5.0, 20.0, 36)      # 3h climb
+    values[100:124] = np.linspace(20.0, 5.0, 24)     # 2h recession
+    series = pd.Series(values, index=index)
+
+    ramped = ctx.ramp_context(series, at=index[99])
+    assert ramped["rise"]["minutes"] >= 120, ramped["rise"]
+    # A clean synthetic climb is maximally DIRECT — and directness separates the two
+    # populations the opposite way to the intuition (see ramp_context's docstring): a
+    # straight climb is the injected-displacement shape, a meandering one is water.
+    assert ramped["rise"]["directness"] == 1.0
+    assert ramped["reads_like"] == "no-ramp"
+
+    # The invariant that matters is RELATIVE: the same net rise, approached by wandering,
+    # must score lower than one approached in a straight line. (An exact threshold is not
+    # asserted here — RAMP_DIRECTNESS is fitted on real gauges, not on a sine wave, and
+    # the wobble also has to stay slower than the 20-min smoother and below the peak.)
+    wandering = series.copy()
+    wobble = 4.0 * np.sin(np.arange(36) * 2 * np.pi / 36)
+    wandering.iloc[64:100] = wandering.iloc[64:100].to_numpy() + wobble
+    wobbly = ctx.ramp_context(wandering, at=index[99])
+    assert wobbly["rise"]["directness"] < ramped["rise"]["directness"]
+    assert wobbly["rise"]["minutes"] >= 120
+
+    # a lone spike on a flat baseline is climbing to nothing
+    flat = pd.Series(np.full(200, 5.0), index=index)
+    flat.iloc[100] = 40.0
+    spike = ctx.ramp_context(flat, at=index[100])
+    assert spike["reads_like"] == "no-ramp"
+    assert "Nothing long and meandering leads into this point" in spike["message"]
+    # and it still refuses to decide on its own
+    assert "check width, recovery and rainfall" in spike["message"]
