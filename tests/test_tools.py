@@ -471,6 +471,48 @@ def test_every_entry_records_which_span_claimed_it():
                for e in result["flags"] if e["rationale_source"] == "deterministic")
 
 
+def test_an_anomaly_span_claims_every_row_it_covers_not_just_the_flagged_ones():
+    """A windowed anomaly could not be reported at all before this (§5, 2026-08-24).
+
+    A level shift is a SPAN sitting at the wrong level, but flagJumps flags its two
+    EDGES. With one entry per flagged row, the interior was never in the log and no
+    decision could reach it. Measured on 01467200_l1: the agent found the shift exactly
+    and claimed 2 of 117 rows.
+    """
+    index = pd.date_range("2024-01-01", periods=400, freq="5min")
+    values = np.full(400, 5.0)
+    values[100:300] = 15.0
+    qc = saqc.SaQC(pd.DataFrame({"value": pd.Series(values, index=index)}))
+    qc = wrappers.flag_jumps(qc, field="value", thresh=3.0, window="1h")["qc"]
+
+    result = wrappers.export_clean_data(qc, decisions=[
+        {"start": str(index[100]), "end": str(index[299]), "difficulty": "clear",
+         "verdict": "anomaly", "anomaly_type": "level_shift", "action": "keep",
+         "reason": "interior 4.5 sigmas above surroundings, both edges sharp"},
+    ])
+    claimed = [e for e in result["flags"] if e["anomaly_type"] == "level_shift"]
+    assert len(claimed) == 200, "the whole window must be claimed, not just its edges"
+    assert result["n_rows_claimed_by_span_not_flagged"] == 199
+
+    # Provenance stays honest: a row a detector found is distinguishable from a row a
+    # decision reached.
+    by_source = {e["flagged_by"] for e in claimed}
+    assert wrappers.SPAN_CLAIMED in by_source and "flagJumps" in by_source
+
+
+def test_a_normal_span_does_not_materialise_rows():
+    """Otherwise a whole-record catch-all keep writes an entry for every row."""
+    qc = _flagged_qc()
+    frame = qc.data.to_pandas()
+    result = wrappers.export_clean_data(qc, decisions=[
+        {"start": str(frame.index[0]), "end": str(frame.index[-1]), "difficulty": "clear",
+         "verdict": "normal", "action": "keep",
+         "reason": "catch-all for everything not judged individually"},
+    ])
+    assert result["n_rows_claimed_by_span_not_flagged"] == 0
+    assert len(result["flags"]) < len(frame), "a keep span must not expand the log"
+
+
 # ---------------------------------------------------------------------------
 # Context tools (CLAUDE.md §7.3)
 # ---------------------------------------------------------------------------

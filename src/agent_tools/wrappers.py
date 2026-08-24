@@ -247,6 +247,11 @@ VERDICT_ANOMALY_TYPES = tuple(sorted(ANOMALY_TYPES - {""}))
 # The asymmetry is the whole point: it is one-directional, so `normal` still means
 # exactly one thing, and detection recall is not quietly bought with untreated rows.
 UNTREATED_ANOMALY_ACTION = "keep"
+
+# `flagged_by` for a row no detector flagged, brought into the log by an `anomaly`
+# decision span covering it (§5). Distinguishes "a decision claimed this" from "a
+# detector found this" — the two are different provenance and the audit pages say so.
+SPAN_CLAIMED = "decision-span"
 MIN_UNTREATED_REASON_CHARS = 20
 
 # How the agent rates its own call. `judgement-call` obliges it to write out the
@@ -408,7 +413,44 @@ def _build_flag_log(
     Returns the entries plus a stats dict for the tool result / message.
     """
     flagged_by = _flagged_by_row(qc, field)
-    stamps = pd.DatetimeIndex(flagged_by.index)
+
+    # A DECISION SPAN CLAIMING AN ANOMALY MARKS EVERY ROW IT COVERS, flagged or not.
+    #
+    # Until 2026-08-24 the log held one entry per FLAGGED row, and that silently capped
+    # what a windowed anomaly could ever claim. A level shift is a span sitting at the
+    # wrong level; flagJumps flags its two EDGES, so the interior was never in the log and
+    # no span could reach it. Measured on 01467200_l1: the agent identified the shift
+    # exactly (2023-09-15 11:40 -> 21:30, against a true 11:40 -> 21:25) and wrote a span
+    # over the whole window — and claimed 2 of 117 rows, because only 3 rows inside it had
+    # been flagged. Every run scored ~0 on level_shift for this reason, whatever the
+    # detector or prompt did.
+    #
+    # Only `anomaly` spans materialise rows. A `normal` span is a statement about
+    # candidates the detectors raised, so it annotates flagged rows and nothing else —
+    # otherwise a whole-record catch-all keep would write an entry for all 210,816 rows.
+    index = pd.DatetimeIndex(qc.data.to_pandas().index)
+    claimed: list[pd.Timestamp] = []
+    for decision in decisions or []:
+        if not isinstance(decision, dict):
+            continue
+        if str(decision.get("verdict", "")).strip().lower() != "anomaly":
+            continue
+        try:
+            lo = pd.Timestamp(decision["start"])
+            hi = pd.Timestamp(decision.get("end") or decision["start"])
+        except (KeyError, ValueError, TypeError):
+            continue                      # validated properly below; skip here
+        if hi < lo:
+            lo, hi = hi, lo
+        claimed.append(index[(index >= lo) & (index <= hi)])
+    extra = index[[]] if not claimed else pd.DatetimeIndex(np.concatenate(
+        [c.to_numpy() for c in claimed])).unique()
+    n_materialised = len(extra.difference(pd.DatetimeIndex(flagged_by.index)))
+
+    stamps = pd.DatetimeIndex(flagged_by.index).union(extra).sort_values()
+    # Rows nothing flagged carry an explicit marker rather than a blank, so a reader can
+    # tell "a decision claimed this" from "a detector found this".
+    flagged_by = flagged_by.reindex(stamps).fillna(SPAN_CLAIMED)
 
     actions = pd.Series(index=stamps, dtype=object)
     reasons = pd.Series("", index=stamps, dtype=object)
@@ -619,6 +661,7 @@ def _build_flag_log(
             if any(e["rationale_source"] == source for e in entries)
         },
         "decisions_matching_no_flagged_row": unmatched,
+        "n_rows_claimed_by_span_not_flagged": n_materialised,
     }
     return entries, stats
 

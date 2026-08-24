@@ -93,6 +93,14 @@ _MAD_TO_SIGMA = 1.4826
 RAMP_MINUTES = 30.0
 RAMP_DIRECTNESS = 0.3
 
+# shift_window_context / find_shift_windows: what makes a span between two jumps a
+# level SHIFT rather than a storm. Interior elevation alone does not separate them —
+# measured on 01467200_l1, 1 of 24 elevated windows was the injected shift, and the
+# biggest storm scored z=+8.6 against the shift's +4.5. Edge sharpness is the lever
+# (§9.1). Fitted on gauges we do not score.
+SHIFT_INTERIOR_SIGMAS = 3.0
+SHIFT_EDGE_SHARPNESS = 0.5
+
 ELEVATED_NOISE_RATIO = 2.0
 LOCAL_STEP_UNREMARKABLE = 8.0
 
@@ -1626,6 +1634,172 @@ def ramp_context(
     return {"tool": "ramp_context", "params": params, "at": str(ts),
             "value": _f(peak), "rise": rise, "fall": fall,
             "reads_like": label, "message": msg}
+
+
+def _edge_sharpness(series, at, k: int = 6) -> float | None:
+    """Largest single-sample move at a transition, as a share of the net step across it.
+
+    §9.1's lever, and the only one that works: a recalibration or sensor swap moves most
+    of its magnitude in ONE sample, while a storm spreads the same net change over hours.
+    1.0 is a cliff; 0.1 is a ramp.
+    """
+    pos = _pos(series, resolve_timestamp(series, at))
+    lo, hi = max(0, pos - k), min(len(series), pos + k + 1)
+    seg = series.iloc[lo:hi].to_numpy(dtype=float)
+    if len(seg) < 4:
+        return None
+    diffs = np.abs(np.diff(seg))
+    diffs = diffs[np.isfinite(diffs)]
+    if not len(diffs):
+        return None
+    before = np.nanmedian(seg[: max(1, len(seg) // 3)])
+    after = np.nanmedian(seg[-max(1, len(seg) // 3):])
+    net = abs(after - before)
+    if not np.isfinite(net) or net <= 0:
+        return None
+    return float(np.max(diffs) / net)
+
+
+def shift_window_context(source, start, end, field: str = VALUE_COL, pad: str = "6h") -> dict:
+    """Is the span between two jumps a LEVEL SHIFT, or a storm?
+
+    The definition this implements: a level shift is the window between two jump points
+    whose interior sits significantly above (or below) its surroundings — plus one clause
+    the data forced, because elevation alone does not separate the two.
+
+    WHY THE EXTRA CLAUSE. Pairing jumps and testing interior elevation recovers the whole
+    shifted window, which is what row-scoring needs: measured on 01467200, row recall goes
+    from ~0.5% (an edge detector against a window label) to 100%. But of 24 such windows on
+    l1, ONE was the injected shift and 23 were storms — and the biggest storm scored z=+8.6
+    against the real shift's z=+4.5, so elevation strength ranks them the wrong way round.
+    §9.1 hit the same wall from the other side and found the lever that does work: EDGE
+    SHARPNESS. A recalibration moves most of its magnitude in one sample; a storm takes
+    hours to rise and hours to recede.
+    """
+    series = as_series(source, field)
+    a = resolve_timestamp(series, start)
+    b = resolve_timestamp(series, end)
+    if b < a:
+        a, b = b, a
+    params = {"field": field, "pad": pad}
+
+    inside = series.loc[a:b].to_numpy(dtype=float)
+    padding = pd.Timedelta(pad)
+    before = series.loc[a - padding: a].to_numpy(dtype=float)
+    after = series.loc[b: b + padding].to_numpy(dtype=float)
+    surround = np.concatenate([before, after])
+    hours = (b - a).total_seconds() / 3600.0
+
+    if np.sum(np.isfinite(inside)) < 4 or np.sum(np.isfinite(surround)) < 4:
+        return {"tool": "shift_window_context", "params": params,
+                "start": str(a), "end": str(b), "hours": _round(hours, 1),
+                "message": "Too little data inside or around this window to judge it."}
+
+    sigma = _MAD_TO_SIGMA * float(np.nanmedian(np.abs(surround - np.nanmedian(surround))))
+    # Floor the scale on the record's own first-difference spread, the same guard §7.1
+    # needs for quantised turbidity. Without it, surroundings that happen to be flat give
+    # sigma == 0 and the elevation test divides by nothing — so the most obvious possible
+    # shift, a clean step out of a quiet baseline, reads as "not shifted".
+    floor = _MAD_TO_SIGMA * float(np.nanmedian(np.abs(np.diff(
+        series.to_numpy(dtype=float)[np.isfinite(series.to_numpy(dtype=float))]))))
+    if not np.isfinite(floor) or floor <= 0:
+        floor = 1e-9
+    sigma = max(sigma, floor)
+    step = float(np.nanmean(inside) - np.nanmean(surround))
+    interior_sigmas = step / sigma if sigma > 0 else None
+
+    onset = _edge_sharpness(series, a)
+    end_sharp = _edge_sharpness(series, b)
+    sharp_edges = [x for x in (onset, end_sharp) if x is not None]
+    abrupt = bool(sharp_edges) and min(sharp_edges) >= SHIFT_EDGE_SHARPNESS
+    elevated = interior_sigmas is not None and abs(interior_sigmas) >= SHIFT_INTERIOR_SIGMAS
+
+    if elevated and abrupt:
+        label = "level-shift-like"
+        why = ("the interior sits well away from its surroundings AND both edges are "
+               "abrupt — the signature of a recalibration or sensor swap")
+    elif elevated:
+        label = "event-like"
+        why = ("the interior is elevated, but at least one edge RAMPS rather than steps. "
+               "A storm rises and recedes over hours; a shift does not. This is the "
+               "distinction elevation alone cannot make")
+    else:
+        label = "not-shifted"
+        why = "the interior is not meaningfully different from its surroundings"
+
+    return {
+        "tool": "shift_window_context", "params": params,
+        "start": str(a), "end": str(b), "hours": _round(hours, 1),
+        "interior_mean": _round(float(np.nanmean(inside)), 3),
+        "surrounding_mean": _round(float(np.nanmean(surround)), 3),
+        "interior_sigmas": _round(interior_sigmas, 1),
+        "onset_sharpness": _round(onset, 2),
+        "end_sharpness": _round(end_sharp, 2),
+        "reads_like": label,
+        "message": (
+            f"{hours:.1f}h window: interior mean {np.nanmean(inside):.2f} vs surroundings "
+            f"{np.nanmean(surround):.2f} ({_round(interior_sigmas, 1)} robust sigmas), "
+            f"edges {_round(onset, 2)} / {_round(end_sharp, 2)} sharpness "
+            f"(1.0 = one-sample cliff). Reads as {label} — {why}."
+        ),
+    }
+
+
+def find_shift_windows(source, ats, field: str = VALUE_COL, min_hours: float = 1.0,
+                       max_hours: float = 48.0, max_windows: int = 20) -> dict:
+    """Pair up jump timestamps into candidate level-shift windows and rank them.
+
+    *ats* is a detector's flagged_datetimes — normally flag_jumps'. Every nearby pair
+    inside the duration bounds becomes a candidate window, each is measured by
+    :func:`shift_window_context`, and overlapping candidates are merged so one event is
+    reported once rather than as thirty windows with sliding start times.
+    """
+    series = as_series(source, field)
+    stamps = sorted({resolve_timestamp(series, a) for a in ats})
+    params = {"field": field, "min_hours": min_hours, "max_hours": max_hours}
+
+    raw = []
+    for i, a in enumerate(stamps):
+        for b in stamps[i + 1: i + 12]:
+            hours = (b - a).total_seconds() / 3600.0
+            if hours < min_hours:
+                continue
+            if hours > max_hours:
+                break
+            measured = shift_window_context(series, a, b, field=field)
+            if measured.get("reads_like") in ("level-shift-like", "event-like"):
+                raw.append(measured)
+            break
+
+    raw.sort(key=lambda r: (r["start"], r["end"]))
+    merged = []
+    for cand in raw:
+        if merged and cand["start"] <= merged[-1]["end"]:
+            keep = dict(max(merged[-1], cand, key=lambda r: abs(r.get("interior_sigmas") or 0)))
+            keep["start"] = min(merged[-1]["start"], cand["start"])
+            keep["end"] = max(merged[-1]["end"], cand["end"])
+            merged[-1] = keep
+        else:
+            merged.append(cand)
+
+    order = {"level-shift-like": 0, "event-like": 1}
+    merged.sort(key=lambda r: (order.get(r["reads_like"], 2), -abs(r.get("interior_sigmas") or 0)))
+    shown = merged[:max_windows]
+    n_shift = sum(1 for r in merged if r["reads_like"] == "level-shift-like")
+    return {
+        "tool": "find_shift_windows", "params": params,
+        "n_jumps": len(stamps), "n_windows": len(merged), "n_level_shift_like": n_shift,
+        "windows": [{k: r[k] for k in ("start", "end", "hours", "interior_sigmas",
+                                       "onset_sharpness", "end_sharpness", "reads_like")}
+                    for r in shown],
+        "message": (
+            f"Paired {len(stamps)} jump(s) into {len(merged)} candidate window(s): "
+            f"{n_shift} read as level-shift-like (abrupt edges), "
+            f"{len(merged) - n_shift} as event-like (elevated but ramped — storms). "
+            "A level-shift-like window is a claim about the WHOLE span: if you accept it, "
+            "write one decision span covering it, not just its edges."
+        ),
+    }
 
 
 def noise_profile(

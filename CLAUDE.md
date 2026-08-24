@@ -261,6 +261,19 @@ narrowest covering span wins. Details the contract above did not say:
   it calibrates: on the next run 12.1% of spans were judgement calls, and those were wrong
   66.7% vs 27.8% for `clear` — 2.4x, which is what makes the queue worth reviewing. Note
   `clear` is still wrong 27.8% of the time: directionally calibrated, not yet sufficient.
+- **An `anomaly` decision span CLAIMS EVERY ROW IT COVERS, flagged or not** (2026-08-24).
+  The log was one entry per *flagged* row, and that silently capped what a windowed
+  anomaly could ever report. A level shift is a span sitting at the wrong level;
+  `flagJumps` flags its two EDGES, so the interior was never in the log and no decision
+  could reach it. Measured on 01467200_l1: the agent identified the shift almost exactly
+  (`2023-09-15 11:40 → 21:30` against a true `11:40 → 21:25`) and claimed **2 of 117
+  rows**, because only 3 rows inside its own span had been flagged. Every run scored ~0
+  on level_shift for this reason, whatever the detector or the prompt did.
+  Rows brought in this way carry `flagged_by = "decision-span"` (`wrappers.SPAN_CLAIMED`)
+  so a reader can tell a detector's find from a decision's claim, and the count is
+  reported as `n_rows_claimed_by_span_not_flagged`. **Only `anomaly` spans materialise
+  rows** — a `normal` span is a statement about candidates the detectors raised, and
+  materialising it would write an entry for all 210,816 rows on a whole-record catch-all.
 - **A decision marked `difficulty: "judgement-call"` MUST carry a `deliberation`** and
   `export_clean_data` raises without one (§13, fail loudly). `reason` states the conclusion;
   `deliberation` shows the working — what pointed which way, what was weighed, what would have
@@ -1414,7 +1427,16 @@ second variable to clean, but that reading should be confirmed before building o
 ## 10. Evaluation
 
 - **Detection:** precision / recall / F1 per anomaly type + macro-F1 (scikit-learn), vs the
-  injected labels, over the **four** types (spike, plateau, level_shift, gap). The §11
+  injected labels, over the **four** types (spike, plateau, level_shift, gap).
+  **`level_shift` is scored by EPISODE OVERLAP, not per row** (`evaluate.EPISODE_TYPES`,
+  2026-08-24), and the printed table marks it with `*`. Per-row scoring of a windowed
+  anomaly measures how much of the span was claimed rather than whether the event was
+  found, which for an edge detector is close to a category error: measured on run E, the
+  same flag log scores **0.009 by row and 1.000 by episode**, and macro-F1 moves 0.651 →
+  0.772 on the identical run. **That is a measurement correction, not a capability gain** —
+  do not report it as the agent improving. Truth and prediction runs are bridged across
+  gaps shorter than `EPISODE_BRIDGE` (6 h) first, because §9 lets a segment anomaly span
+  dropouts and one injected shift arrives as up to five labelled fragments. The §11
   macro-F1 ≥ 0.70 target refers to those four. Drift is not scored at all — it is removed
   (§9.2); it was already excluded from macro-F1 when it existed, so the headline number is
   unchanged by its removal, and there is no longer a drift correction-quality metric.

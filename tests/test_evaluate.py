@@ -317,3 +317,43 @@ def test_score_imputation():
     # Values: 11.333, 11.666 -> errors vs [12.0, 11.0] are > 0
     assert score.baseline_mae > 0
     assert score.baseline_rmse > 0
+
+
+def test_level_shift_is_scored_by_episode_because_a_jump_flags_an_edge():
+    """Per-row scoring of a windowed anomaly measures span coverage, not detection.
+
+    Measured on 01467200_l1: the agent identified the shift almost exactly
+    (2023-09-15 11:40 -> 21:30 against a true 11:40 -> 21:25) and scored 0.009 row
+    recall, because flagJumps flags the two EDGES and the interior was never claimed.
+    By episode the same run scores 1.000.
+    """
+    from src.evaluate import score_episodes, _episodes
+
+    index = pd.date_range("2024-01-01", periods=400, freq="5min")
+    truth = index[100:300]                     # one 200-row event
+
+    # an edge-only claim: the two transitions and nothing between them
+    edges = index[[100, 299]]
+    p, r, f1, n_true, n_pred = score_episodes(truth, edges)
+    assert n_true == 1
+    assert r == 1.0, "overlapping the event at all means it was found"
+
+    # missing it entirely
+    p, r, f1, n_true, n_pred = score_episodes(truth, index[350:360])
+    assert r == 0.0 and p == 0.0
+
+    # gaps inside one event must not split it into several (§9 lets shifts span dropouts)
+    fragmented = index[100:150].union(index[200:300])     # a 4h hole in the middle
+    assert len(_episodes(fragmented)) == 1
+
+
+def test_episode_scoring_is_marked_in_the_table():
+    """1-of-1 episodes and 1-of-117 rows must not be readable as the same number."""
+    from src.evaluate import TypeScore, format_table
+
+    scores = [TypeScore("spike", 63, 108, 0.509, 0.873, 0.643),
+              TypeScore("level_shift", 1, 3, 0.333, 1.0, 0.5, by_episode=True)]
+    table = format_table(scores, 0.772, scored_verdicts=True)
+    assert "0.500 *" in table
+    assert "EPISODE OVERLAP" in table
+    assert "counts of" in table

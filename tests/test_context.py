@@ -537,3 +537,61 @@ def test_ramp_context_measures_the_climb_a_45_minute_window_cannot_see():
     assert "Nothing long and meandering leads into this point" in spike["message"]
     # and it still refuses to decide on its own
     assert "check width, recovery and rainfall" in spike["message"]
+
+
+def test_a_shift_window_is_judged_on_its_edges_not_just_its_elevation():
+    """Elevation alone cannot separate a level shift from a storm.
+
+    Measured on 01467200_l1: of 24 windows elevated between two jumps, ONE was the
+    injected shift and 23 were storms — and the largest storm scored z=+8.6 against
+    the real shift's +4.5, so ranking by elevation puts them the wrong way round.
+    §9.1's lever is edge sharpness: a recalibration moves in one sample, a storm ramps.
+    """
+    index = pd.date_range("2024-01-01", periods=600, freq="5min")
+
+    # a true shift: instantaneous step up, holds, instantaneous step back
+    shifted = np.full(600, 5.0)
+    shifted[200:400] = 15.0
+    step = ctx.shift_window_context(pd.Series(shifted, index=index),
+                                    start=index[200], end=index[399])
+    assert step["reads_like"] == "level-shift-like"
+    assert step["interior_sigmas"] is not None and abs(step["interior_sigmas"]) >= 3
+    assert step["onset_sharpness"] >= ctx.SHIFT_EDGE_SHARPNESS
+    assert "recalibration or sensor swap" in step["message"]
+
+    # a storm: same elevation, but it ramps in and out over hours
+    storm = np.full(600, 5.0)
+    storm[200:260] = np.linspace(5, 15, 60)
+    storm[260:340] = 15.0
+    storm[340:400] = np.linspace(15, 5, 60)
+    ramped = ctx.shift_window_context(pd.Series(storm, index=index),
+                                      start=index[200], end=index[399])
+    assert ramped["reads_like"] == "event-like", ramped["message"]
+    assert ramped["onset_sharpness"] < ctx.SHIFT_EDGE_SHARPNESS
+    assert "ramps rather than steps" in ramped["message"].lower()
+
+    # flat: nothing to report
+    flat = ctx.shift_window_context(pd.Series(np.full(600, 5.0), index=index),
+                                    start=index[200], end=index[399])
+    assert flat["reads_like"] == "not-shifted"
+
+
+def test_find_shift_windows_reports_one_event_not_thirty_sliding_ones():
+    """A jump list produces many overlapping pairs; the tool must merge them."""
+    index = pd.date_range("2024-01-01", periods=600, freq="5min")
+    values = np.full(600, 5.0)
+    values[200:400] = 15.0
+    series = pd.Series(values, index=index)
+
+    # jump timestamps as a detector would give them: a cluster at each edge
+    ats = [str(index[i]) for i in (198, 199, 200, 201, 398, 399, 400, 401)]
+    found = ctx.find_shift_windows(series, ats)
+
+    assert found["n_windows"] <= 2, found["windows"]
+    assert found["n_level_shift_like"] >= 1
+    best = found["windows"][0]
+    assert best["reads_like"] == "level-shift-like"
+    # and it spans the WHOLE shifted region, which is the point of the tool
+    assert pd.Timestamp(best["start"]) <= index[201]
+    assert pd.Timestamp(best["end"]) >= index[398]
+    assert "WHOLE span" in found["message"]

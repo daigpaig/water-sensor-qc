@@ -38,6 +38,10 @@ from src.agent_tools import precipitation
 
 # Bump on every edit to SYSTEM_PROMPT and note the change in the commit message,
 # so a run in logs/*.jsonl can be tied to the exact prompt that produced it.
+# v0.14: a jump is an EDGE, a level shift is a WINDOW. find_shift_windows pairs
+#        flag_jumps edges into candidate spans and measures interior elevation plus edge
+#        sharpness; the prompt now requires a decision span over the whole window. The
+#        detector was already finding every onset and scoring 0.9% recall.
 # v0.13: every spike verdict is audited against rainfall (precip_context_points, §7.7) —
 #        outside evidence for the points the series alone cannot settle; ramp_context adds
 #        the multi-hour shape above slope_context's 45-min window; slope_context's window
@@ -69,7 +73,7 @@ from src.agent_tools import precipitation
 #       override a specific verdict.
 # v0.5: phases replace the fixed STEP script (only inspect-first, range-before-spikes and
 #       export-last are forced); three context primitives exposed as tools.
-SYSTEM_PROMPT_VERSION = "v0.13-draft"
+SYSTEM_PROMPT_VERSION = "v0.14-draft"
 
 # The model is a CLAUDE.md §2 golden rule — do not change it without changing §2.
 MODEL = "claude-sonnet-4-6"
@@ -383,8 +387,31 @@ the main defence against a mis-parameterised detector wrecking a run.
     re-run rather than reasoning about the flags. (Re-running cannot un-flag, so the first
     call should be the strict one.) A "there are no level shifts here" conclusion drawn from
     an over-flagged run is not a finding; it is the parameter talking.
-    Confirm with: describe_point — the level_shift block gives you median before vs after,
-    the step in robust sigmas, step_sharpness, and how long the new level actually held.
+    Confirm with: find_shift_windows FIRST, then describe_point on anything still in doubt.
+
+    A JUMP IS AN EDGE; A LEVEL SHIFT IS A WINDOW. This is the single most important thing
+    on this type and it has cost every run so far. flag_jumps marks the TRANSITION — the
+    one row where the level moved — but the anomaly is the whole span that then sits at
+    the wrong level. Measured on this project's data: the detector found EVERY onset and
+    still scored 0.9% recall, because 116 of the 117 corrupted rows were never claimed.
+    Reporting the edge is not reporting the shift.
+
+    So pass flag_jumps' flagged_datetimes to find_shift_windows. It pairs the edges into
+    candidate windows and measures each one. Two numbers decide it, and you need BOTH:
+      * interior_sigmas — how far the inside of the window sits from its surroundings.
+      * onset_sharpness / end_sharpness — 1.0 means the level moved in ONE sample, 0.1
+        means it ramped over hours.
+    Elevation alone cannot separate a shift from a storm: a storm is also elevated between
+    two jumps, and measured here the largest storm scored HIGHER than the real shift
+    (z=+8.6 vs +4.5). Sharp edges are what distinguish a recalibration from weather.
+
+    When you accept a window, write ONE decision span covering the WHOLE span, start to
+    end. A span covering only the edge claims one row and leaves the rest of the corrupted
+    segment unreported.
+
+    describe_point's level_shift block still gives you median before vs after, the step in
+    robust sigmas, step_sharpness, and how long the new level held — use it on a single
+    window you are unsure about, after find_shift_windows has narrowed the field.
     Default action: KEEP and flag, unless clearly erroneous.
     Judgement — read this carefully, it is the hardest call you make. flag_jumps fires on
     every sharp change, and in turbidity most sharp changes are storm rising limbs and
@@ -428,6 +455,9 @@ Utility
                        column min/max/mean/std. ALSO returns noise_profile: which calendar
                        stretches of THIS record are noisier than its own typical window.
                        ALWAYS call this first, before anything else.
+  find_shift_windows   Pairs flag_jumps edges into candidate LEVEL-SHIFT WINDOWS and
+                       measures each. A jump is an edge; the shift is the whole span.
+  shift_window_context One candidate window: interior vs surroundings, edge sharpness.
   ramp_context         How long the series took to CLIMB to a point and to come back down —
                        the shape ABOVE the 90-minute scale that slope_context measures.
   precip_context_points  Was it raining? Checks a LIST of timestamps against nearby rainfall.
@@ -873,7 +903,10 @@ def _get_tool_function(tool_name: str):
 # unexported. Two things were wrong and both are fixed: the exception is not an
 # `anthropic.APIError`, so it escaped the handler that exists to break gracefully,
 # and nothing re-issued the request.
-_STREAM_ATTEMPTS = 3
+# Four attempts, not three: each one is now bounded by the 300s read timeout above
+# rather than the SDK default, so the whole retry sequence costs ~20 minutes worst case
+# instead of two hours. More attempts is the cheaper trade once each is cheap.
+_STREAM_ATTEMPTS = 4
 _STREAM_BACKOFF_SECONDS = 5.0
 
 
@@ -934,8 +967,20 @@ def run_agent(
     # far higher than for a single request. Measured 2026-08-13 on 08041770_l1 — an
     # `overloaded_error` at step 15 of 15, one call before export_clean_data, threw away
     # a complete run's worth of work. The SDK retries 408/409/429/5xx with backoff.
+    # An EXPLICIT read timeout, because the SDK's default is far too long for this
+    # workload. A stalled stream is common here and the read timeout is what bounds it:
+    # measured 2026-08-21/22, three separate runs lost their export turn to stalls that
+    # each burned ~40 minutes before the retry below got a turn, so three attempts took
+    # two hours and then gave up — run D died at step 13 with 12 steps of work unexported.
+    #
+    # `read` is the gap BETWEEN streamed chunks, not the total response time, so a long
+    # answer is unaffected: a healthy stream delivers continuously. 300s is generous
+    # against that and still turns a stall into a fast failure the retry can act on.
+    # `connect` is short because a connection that has not opened in 15s will not.
     client = anthropic.Anthropic(
-        api_key=os.environ["ANTHROPIC_API_KEY"], max_retries=8
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+        max_retries=8,
+        timeout=httpx.Timeout(1800.0, connect=15.0, read=300.0),
     )
 
     messages = [

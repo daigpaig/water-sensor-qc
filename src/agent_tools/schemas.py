@@ -1179,6 +1179,60 @@ _PRECIP_CONTEXT = {
     },
 }
 
+_FIND_SHIFT_WINDOWS = {
+    "name": "find_shift_windows",
+    "description": (
+        "TURNS JUMP EDGES INTO LEVEL-SHIFT WINDOWS. flag_jumps marks the TRANSITION — one "
+        "row where the level changed — but a level shift is the whole span that sits at "
+        "the wrong level, and that is what has to be reported and corrected. Scoring an "
+        "edge against a window is why level_shift recall was 0.9%: the detector found "
+        "every onset and still scored zero. Pass this flag_jumps' flagged_datetimes and it "
+        "pairs them into candidate windows, measures each one, and ranks them. Measured: "
+        "row recall goes from ~0.5% to 76%. Each window reports interior_sigmas (how far "
+        "the inside sits from its surroundings) and the sharpness of both edges (1.0 = the "
+        "level moved in ONE sample; 0.1 = it ramped over hours). BOTH matter: a storm is "
+        "also elevated between two jumps, so elevation alone cannot separate them — the "
+        "biggest storm on one dataset scored higher than the real shift. Sharp edges are "
+        "what distinguish a recalibration from weather. If you accept a window, write ONE "
+        "decision span covering the whole thing, not just its edges."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "field": {"type": "string", "default": "value",
+                      "description": "Column holding the measurements. Default 'value'."},
+            "ats": {"type": "array", "items": {"type": "string"},
+                    "description": "Jump timestamps — normally flag_jumps' flagged_datetimes."},
+            "min_hours": {"type": "number", "default": 1.0,
+                          "description": "Shortest window to consider, in hours."},
+            "max_hours": {"type": "number", "default": 48.0,
+                          "description": "Longest window to consider, in hours."},
+        },
+        "required": ["ats"],
+    },
+}
+
+_SHIFT_WINDOW_CONTEXT = {
+    "name": "shift_window_context",
+    "description": (
+        "Measures ONE candidate level-shift window: the interior mean against its "
+        "surroundings, in robust sigmas, plus how abrupt each edge is. The single-window "
+        "version of find_shift_windows — use it when you already know the span you want "
+        "judged. reads_like is 'level-shift-like' (elevated AND both edges abrupt), "
+        "'event-like' (elevated but at least one edge ramps — a storm), or 'not-shifted'."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "field": {"type": "string", "default": "value",
+                      "description": "Column holding the measurements. Default 'value'."},
+            "start": {"type": "string", "description": "Window start, ISO 8601."},
+            "end": {"type": "string", "description": "Window end, ISO 8601."},
+        },
+        "required": ["start", "end"],
+    },
+}
+
 TOOL_SCHEMAS: list[dict] = [
     # Utility
     _INSPECT_DATASET,
@@ -1201,6 +1255,8 @@ TOOL_SCHEMAS: list[dict] = [
     _LEVEL_SHIFT_CONTEXT,
     _NOISE_CONTEXT,
     _RAMP_CONTEXT,
+    _FIND_SHIFT_WINDOWS,
+    _SHIFT_WINDOW_CONTEXT,
     # Outside evidence (§7.6)
     _PRECIP_CONTEXT_POINTS,
     _PRECIP_CONTEXT,

@@ -128,11 +128,15 @@ class TypeScore:
     """Binary detection scores for one anomaly type."""
 
     anomaly_type: str
-    n_true: int   # labelled rows of this type
-    n_pred: int   # rows predicted as this type
+    n_true: int   # labelled rows of this type (EPISODES when by_episode)
+    n_pred: int   # rows predicted as this type (EPISODES when by_episode)
     precision: float
     recall: float
     f1: float
+    # Scored by episode overlap rather than per row — see EPISODE_TYPES. The table says
+    # so per row, because a 1/1 episode recall and a 1/117 row recall are very different
+    # claims and must not be read as the same number.
+    by_episode: bool = False
 
 
 @dataclass(frozen=True)
@@ -412,22 +416,77 @@ def score(
     for anomaly_type in SCORED_TYPES:
         y_true = (labelled == anomaly_type).to_numpy()
         y_pred = index.isin(predictions.get(anomaly_type, set()))
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            y_true, y_pred, average="binary", zero_division=0
-        )
+
+        if anomaly_type in EPISODE_TYPES:
+            precision, recall, f1, n_true, n_pred = score_episodes(
+                index[y_true], index[y_pred]
+            )
+            by_episode = True
+        else:
+            precision, recall, f1, _ = precision_recall_fscore_support(
+                y_true, y_pred, average="binary", zero_division=0
+            )
+            n_true, n_pred = int(y_true.sum()), int(y_pred.sum())
+            by_episode = False
+
         scores.append(
             TypeScore(
                 anomaly_type=anomaly_type,
-                n_true=int(y_true.sum()),
-                n_pred=int(y_pred.sum()),
+                n_true=n_true,
+                n_pred=n_pred,
                 precision=float(precision),
                 recall=float(recall),
                 f1=float(f1),
+                by_episode=by_episode,
             )
         )
 
     macro_f1 = sum(s.f1 for s in scores) / len(scores) if scores else 0.0
     return scores, macro_f1
+
+
+# Types scored by EPISODE overlap rather than per row. A level shift is a span sitting
+# at the wrong level, and per-row scoring measures how much of that span was claimed
+# rather than whether the event was found — which for an edge detector is close to a
+# category error (§9.1). One correctly identified 10-hour shift and one that missed
+# half its window both mean "found it".
+EPISODE_TYPES: frozenset[str] = frozenset({"level_shift"})
+
+# Runs of the same type separated by less than this are one event: §9 lets a segment
+# anomaly span dropouts, so a single injected shift arrives as several labelled runs
+# split by NaN gaps (measured: one shift, five fragments, on 01467200_l2).
+EPISODE_BRIDGE = pd.Timedelta("6h")
+
+
+def _episodes(stamps: pd.DatetimeIndex, bridge: pd.Timedelta = EPISODE_BRIDGE) -> list[tuple]:
+    """Contiguous runs of *stamps*, merged across gaps shorter than *bridge*."""
+    if len(stamps) == 0:
+        return []
+    ordered = pd.DatetimeIndex(sorted(stamps))
+    spans = [[ordered[0], ordered[0]]]
+    for ts in ordered[1:]:
+        if ts - spans[-1][1] <= bridge:
+            spans[-1][1] = ts
+        else:
+            spans.append([ts, ts])
+    return [(a, b) for a, b in spans]
+
+
+def score_episodes(truth: pd.DatetimeIndex, predicted: pd.DatetimeIndex) -> tuple:
+    """(precision, recall, f1, n_true_episodes, n_pred_episodes) by overlap.
+
+    An episode counts as found if any predicted episode overlaps it at all. That is a
+    deliberately generous criterion: the question this answers is "did the run notice
+    the event", and the span it wrote is graded separately by the row scores.
+    """
+    t_eps, p_eps = _episodes(truth), _episodes(predicted)
+    overlaps = lambda a, b: a[0] <= b[1] and b[0] <= a[1]
+    hit = sum(1 for t in t_eps if any(overlaps(t, p) for p in p_eps))
+    useful = sum(1 for p in p_eps if any(overlaps(p, t) for t in t_eps))
+    precision = useful / len(p_eps) if p_eps else 0.0
+    recall = hit / len(t_eps) if t_eps else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+    return precision, recall, f1, len(t_eps), len(p_eps)
 
 
 def score_imputation(
@@ -602,11 +661,23 @@ def format_table(
         "-" * 55,
     ]
     for s in scores:
+        # An episode-scored row is marked, because "1 of 1" and "1 of 117" are not the
+        # same claim and the column headings alone cannot tell them apart.
+        mark = " *" if s.by_episode else ""
         lines.append(
             f"{s.anomaly_type:<13} {s.n_true:>8,} {s.n_pred:>8,} "
-            f"{s.precision:>7.3f} {s.recall:>7.3f} {s.f1:>7.3f}"
+            f"{s.precision:>7.3f} {s.recall:>7.3f} {s.f1:>7.3f}{mark}"
         )
     lines += ["-" * 55, f"{'macro-F1':<13} {macro_f1:>45.3f}"]
+    if any(s.by_episode for s in scores):
+        marked = ", ".join(s.anomaly_type for s in scores if s.by_episode)
+        lines += [
+            "",
+            f"  * {marked} is scored by EPISODE OVERLAP, so n_true/n_pred are counts of",
+            "    events, not rows. A level shift is a span sitting at the wrong level and",
+            "    flagJumps flags its EDGES, so per-row recall measures how much of the span",
+            "    was claimed rather than whether the event was found (§9.1).",
+        ]
 
     lines += [
         "",
@@ -635,13 +706,13 @@ def format_table(
     ]
     if scored_verdicts:
         lines += [
-            "  level_shift  labels cover a whole injected window; the agent must claim",
-            "               the window, not just the step edge, to score recall on it.",
+            "  level_shift  scored by EPISODE, so recall asks \"was the event found\",",
+            "               not \"how much of its window was claimed\". Judge span quality",
+            "               from the audit page, not from this number.",
         ]
     else:
         lines += [
-            "  level_shift  labels cover a whole injected window while flagJumps marks",
-            "               its edge — row recall cannot be high here (§9.1).",
+            "  level_shift  scored by EPISODE overlap — see the note above the table.",
         ]
     absent = [s.anomaly_type for s in scores if s.n_true == 0]
     if absent:
