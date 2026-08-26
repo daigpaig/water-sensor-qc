@@ -12,6 +12,7 @@ Implemented in Phase 2
 """
 
 import json
+import types
 from pathlib import Path
 
 import numpy as np
@@ -248,10 +249,34 @@ VERDICT_ANOMALY_TYPES = tuple(sorted(ANOMALY_TYPES - {""}))
 # exactly one thing, and detection recall is not quietly bought with untreated rows.
 UNTREATED_ANOMALY_ACTION = "keep"
 
+# ...and the type it is allowed FOR. `anomaly` + `keep` exists for one situation: a gap
+# longer than any defensible imputation window, where forcing consistency would make the
+# agent either lie about the verdict or fill a hole it had just called unfillable. Every
+# other type has a treatment available, so the pair there says "the sensor is wrong and I
+# am shipping the wrong values anyway", which is not a defensible export.
+#
+# It was unrestricted until 2026-08-25 and level_shift walked straight through the gap.
+# Measured on run I: the agent bounded the injected shift to within one sample, wrote
+# that both edges "move in essentially one sample" and that the date sits in none of the
+# 419 elevated-noise stretches — i.e. it concluded the step was an artifact — and then
+# kept all 118 rows, because §6's "keep unless clearly erroneous" is the DEFAULT and
+# nothing made it revisit that once its own evidence had cleared the bar. The validator
+# accepted it because the only test on the pair was that `reason` ran past 20 characters.
+UNTREATED_ANOMALY_TYPES = frozenset({"gap"})
+
 # `flagged_by` for a row no detector flagged, brought into the log by an `anomaly`
 # decision span covering it (§5). Distinguishes "a decision claimed this" from "a
 # detector found this" — the two are different provenance and the audit pages say so.
 SPAN_CLAIMED = "decision-span"
+
+# Types whose anomaly spans bring unflagged rows into the log. Only `level_shift` has the
+# edge-vs-window mismatch that needs it (flagJumps marks two edges; the anomaly is the
+# span between). Everything else is already flagged row-for-row by its own detector.
+SPAN_MATERIALISING_TYPES = frozenset({"level_shift"})
+
+# Backstop against one span expanding the log by a whole series. A level shift is bounded
+# at 4-24 h by §9, so ~3000 five-minute rows is far above any legitimate window.
+MAX_SPAN_MATERIALISED_ROWS = 5000
 MIN_UNTREATED_REASON_CHARS = 20
 
 # How the agent rates its own call. `judgement-call` obliges it to write out the
@@ -344,6 +369,20 @@ def _validate_verdict(
             )
 
     if verdict == "anomaly" and action == UNTREATED_ANOMALY_ACTION:
+        if anomaly_type not in UNTREATED_ANOMALY_TYPES:
+            raise ValueError(
+                f"decisions[{i}] calls this segment a {anomaly_type} — an anomaly, i.e. "
+                "the sensor is wrong here — and then keeps the recorded values. That "
+                "pair ships data you have just said is faulty, and it is only allowed "
+                f"for {', '.join(sorted(UNTREATED_ANOMALY_TYPES))} (a gap too long for "
+                "any defensible imputation window has genuinely no treatment). A "
+                f"{anomaly_type} does: 'delete' the values, or 'correct' them. If you "
+                "instead think this is real water the sensor reported correctly — a "
+                "storm peak, a genuine step change in the river — then say so: that is "
+                "verdict='normal' with action='keep', which is a rejection of your own "
+                "detector and scores as one. Choose whichever you actually believe, but "
+                "not both at once."
+            )
         # Allowed, but only as a stated choice. Without this the pair becomes the
         # cost-free way to claim a detection while doing nothing about it.
         if len(reason) < MIN_UNTREATED_REASON_CHARS:
@@ -425,15 +464,25 @@ def _build_flag_log(
     # been flagged. Every run scored ~0 on level_shift for this reason, whatever the
     # detector or prompt did.
     #
-    # Only `anomaly` spans materialise rows. A `normal` span is a statement about
-    # candidates the detectors raised, so it annotates flagged rows and nothing else —
-    # otherwise a whole-record catch-all keep would write an entry for all 210,816 rows.
+    # ONLY WINDOWED TYPES MATERIALISE, and only up to a cap. Restricting this to
+    # `anomaly` spans was not enough: on the 2026-08-24 run the agent wrote a perfectly
+    # reasonable whole-record catch-all — `anomaly` / `gap` / `impute` over all 2 years —
+    # and the log came back with 210,816 entries, one per row of the series.
+    #
+    # The edge-vs-window mismatch this feature exists for is specific to `level_shift`:
+    # flagJumps flags two edges while the anomaly is the span between them. Every other
+    # type is already flagged row-for-row by its own detector — flagNAN flags every NaN,
+    # flagConstants flags the whole stuck run — so materialising them adds nothing and
+    # risks exactly the blow-up above.
     index = pd.DatetimeIndex(qc.data.to_pandas().index)
     claimed: list[pd.Timestamp] = []
+    oversized: list[tuple] = []
     for decision in decisions or []:
         if not isinstance(decision, dict):
             continue
         if str(decision.get("verdict", "")).strip().lower() != "anomaly":
+            continue
+        if str(decision.get("anomaly_type", "")).strip().lower() not in SPAN_MATERIALISING_TYPES:
             continue
         try:
             lo = pd.Timestamp(decision["start"])
@@ -442,7 +491,13 @@ def _build_flag_log(
             continue                      # validated properly below; skip here
         if hi < lo:
             lo, hi = hi, lo
-        claimed.append(index[(index >= lo) & (index <= hi)])
+        covered = index[(index >= lo) & (index <= hi)]
+        # A backstop, so one mistyped end timestamp cannot expand the log by a whole
+        # series even within a materialising type. Reported, never silent.
+        if len(covered) > MAX_SPAN_MATERIALISED_ROWS:
+            oversized.append((decision.get("start"), decision.get("end"), len(covered)))
+            continue
+        claimed.append(covered)
     extra = index[[]] if not claimed else pd.DatetimeIndex(np.concatenate(
         [c.to_numpy() for c in claimed])).unique()
     n_materialised = len(extra.difference(pd.DatetimeIndex(flagged_by.index)))
@@ -662,8 +717,58 @@ def _build_flag_log(
         },
         "decisions_matching_no_flagged_row": unmatched,
         "n_rows_claimed_by_span_not_flagged": n_materialised,
+        "spans_too_wide_to_materialise": oversized,
     }
     return entries, stats
+
+
+# §7.7: rainfall is the only evidence that comes from OUTSIDE the turbidity series, so
+# it is the only thing that can overturn a call the series itself makes to look obvious.
+# The prompt has mandated auditing every spike against it since v0.13 and the audit never
+# happened once — the dispatch branch was missing, so every call returned "Unknown tool"
+# (fixed 2026-08-25). A requirement that lives only in prompt text fails exactly that
+# quietly, so it is enforced here instead, against evidence the run actually obtained.
+PRECIP_AUDITED_ACTIONS = frozenset({"delete", "correct"})
+MAX_UNAUDITED_LISTED = 20
+
+
+def _require_precip_audit(entries: list[dict], audited) -> None:
+    """Refuse to destroy a spike's value that was never checked against rainfall.
+
+    Scoped deliberately narrowly. It covers spikes the run is about to DELETE or
+    CORRECT, because that is the irreversible act §1 calls the worst outcome and the
+    one rain can prevent — not every spike verdict, and not the other three types,
+    whose storm-vs-artifact question rainfall does not answer.
+
+    ``audited`` is ``None`` for any caller that is not the agent runner, which switches
+    the check off rather than failing a library call that never had a chance to look.
+    """
+    if audited is None:
+        return
+    unaudited = sorted({
+        e["datetime"] for e in entries
+        if e.get("anomaly_type") == "spike"
+        and e.get("verdict") == "anomaly"
+        and e.get("action") in PRECIP_AUDITED_ACTIONS
+        and e["datetime"] not in audited
+    })
+    if not unaudited:
+        return
+    shown = ", ".join(unaudited[:MAX_UNAUDITED_LISTED])
+    more = (f" (and {len(unaudited) - MAX_UNAUDITED_LISTED} more)"
+            if len(unaudited) > MAX_UNAUDITED_LISTED else "")
+    raise ValueError(
+        f"{len(unaudited)} row(s) are about to have a spike's value removed without ever "
+        f"being checked against rainfall: {shown}{more}. Rain is the only evidence here "
+        "that does not come from the turbidity series itself, so it is the only thing "
+        "that can overturn a call the series makes look clear-cut — which is exactly why "
+        "this applies to the obvious ones too, not just the borderline ones. Pass EVERY "
+        "timestamp you intend to delete or correct as a spike to precip_context_points "
+        "(it takes 300 at a time, so this is one call), then export again. If a station "
+        "cannot cover a timestamp the result says so, and that point stays unaudited: "
+        "'no data' is not 'no rain', so decide it on the series alone and record that "
+        "reasoning — or keep the value."
+    )
 
 
 def export_clean_data(
@@ -672,6 +777,7 @@ def export_clean_data(
     decisions: list[dict] | None = None,
     output_dir: str | Path | None = None,
     stem: str | None = None,
+    precip_audited: frozenset[str] | set[str] | None = None,
 ) -> dict:
     """
     Takes the final, cleaned data and gives it back as a simple spreadsheet-like format,
@@ -686,6 +792,11 @@ def export_clean_data(
     *output_dir* and *stem* are supplied by the runner, not by the agent (they are
     absent from the tool schema): given both, the flag log is written to
     ``<output_dir>/<stem>_flags.json``. Without them the entries are returned only.
+
+    *precip_audited* is likewise injected by the runner: the set of timestamps that have
+    actually come back from a precipitation call with a real answer. Deleting a spike
+    that is not in it raises (§7.7). Passing ``None`` disables the check entirely, which
+    is what a bare library call or a test that does not care about rainfall gets.
     """
     df = qc.data.to_pandas()
 
@@ -702,6 +813,25 @@ def export_clean_data(
         df.loc[mask, 'flag'] = test_name
 
     entries, stats = _build_flag_log(qc, field, decisions)
+    _require_precip_audit(entries, precip_audited)
+
+    # ACTUALLY REMOVE WHAT THE RUN DECIDED TO DELETE (2026-08-25). §5 says the cleaned
+    # file carries "deleted values as NaN", and §1 promises a cleaned dataset — but this
+    # frame came straight off `qc.data` and no action was ever applied to it, so every
+    # value the agent deleted was still sitting there at its original reading. Verified
+    # on run L: 2023-07-05T13:45 was recorded `action=delete` in the flag log and read
+    # 16.1 in the "clean" CSV, identical to the input. The whole delete pathway was a
+    # label. `correct` needs no branch here because correct_level_shift writes through
+    # `qc` when the agent calls it, so the corrected values are already in this frame.
+    deleted = {e["datetime"] for e in entries if e.get("action") == "delete"}
+    n_deleted = 0
+    if deleted:
+        # `df` still carries the timestamps as its INDEX here — export_clean_data never
+        # reset it — so match on the index, not on a column.
+        mask = df.index.isin(pd.to_datetime(sorted(deleted)))
+        n_deleted = int(mask.sum() - df.loc[mask, field].isna().sum())
+        df.loc[mask, field] = np.nan
+    stats = {**stats, "n_values_deleted": n_deleted}
 
     flags_path = None
     if output_dir is not None and stem is not None:
@@ -716,6 +846,8 @@ def export_clean_data(
         f"VERDICTS (this is what the run is scored on): {stats['n_by_verdict']}"
         + (f", by type {stats['n_by_anomaly_type']}" if stats["n_by_anomaly_type"] else "")
         + f". Actions taken: {stats['n_by_action']}."
+        + (f" {stats['n_values_deleted']} value(s) removed from the cleaned file."
+           if stats.get("n_values_deleted") else "")
     )
     if flags_path:
         msg += f" Written to {flags_path}."
@@ -766,6 +898,134 @@ def export_clean_data(
         "qc": qc,
         "df": df,
         "flags": entries,
+    }
+
+
+# How much series either side of an edge is averaged to measure the step there. Wide
+# enough to average out 5-minute noise, narrow enough not to reach into the storm that
+# may sit beyond the window.
+SHIFT_EDGE_WINDOW = "2h"
+
+# The two edge estimates of a clean rectangle should be equal and opposite. When they
+# disagree by more than this share of their mean, the window is not a clean step and the
+# caller is told so rather than handed a confident-looking number.
+SHIFT_EDGE_DISAGREEMENT = 0.5
+
+
+def correct_level_shift(
+    qc: saqc.SaQC,
+    field: str = "value",
+    start: str | None = None,
+    end: str | None = None,
+    edge_window: str = SHIFT_EDGE_WINDOW,
+) -> dict:
+    """Shift a level-shifted window back by the step measured at its own two edges.
+
+    A level shift is an OFFSET: the sensor reported the wrong number, but the water
+    underneath moved normally, so the shape inside the window is real data sitting at
+    the wrong height. Deleting it throws that away; subtracting the offset recovers it.
+    That is why this exists and why `delete` is the wrong default for the type.
+
+    The step is measured from the edges rather than from the interior-vs-surroundings
+    difference, because a storm can be underway on one side and the interior median
+    would then absorb it. Both edges are measured and reported separately: for a clean
+    rectangle they are equal and opposite, and when they are not, the window is not a
+    clean step and `edges_agree` says so.
+
+    SaQC's own `correctOffset` is deliberately NOT used. It is a detector-plus-corrector
+    that finds offsets itself, and on this storm-driven record it rewrote 2,324 rows at
+    `max_jump=3.0` (54,493 at 6.0), up to 71 FNU, while touching **zero** rows of the
+    real level shift (`scratchpad/probe_correct_offset_real.py`). It has the right name
+    and the wrong job, which is §2's "unless SaQC has no equivalent" clause.
+    """
+    if start is None or end is None:
+        raise ValueError(
+            "correct_level_shift needs both `start` and `end` — the window to correct. "
+            "Take them from find_shift_windows, which reports the bounds of each "
+            "candidate window."
+        )
+    data = qc.data.to_pandas()[field]
+    lo, hi = pd.Timestamp(start), pd.Timestamp(end)
+    if lo >= hi:
+        raise ValueError(f"correct_level_shift: start ({lo}) must be before end ({hi}).")
+    span = pd.Timedelta(edge_window)
+
+    def med(frm, to):
+        seg = data[(data.index >= frm) & (data.index <= to)]
+        return float(seg.median()) if seg.notna().any() else float("nan")
+
+    before, head = med(lo - span, lo), med(lo, lo + span)
+    tail, after = med(hi - span, hi), med(hi, hi + span)
+    onset_step, end_step = head - before, after - tail
+
+    # Average the two independent estimates where both exist; a window butting against
+    # the start or end of the record has only one, which is usable but worth flagging.
+    estimates = [e for e in (onset_step, -end_step) if np.isfinite(e)]
+    if not estimates:
+        raise ValueError(
+            f"correct_level_shift: no finite data either side of {lo} / {hi}, so the "
+            "step cannot be measured. Check the window bounds."
+        )
+    offset = float(np.mean(estimates))
+    spread = abs(estimates[0] - estimates[-1])
+    edges_agree = bool(
+        len(estimates) == 2
+        and abs(offset) > 0
+        and spread / abs(offset) <= SHIFT_EDGE_DISAGREEMENT
+    )
+
+    inside = (data.index >= lo) & (data.index <= hi)
+    n_corrected = int(inside.sum() - data[inside].isna().sum())
+
+    def _shift_back(values: pd.Series) -> pd.Series:
+        out = values.copy()
+        out[(out.index >= lo) & (out.index <= hi)] -= offset
+        return out
+
+    # Hand processGeneric a function whose __globals__ is a PRIVATE dict. SaQC injects
+    # its 35-name evaluation environment into the globals of whatever callable it is
+    # given, and six of those names shadow builtins: abs, id, len, max, min, sum. A
+    # single call with a function defined here therefore replaces `max` and `len` for
+    # every other function in this module, for the rest of the process — which is how
+    # `_build_flag_log`'s `max(len(stamps), 1)` started raising
+    # `AxisError: axis 1 is out of bounds`, in a test that never touched this tool.
+    # Rebuilding the function over an empty globals dict keeps the pollution in the
+    # throwaway dict; the closure cells (lo/hi/offset) come across untouched, and the
+    # body needs no globals of its own.
+    _isolated = types.FunctionType(
+        _shift_back.__code__, {}, "_shift_back", None, _shift_back.__closure__
+    )
+
+    # dfilter=inf, NEVER the default. SaQC masks rows whose flag is >= dfilter before a
+    # function runs, and the default (-inf) masks EVERYTHING — so the corrected window,
+    # which flag_jumps has by definition already flagged, arrives as NaN and the
+    # correction writes nothing. Probed: the interior median came back 16.00 (uncorrected)
+    # at the default and 10.00 at inf. It fails silently and returns a normal result dict,
+    # exactly like the interpolateByRolling bug in §7.1.
+    qc_out = qc.processGeneric(field, func=_isolated, dfilter=np.inf)
+
+    message = (
+        f"Corrected {n_corrected} row(s) from {lo} to {hi} by {-offset:+.2f} "
+        f"(onset step {onset_step:+.2f}, end step {end_step:+.2f})."
+    )
+    if not edges_agree:
+        message += (
+            " WARNING: the two edges disagree about the size of the step "
+            f"({onset_step:+.2f} vs {-end_step:+.2f} inward). A clean level shift steps "
+            "up and back down by the same amount, so this window may be a storm rather "
+            "than an offset — check it before relying on the correction."
+        )
+    return {
+        "tool": "correct_level_shift",
+        "params": {"field": field, "start": str(lo), "end": str(hi),
+                   "edge_window": edge_window},
+        "n_corrected": n_corrected,
+        "offset_removed": round(offset, 3),
+        "onset_step": round(onset_step, 3) if np.isfinite(onset_step) else None,
+        "end_step": round(end_step, 3) if np.isfinite(end_step) else None,
+        "edges_agree": edges_agree,
+        "message": message,
+        "qc": qc_out,
     }
 
 

@@ -35,6 +35,12 @@ import pandas as pd
 
 DEFAULT_ROOT = Path("data/precip")
 
+# Fallback only. The runner injects the gauge from the dataset stem (§5:
+# `<gauge>_l<level>`), because a hard-coded default here answers with the WRONG
+# river's rain on every other gauge — and does so silently, since the result looks
+# perfectly well-formed.
+DEFAULT_GAUGE = "01467200"
+
 # Lag windows before the point, as (label, from, to) in hours back.
 LAG_WINDOWS: tuple[tuple[str, float, float], ...] = (
     ("0-1h", 0.0, 1.0),
@@ -78,7 +84,7 @@ def _missing(gauge: str, root: Path) -> dict:
     }
 
 
-def precip_context(source, at, gauge: str = "01467200",
+def precip_context(source, at, gauge: str = DEFAULT_GAUGE,
                    root: Path | str = DEFAULT_ROOT) -> dict:
     """Rain before and after one timestamp, from the nearest station that has data.
 
@@ -137,7 +143,7 @@ def precip_context(source, at, gauge: str = "01467200",
     }
 
 
-def precip_context_points(source, ats, gauge: str = "01467200",
+def precip_context_points(source, ats, gauge: str = DEFAULT_GAUGE,
                           root: Path | str = DEFAULT_ROOT,
                           max_points: int = 300) -> dict:
     """The batch form — every point about to be called a spike, in one call.

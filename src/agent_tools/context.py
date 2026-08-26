@@ -98,6 +98,19 @@ RAMP_DIRECTNESS = 0.3
 # measured on 01467200_l1, 1 of 24 elevated windows was the injected shift, and the
 # biggest storm scored z=+8.6 against the shift's +4.5. Edge sharpness is the lever
 # (§9.1). Fitted on gauges we do not score.
+# How long the new level must hold before it is a SHIFT rather than an excursion.
+#
+# This was hard-coded as `6 * 60` with the comment "§9: injected shifts run 6-72 h".
+# That range was correct when it was written and stopped being correct on 2026-07-31:
+# §9 now injects 4-24 h shifts, so the low end of the range was unreachable — a 4 h
+# shift was "transient, not a shift" by definition. tests/test_context.py asserts this
+# against inject.LEVEL_SHIFT_DURATION_HOURS so it cannot go stale a third time.
+SHIFT_MIN_HOLD_MINUTES = 4 * 60
+
+# A departure from the new level must last this long to end the hold. See the walk in
+# level_shift_context for what the old two-sample rule did to real shifts.
+HOLD_BREAK_AFTER = "1h"
+
 SHIFT_INTERIOR_SIGMAS = 3.0
 SHIFT_EDGE_SHARPNESS = 0.5
 
@@ -701,14 +714,21 @@ def level_shift_context(
     tolerance = hold_sigmas * min(sigma_before, sigma_after)
     forward = series.iloc[pos + 1 :].loc[: ts + pd.Timedelta(max_hold)]
     hold_end = ts
-    misses = 0
+    # END THE HOLD ON A SUSTAINED DEPARTURE, NOT ON TWO SAMPLES. Two consecutive
+    # out-of-band readings is a threshold a shifted segment trips on its own noise, and
+    # a NaN run inside a shift — which §9 explicitly allows — has the same effect.
+    # Measured on 01467200: a 23.5 h shift reported a 0.0 h hold and a 22.0 h shift
+    # reported 4.8 h, so both read as "transient excursion, not a shift" and the run
+    # rejected the very events it had just found.
+    first_miss = None
     for stamp, v in forward.items():
         if np.isfinite(v) and abs(v - median_after) > tolerance:
-            misses += 1
-            if misses >= 2:
+            if first_miss is None:
+                first_miss = stamp
+            elif stamp - first_miss >= pd.Timedelta(HOLD_BREAK_AFTER):
                 break
         else:
-            misses = 0
+            first_miss = None
             hold_end = stamp
     hold_minutes = (hold_end - ts).total_seconds() / 60.0
     hold_samples = int(series.index.get_indexer([hold_end])[0] - pos)
@@ -716,7 +736,7 @@ def level_shift_context(
 
     if abs(step_sigmas) < 1.0:
         verdict = "no meaningful step at this point"
-    elif hold_minutes >= 6 * 60:
+    elif hold_minutes >= SHIFT_MIN_HOLD_MINUTES:
         verdict = (
             f"the new level held for {round(hold_minutes / 60, 1)} h "
             + ("to the end of the searched span => shift-like"
@@ -1409,7 +1429,7 @@ def _reads_like(parts: dict) -> tuple[str, str]:
         step_sigmas is not None
         and abs(step_sigmas) >= 3
         and hold_minutes is not None
-        and hold_minutes >= 6 * 60          # §9: injected shifts run 6-72 h
+        and hold_minutes >= SHIFT_MIN_HOLD_MINUTES
         and step_sharpness is not None
         and step_sharpness <= 2
         and (abs_z is None or abs_z < 2)
@@ -1745,9 +1765,35 @@ def shift_window_context(source, start, end, field: str = VALUE_COL, pad: str = 
     }
 
 
-def find_shift_windows(source, ats, field: str = VALUE_COL, min_hours: float = 1.0,
+def _jump_stamps_from_history(source, field: str) -> list:
+    """Every timestamp flagJumps flagged on *field*, read from the SaQC history.
+
+    §7.1: `qc.flags` attributes a doubly-flagged row to the FIRST test only, so the
+    history is the only honest source for "which rows did this particular test flag".
+    """
+    try:
+        history = source._flags.history[field]
+    except (AttributeError, KeyError):
+        return []
+    stamps = []
+    for col in history.hist.columns:
+        if "jump" in str(history.meta[col].get("func", "")).lower():
+            hit = history.hist[col] > 0
+            stamps.extend(history.hist.index[hit.fillna(False)])
+    return sorted(set(stamps))
+
+
+def find_shift_windows(source, ats=None, field: str = VALUE_COL, min_hours: float = 1.0,
                        max_hours: float = 48.0, max_windows: int = 20) -> dict:
     """Pair up jump timestamps into candidate level-shift windows and rank them.
+
+    **`ats` is optional, and omitting it is the right default** (2026-08-25). Given
+    nothing, every timestamp flagJumps flagged is read straight from the SaQC history,
+    so the agent cannot hand over a subset that leaves the real shift out. Run M did
+    exactly that: it chose 76 of 145 jump timestamps, its subset excluded the injected
+    shift's two edges, the tool returned one unrelated window, and the run concluded
+    there were no level shifts. Runs K and L passed 134 and 53 and both happened to
+    include it — so the failure is silent and depends on which subset gets picked.
 
     *ats* is a detector's flagged_datetimes — normally flag_jumps'. Every nearby pair
     inside the duration bounds becomes a candidate window, each is measured by
@@ -1755,8 +1801,25 @@ def find_shift_windows(source, ats, field: str = VALUE_COL, min_hours: float = 1
     reported once rather than as thirty windows with sliding start times.
     """
     series = as_series(source, field)
+    from_history = False
+    if not ats:
+        ats = _jump_stamps_from_history(source, field)
+        from_history = True
+        if not ats:
+            return {
+                "tool": "find_shift_windows",
+                "params": {"field": field, "min_hours": min_hours,
+                           "max_hours": max_hours},
+                "n_jumps": 0, "n_windows": 0, "n_level_shift_like": 0, "windows": [],
+                "message": (
+                    "No jump flags found on this field, so there are no edges to pair "
+                    "into windows. Run flag_jumps first (take `thresh` from "
+                    "inspect_dataset's jump_scale.recommended_thresh)."
+                ),
+            }
     stamps = sorted({resolve_timestamp(series, a) for a in ats})
-    params = {"field": field, "min_hours": min_hours, "max_hours": max_hours}
+    params = {"field": field, "min_hours": min_hours, "max_hours": max_hours,
+              "jumps_from": "flag history" if from_history else "caller"}
 
     raw = []
     for i, a in enumerate(stamps):

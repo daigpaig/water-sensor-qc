@@ -312,11 +312,22 @@ directions are not symmetric:
 - `verdict='normal'` **must** take `action='keep'`. Calling a value real water and then
   deleting it is not a defensible pair, and allowing it would let a run score as having
   *rejected* a candidate whose value is gone from the exported file.
-- `verdict='anomaly'` normally takes `delete`/`correct`/`impute` but **may** take `keep`,
-  provided the `reason` says why the segment cannot be treated (≥20 chars, enforced). The
-  case this exists for is a gap longer than any defensible imputation window: forcing
-  consistency there would make the agent either lie about the verdict or impute a gap it had
-  just judged unfillable. `n_anomalies_left_untreated` surfaces the count, since the pair
+- `verdict='anomaly'` normally takes `delete`/`correct`/`impute` but **may** take `keep`
+  **for `anomaly_type='gap'` only** (`wrappers.UNTREATED_ANOMALY_TYPES`), and only with a
+  `reason` saying why the segment cannot be treated (≥20 chars, enforced). The case this
+  exists for is a gap longer than any defensible imputation window: forcing consistency
+  there would make the agent either lie about the verdict or impute a gap it had just
+  judged unfillable. **The type restriction arrived 2026-08-25**, because the pair was the
+  hole level_shift fell through: on run I the agent bounded the injected shift to within
+  one sample, wrote that both edges "move in essentially one sample" and that the date is
+  in none of the 419 elevated-noise stretches — i.e. concluded it was an artifact — and
+  then kept all 118 rows. Nothing caught it: §6 makes `keep` the *default* action for a
+  shift, the prompt said in as many words to record "verdict 'anomaly' ... even if you
+  keep the values", and the only check on the pair was that `reason` ran past 20
+  characters. Every other type has a treatment available, so `anomaly` + `keep` there says
+  "the sensor is wrong and I am shipping the wrong values anyway", which is not a
+  defensible export. If the segment is real water, that is `normal` + `keep` — a rejection
+  of the run's own detector, and scored as one. `n_anomalies_left_untreated` surfaces the count, since the pair
   claims a detection without touching the value.
 
 A row the imputer filled gets `verdict='anomaly', anomaly_type='gap'` deterministically, for
@@ -335,7 +346,7 @@ that is syntactically valid and evidentially empty.
 | ------------------ | ------------------------------------------ | ------------------------------------ | -------------------------------------------------- |
 | Spike              | one/few values far from neighbours         | `flagUniLOF`, `flagZScore`, `flagRange` | delete                                          |
 | Plateau / stuck    | identical value repeated for a long window | `flagConstants` (+ `flagPlateau` if offset) | delete or flag                             |
-| Level shift / jump | permanent step to a new level              | `flagJumps`                          | flag; keep unless clearly erroneous (agent judges) |
+| Level shift / jump | permanent step to a new level              | `flagJumps`                          | judge first: real water → `normal`+keep; artifact → `anomaly`+**correct** via `correct_level_shift` (§7.8) |
 | Gap (missing)      | NaN run                                    | `flagNAN`                            | impute (short gaps only)                           |
 
 The agent reasons about each flagged segment and picks the action; these are defaults, not
@@ -882,6 +893,41 @@ because the calls that look obvious from the series alone are the ones this can 
   a lag the tool reports **0-1h, 1-3h and 3-12h** before the point and lets the agent judge.
 - Pull with `python -m src.datasets.pull_precip <gauge>` -> `data/precip/<gauge>/`.
 
+**IT HAD NEVER RUN ONCE (fixed 2026-08-25).** `agent.py`'s dispatch chain checked
+`wrappers`, then `context`, then raised — there was no branch for the precipitation
+module. `_get_tool_function` resolved the tools fine, the schemas were published to the
+model, and the prompt has MANDATED the audit since v0.13, so nothing looked wrong from
+any angle except the one that mattered: every call came back
+`Unknown tool: precip_context_points`, the model worked around the tool error, and the
+run completed normally. **The measured claim below was therefore taken on a tool that
+never executed** — treat it as unverified until a run with the branch in place repeats it.
+A test now asserts every name in `TOOL_SCHEMAS` is reachable by the dispatch chain, not
+merely resolvable, because a schema the model can call and the runner cannot reach is
+exactly this bug's shape.
+
+**The audit is ENFORCED in code, not requested in the prompt** (2026-08-25).
+`export_clean_data` raises if any row it is about to `delete`/`correct` as a **spike**
+was never passed to a precipitation tool. The runner keeps the ledger — `precip_audited`,
+injected like `output_dir` and absent from the schema — so the check runs against
+evidence the run actually obtained rather than its claim to have looked. Three scoping
+decisions, each load-bearing:
+
+- **It gates the irreversible act, not the verdict.** Only `delete`/`correct` on a
+  `spike`; keeping a value needs no rain check, and rainfall does not answer the
+  storm-vs-artifact question for the other three types.
+- **The ledger records that the run LOOKED, not that it got an answer.** A timestamp no
+  station covers is recorded too. Requiring a positive answer would make any point
+  outside the rain gauge's coverage permanently undeletable, leaving the run no way out
+  but to ship values it believes are wrong. §7.7's asymmetry is carried by the tool's own
+  result text on every uncovered point; enforcing it in the ledger deadlocks the run.
+- **`precip_audited=None` switches the check off**, which is what a library call or a
+  test that does not care about rainfall gets. Only the agent runner passes a set.
+
+**`gauge` is injected from the dataset stem**, not left to the model or to the module's
+`DEFAULT_GAUGE`. That default is `01467200`, so on any other gauge an un-injected call
+answers with the **wrong river's rain** — and the result is perfectly well-formed, so
+nothing downstream can tell.
+
 **IT CANNOT MOVE THE SYNTHETIC BENCHMARK, AND THAT IS NOT A BUG.** Measured on the
 Part B run: of deleted rows, 18% of false positives had rain in the preceding 12h versus
 16% of true injected spikes. No separation — because §9 injects spikes at random
@@ -889,6 +935,78 @@ locations regardless of weather, so a synthetic "true spike" inherits the backgr
 rate. Precipitation can only pay off on real records, which is exactly the synthetic-vs-
 real gap §10 asks us to report. Do not read a flat spike-precision number here as the
 tool failing.
+
+---
+
+### 7.8 Correcting a level shift — and two traps found doing it (2026-08-25)
+
+**A level shift is an OFFSET, so deleting it is the wrong action.** The sensor reported
+the wrong number, but the water underneath moved normally: the shape inside the window
+is real data sitting at the wrong height. `correct_level_shift(start, end)` measures the
+step at the window's **two edges** and shifts the interior back by it. Measured on
+01467200_l1's injected shift: interior RMSE against the true water **6.954 → 0.775 FNU**,
+117 rows corrected, **0 rows outside the window touched**. Run L deleted those same 117
+rows — recoverable record, destroyed — which is most of why its `wrongly-deleted` count
+doubled to 132.
+
+The step comes from the edges rather than from interior-vs-surroundings because a storm
+can be underway on one side, and the interior median would then absorb it. Both edges are
+reported: for a clean rectangle they are equal and opposite, and `edges_agree=false` says
+the window may be a storm rather than an offset — the one case where deleting beats
+correcting.
+
+**SaQC's `correctOffset` is deliberately NOT used, and this was measured, not assumed.**
+It is a detector-plus-corrector that finds offsets itself. On this record
+(`scratchpad/probe_correct_offset_real.py`):
+
+| `max_jump` | rows changed | inside the real shift | largest change |
+| --- | ---: | ---: | ---: |
+| 3.0 | 2,324 | **0** | 64.7 FNU |
+| 6.0 | 54,493 | **0** | 71.1 FNU |
+
+It rewrites storm limbs by tens of FNU and never touches the actual artifact. Right name,
+wrong job — which is §2's "unless SaQC has no equivalent" clause.
+
+**`find_shift_windows` takes its jumps from the FLAG HISTORY, not from the agent**
+(2026-08-25). `ats` is optional and omitting it is the documented default. Run M chose
+**76 of 145** jump timestamps to pass, its subset excluded the injected shift's two
+edges, the tool returned one unrelated window, and the run concluded the record had no
+level shifts — with nothing about the result looking wrong. Runs K and L passed 134 and
+53 and both happened to include it, so the failure is silent and depends purely on which
+subset gets picked. This is the §8 "do not deliberate over which timestamps to hand a
+batch tool" failure, which the prompt warned about for `describe_points` and
+`precip_context_points` only. Reading the edges from `qc._flags.history` (matching on the
+test's `func` name, §7.1) removes the class of error rather than warning about it.
+
+**TRAP 1 — `processGeneric`'s `dfilter` default silently discards the correction.** §7.1's
+`interpolateByRolling` trap, third appearance. SaQC masks rows whose flag is >= `dfilter`
+before the function runs, and `processGeneric`'s default is `-inf`, which masks
+**everything** — so the window, which `flagJumps` has by definition already flagged,
+arrives as NaN and the correction writes nothing while returning a normal result dict.
+Probed: interior median **16.00** at the default, **10.00** at `np.inf`. Pass
+`dfilter=np.inf`.
+
+**TRAP 2 — `processGeneric` POLLUTES THE CALLING MODULE'S GLOBALS.** It injects its
+35-name evaluation environment into the `__globals__` of whatever callable it is handed,
+and six of those names shadow builtins: **`abs`, `id`, `len`, `max`, `min`, `sum`**. One
+call with a function defined in `wrappers.py` therefore replaces `max` and `len` for every
+*other* function in that module for the rest of the process. It surfaced as
+`_build_flag_log`'s `max(len(stamps), 1)` raising
+`numpy.exceptions.AxisError: axis 1 is out of bounds` inside a test that never touched the
+correction tool — remote, silent and order-dependent, and it passed in isolation.
+The fix PREVENTS it rather than cleaning up after it: the callable is rebuilt with
+`types.FunctionType(code, {}, ...)` so the injection lands in a throwaway dict, closure
+cells intact. `scratchpad/probe_generic_pollution.py` reproduces it; a test asserts the
+six names stay out of `vars(wrappers)`.
+
+**Related: `delete` never removed anything.** §5 says the cleaned file carries deleted
+values as NaN and §1 promises a cleaned dataset, but `export_clean_data` built its frame
+straight off `qc.data` and applied no action to it — so every value the agent deleted was
+still there at its original reading. Verified on run L: `2023-07-05T13:45` was
+`action=delete` in the flag log and read `16.1` in the "clean" CSV, identical to the input.
+The whole delete pathway was a label. It now nulls those rows and reports
+`n_values_deleted`. `correct` needs no branch there, because `correct_level_shift` writes
+through `qc` when the agent calls it.
 
 ---
 
@@ -965,6 +1083,17 @@ them:
   ended the process with 14 completed steps unexported. Re-issuing is safe: the request is
   the whole conversation so far, so a retry re-asks rather than resuming a half-received
   answer.
+- **`_stream_message` retries `anthropic.APIError` too, not just `httpx.HTTPError`**
+  (2026-08-25). Same shape as the bullet above, one exception type over: a 5xx
+  delivered as an error event *inside* an open stream reaches the retry loop with no
+  SDK retry behind it, and a bare `except httpx.HTTPError` does not catch it. Measured
+  on run K — `APIStatusError: Internal server error` at step 8 ended the process and
+  discarded eight completed steps, ~$0.90. `_is_retryable` gates it so a 400 or an auth
+  failure raises immediately instead of re-sending the whole conversation four times.
+  **The same predicate now decides the `transient` flag on the logged `api_error`**,
+  which previously isinstance-checked `InternalServerError` and so reported run K's
+  generic `APIStatusError` 500 as permanent — telling the reader re-running would not
+  help, when it was the only thing that would.
 - The `except` around the call catches **`httpx.HTTPError` as well as
   `anthropic.APIError`** and `break`s, so the run exports what it has. This is why the
   above mattered twice over: `httpx.ReadTimeout` is not an `anthropic.APIError`, so it
@@ -1446,7 +1575,31 @@ second variable to clean, but that reading should be confirmed before building o
   `POSITIVE_ACTIONS` + `TOOL_TO_TYPE`; the printed table's `mode:` line always says which of
   the three paths ran (verdicts / actions / raw flags), so the two are never confused.
 - **Imputation:** RMSE / MAE on filled values vs true values, compared to a
-  linear-interpolation baseline.
+  linear-interpolation baseline. **Scored on INJECTED GAPS ONLY** (`evaluate.GAP_TYPE`,
+  2026-08-25) — §5 already said so; the code did not. The mask was `source == injected`
+  alone, which also swept in injected spikes, plateaus and level shifts, none of which
+  the imputer ever touched. For a **missed** spike the cleaned file still holds the
+  500-NTU reading, so its distance from the true water was charged to the imputer and
+  compared against a linear interpolation of a gap that never existed. Measured on run N:
+
+  | rows the old mask scored | n | RMSE | share of squared error |
+  | --- | ---: | ---: | ---: |
+  | gap (the only legitimate set) | 78 | 1.765 | 14% |
+  | spike | 14 | 8.296 | **55%** |
+  | plateau | 10 | 6.935 | 27% |
+  | level_shift | 117 | 0.775 | 4% |
+
+  So 24 rows nobody imputed carried **82%** of the error, and the headline read
+  **7.866 vs a 2.655 baseline** where the gaps alone read **1.765 vs 1.509**. **This is a
+  measurement correction, not an improvement** — the imputer still loses to linear, by
+  17% rather than 3x, and the §11 criterion is still unmet. Note the contamination was
+  worse before `delete` began actually deleting (§7.8): 409 rows were scored, not 219,
+  because every deleted spike also sat in the cleaned file at its original value.
+  **The remaining honest gap is thin and directional**: 7 filled gap events on this
+  dataset, and the agent's deficit grows with how far the water moved across the gap
+  (+0.05 flat, +0.28 moving, +0.31 fast). That is what a centred rolling median is: a
+  LEVEL estimator, where linear interpolation follows the TREND between the gap's
+  endpoints. Expect it to lose on any sloped gap by construction.
 - **Decision quality:** for each flagged segment, does the chosen action match the known
   correct action?
 - **Fixed-pipeline baseline:** the same SaQC methods in a set order with default params and
@@ -1478,6 +1631,34 @@ all four rendering as a blank or as the same blank-ish row:
 | flagged, called normal | the same trail, ending in the agent rejecting its own detector — §6 asks for exactly this, so it must read as a decision, not an omission |
 | flagged, undecided | no span covered it; no claim in either direction |
 | **never flagged** | a **roll-call**: every detector that ran, with its parameters, and the statement that none of them fired — so a detector miss is visibly upstream of the agent rather than an empty panel |
+
+- **The page's BUCKETS are keyed on the verdict, not the action** (2026-08-25). This is
+  the §5.1 split arriving in the audit page a fortnight after it arrived in the scorer:
+  `categorise()` read only `action`, so a labelled anomaly the agent **found** and
+  deliberately left in place was filed under `missed`. That is not a miss by any
+  reading — §6 makes `keep` the DEFAULT action for a level shift, and §5.1 exists so
+  that `anomaly` + `keep` can say "I found this and cannot defensibly treat it".
+  Measured on run I: the page reported **`missed=117`** — every row of the single level
+  shift the agent had bounded to within one sample — while `evaluate.py` scored that
+  same flag log **1.000** on level_shift. **Two artefacts reading one flag log must not
+  contradict each other about whether the event was found.** Two buckets carry it:
+  - **`identified-kept`** — found, verdict `anomaly`, value kept. A correct detection.
+    On run I this moves 117 rows out of `missed` (which goes to **0**) and drops the
+    "labelled anomalies went unhandled" headline from 133 to 16.
+  - **`false-anomaly`** — the mirror, and it was hidden inside `kept` for exactly the
+    same reason: normal water the agent **called** an anomaly without removing it.
+    §10 scores the verdict, so it costs precision however intact the value is. Run I
+    has one, `2023-09-15T21:30:00` — the single sample its level-shift span overran
+    past the true end. That is the bucket earning its keep on the first run.
+
+  An **empty `verdict` falls back to the old action-based behaviour**, so a pre-§5.1 log
+  renders as it always did rather than being silently recategorised — otherwise two
+  archived pages of one run would disagree. A test enumerates every
+  `(action, label, flagged, inspected, verdict)` combination and asserts the emitted
+  bucket is declared in `CATEGORIES`, because a bucket missing from that tuple renders
+  as an uncoloured, uncountable ghost. Note the number keys now index the **non-empty**
+  categories: they sliced the first nine of `COLOR`, so anything past the ninth was
+  unreachable from the keyboard.
 
 - **The roll-call is the reason `provenance.py` exists.** A flag log only holds flagged
   rows, so "no entry" silently covered both ordinary water and a labelled anomaly every

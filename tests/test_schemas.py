@@ -56,6 +56,7 @@ EXPECTED_TOOLS = {
     "precip_context_points",
     # Action
     "impute_rolling",
+    "correct_level_shift",
 }
 
 REMOVED_TOOLS = {

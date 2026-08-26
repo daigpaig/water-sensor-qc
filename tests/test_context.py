@@ -595,3 +595,79 @@ def test_find_shift_windows_reports_one_event_not_thirty_sliding_ones():
     assert pd.Timestamp(best["start"]) <= index[201]
     assert pd.Timestamp(best["end"]) >= index[398]
     assert "WHOLE span" in found["message"]
+
+
+def test_the_hold_threshold_matches_what_injection_actually_produces():
+    """The constant that made real shifts unfindable, pinned so it cannot go stale again.
+
+    `level_shift_context` hard-coded `6 * 60` with the comment "§9: injected shifts run
+    6-72 h". That was true when written and stopped being true on 2026-07-31, when §9
+    moved to 4-24 h — so the low end of the injected range was "transient, not a shift"
+    BY DEFINITION, and the confirmation step rejected the events the detector found.
+    """
+    from src.datasets.inject import LEVEL_SHIFT_DURATION_HOURS
+
+    shortest_injected_hours = min(LEVEL_SHIFT_DURATION_HOURS)
+    assert ctx.SHIFT_MIN_HOLD_MINUTES <= shortest_injected_hours * 60, (
+        f"level_shift_context calls a hold under {ctx.SHIFT_MIN_HOLD_MINUTES} min "
+        f"transient, but §9 injects shifts as short as {shortest_injected_hours} h. "
+        "The shortest injected shift must be reachable."
+    )
+
+
+def test_a_gap_inside_a_shift_does_not_end_the_hold():
+    """§9 lets a level shift span dropouts, so a NaN run is not the end of the shift.
+
+    The old walk ended the hold after two out-of-band samples, and a NaN run or the
+    segment's own noise both tripped it: measured on 01467200, a 23.5 h shift reported
+    a 0.0 h hold and a 22.0 h shift reported 4.8 h.
+    """
+    index = pd.date_range("2024-01-01", periods=600, freq="5min")
+    values = np.full(600, 5.0)
+    values[200:500] = 15.0                 # a 25h shift
+    values[300:320] = np.nan               # a dropout inside it
+    values[400] = 15.0 + 40                # and one brief excursion
+    series = pd.Series(values, index=index)
+
+    held = ctx.level_shift_context(series, at=index[200])["hold_minutes"]
+    assert held >= 20 * 60, f"the shift ran 25h; the hold measured {held/60:.1f}h"
+
+
+def test_find_shift_windows_reads_the_jumps_itself_when_given_none():
+    """Run M chose 76 of 145 jump timestamps, its subset excluded the injected shift's
+    two edges, the tool returned one unrelated window, and the run concluded there were
+    no level shifts. Runs K and L passed 134 and 53 and both happened to include it — so
+    the failure is silent and depends on which subset gets picked. Omitting `ats` reads
+    every jump from the flag history and makes the whole class of error impossible."""
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    from src.agent_tools import context as C
+
+    idx = pd.date_range("2024-01-01", periods=2000, freq="5min")
+    rng = np.random.default_rng(0)
+    v = pd.Series(10 + rng.normal(0, 0.2, 2000), index=idx)
+    v.iloc[800:1000] += 8.0                      # a clean rectangular shift
+    qc = saqc.SaQC(pd.DataFrame({"value": v})).flagJumps("value", thresh=4.0, window="6h")
+
+    out = C.find_shift_windows(source=qc)
+    assert out["n_jumps"] > 0, "jump edges must come from the history"
+    assert out["params"]["jumps_from"] == "flag history"
+    starts = [pd.Timestamp(w["start"]) for w in out["windows"]]
+    assert any(abs((s - idx[800]).total_seconds()) <= 3600 for s in starts), (
+        f"the real shift at {idx[800]} was not among {starts}")
+
+
+def test_find_shift_windows_says_so_rather_than_failing_with_no_jumps():
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    from src.agent_tools import context as C
+
+    idx = pd.date_range("2024-01-01", periods=200, freq="5min")
+    qc = saqc.SaQC(pd.DataFrame({"value": pd.Series(np.full(200, 10.0), index=idx)}))
+    out = C.find_shift_windows(source=qc)
+    assert out["n_windows"] == 0
+    assert "flag_jumps first" in out["message"]

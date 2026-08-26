@@ -489,6 +489,9 @@ def score_episodes(truth: pd.DatetimeIndex, predicted: pd.DatetimeIndex) -> tupl
     return precision, recall, f1, len(t_eps), len(p_eps)
 
 
+GAP_TYPE = "gap"
+
+
 def score_imputation(
     clean_series: pd.Series,
     raw_series: pd.Series,
@@ -502,8 +505,19 @@ def score_imputation(
     raw = raw_series.reindex(index)
     lbl = labels.set_index(DATETIME_COL).reindex(index)
 
-    # We only score rows that were synthetically injected (so we have a true_value)
-    mask = (lbl["source"] == "injected") & lbl["true_value"].notna()
+    # §5: INJECTED GAPS ONLY. `source == injected` alone also sweeps in injected spikes,
+    # plateaus and level shifts, none of which the imputer ever touched — and for a
+    # MISSED spike the cleaned file still holds the 500-NTU reading, so its distance
+    # from the true water was being charged to the imputer. Measured on run N: 24 spike
+    # and plateau rows carried 82% of the squared error against 78 real gap rows, and
+    # the headline read 7.866 vs a linear baseline of 2.655 where the gaps alone read
+    # 1.765 vs 1.509. Comparing a value nobody imputed against a linear interpolation
+    # of a gap that never existed is not a measurement of anything.
+    mask = (
+        (lbl["source"] == "injected")
+        & (lbl["anomaly_type"] == GAP_TYPE)
+        & lbl["true_value"].notna()
+    )
     if not mask.any():
         return None
 

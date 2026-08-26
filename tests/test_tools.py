@@ -6,7 +6,10 @@ import pandas as pd
 import pytest
 import saqc
 
+from pathlib import Path
+
 from src.agent_tools import wrappers
+from src.inspect_data import DATETIME_COL
 
 
 def test_saqc_version():
@@ -487,7 +490,7 @@ def test_an_anomaly_span_claims_every_row_it_covers_not_just_the_flagged_ones():
 
     result = wrappers.export_clean_data(qc, decisions=[
         {"start": str(index[100]), "end": str(index[299]), "difficulty": "clear",
-         "verdict": "anomaly", "anomaly_type": "level_shift", "action": "keep",
+         "verdict": "anomaly", "anomaly_type": "level_shift", "action": "delete",
          "reason": "interior 4.5 sigmas above surroundings, both edges sharp"},
     ])
     claimed = [e for e in result["flags"] if e["anomaly_type"] == "level_shift"]
@@ -498,6 +501,45 @@ def test_an_anomaly_span_claims_every_row_it_covers_not_just_the_flagged_ones():
     # decision reached.
     by_source = {e["flagged_by"] for e in claimed}
     assert wrappers.SPAN_CLAIMED in by_source and "flagJumps" in by_source
+
+
+def test_a_wide_gap_span_does_not_materialise_the_whole_series():
+    """The regression this guard exists for (2026-08-24).
+
+    Restricting materialisation to `anomaly` spans was not enough: the agent wrote a
+    perfectly reasonable whole-record catch-all — anomaly / gap / impute over two years
+    — and the flag log came back with 210,816 entries, one per row of the series. Only
+    `level_shift` has the edge-vs-window mismatch that needs materialising; every other
+    type is already flagged row-for-row by its own detector.
+    """
+    index = pd.date_range("2024-01-01", periods=2000, freq="5min")
+    values = np.full(2000, 5.0)
+    values[500:520] = np.nan                       # a real gap, which flagNAN will flag
+    qc = saqc.SaQC(pd.DataFrame({"value": pd.Series(values, index=index)}))
+    qc = wrappers.flag_nan(qc, field="value")["qc"]
+
+    result = wrappers.export_clean_data(qc, decisions=[
+        {"start": str(index[0]), "end": str(index[-1]), "difficulty": "clear",
+         "verdict": "anomaly", "anomaly_type": "gap", "action": "keep",
+         "reason": "catch-all for every missing run in the record, none fillable"},
+    ])
+    assert result["n_rows_claimed_by_span_not_flagged"] == 0
+    assert len(result["flags"]) == 20, "only the rows flagNAN flagged belong in the log"
+
+
+def test_an_oversized_level_shift_span_is_refused_and_reported():
+    """A mistyped end timestamp must not expand the log by a whole series."""
+    index = pd.date_range("2024-01-01", periods=8000, freq="5min")
+    qc = saqc.SaQC(pd.DataFrame({"value": pd.Series(np.full(8000, 5.0), index=index)}))
+    qc = wrappers.flag_jumps(qc, field="value", thresh=0.5, window="1h")["qc"]
+
+    result = wrappers.export_clean_data(qc, decisions=[
+        {"start": str(index[0]), "end": str(index[-1]), "difficulty": "clear",
+         "verdict": "anomaly", "anomaly_type": "level_shift", "action": "delete",
+         "reason": "a span far wider than any level shift §9 injects (4-24h)"},
+    ])
+    assert result["n_rows_claimed_by_span_not_flagged"] == 0
+    assert result["spans_too_wide_to_materialise"], "an oversized span must be reported"
 
 
 def test_a_normal_span_does_not_materialise_rows():
@@ -879,3 +921,197 @@ def test_inspect_dataset_measures_the_flag_jumps_threshold():
     # scale from -- `std` alone is what produced the 2,865-flag run.
     stats = res["summary"]["columns"]["value"]
     assert stats["median"] is not None and stats["robust_sigma"] > 0
+
+
+# --- §7.7 rainfall gate + the anomaly/keep restriction (2026-08-25) ------------
+
+def _qc_with_one_flagged_spike():
+    import numpy as np
+    import pandas as pd
+    import saqc
+    idx = pd.date_range("2024-01-01", periods=60, freq="5min")
+    values = pd.Series(np.full(60, 5.0), index=idx)
+    values.iloc[20] = 500.0
+    qc = saqc.SaQC(pd.DataFrame({"value": values}))
+    return qc.flagRange("value", min=0, max=100), idx[20].strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def test_deleting_a_spike_never_checked_against_rain_is_refused():
+    """§7.7. The prompt has required this since v0.13 and it never once happened —
+    the dispatch branch was missing, so the tool always errored. Prompt text cannot
+    enforce a requirement; this can."""
+    from src.agent_tools.wrappers import export_clean_data
+    qc, at = _qc_with_one_flagged_spike()
+    decisions = [{"start": at, "difficulty": "clear", "verdict": "anomaly",
+                  "anomaly_type": "spike", "action": "delete", "reason": "500 NTU spike"}]
+    with pytest.raises(ValueError, match="without ever being checked against rainfall"):
+        export_clean_data(qc=qc, decisions=decisions, precip_audited=frozenset())
+
+    # audited -> allowed
+    out = export_clean_data(qc=qc, decisions=decisions, precip_audited=frozenset({at}))
+    assert out["n_entries"] == 1
+
+
+def test_the_rain_gate_covers_the_obvious_deletions_too_but_not_other_verdicts():
+    """The user's point, and §7.7's: a clear-cut-looking spike is exactly the kind of
+    call rainfall overturns, so `difficulty` does not exempt it. Equally, the gate is
+    about DESTROYING a value — keeping one, or judging another type, is untouched."""
+    from src.agent_tools.wrappers import export_clean_data
+    qc, at = _qc_with_one_flagged_spike()
+
+    def export(**over):
+        d = {"start": at, "difficulty": "clear", "verdict": "anomaly",
+             "anomaly_type": "spike", "action": "delete",
+             "reason": "clear-cut single-sample excursion"}
+        d.update(over)
+        return export_clean_data(qc=qc, decisions=[d], precip_audited=frozenset())
+
+    with pytest.raises(ValueError, match="rainfall"):
+        export()                                    # "clear" is not an exemption
+    with pytest.raises(ValueError, match="rainfall"):
+        export(action="correct")                    # correcting destroys it too
+    # rejecting the detector needs no rain check: nothing is removed
+    assert export(verdict="normal", anomaly_type="", action="keep")["n_entries"] == 1
+
+
+def test_an_anomaly_verdict_may_not_ship_the_values_it_calls_faulty():
+    """Run I called the injected level shift an artifact — both edges moving in one
+    sample, no elevated-noise stretch on that date — and then kept all 118 rows,
+    because §6 makes `keep` the default and nothing made it revisit that. Only a gap
+    genuinely has no treatment available."""
+    from src.agent_tools.wrappers import export_clean_data
+    qc, at = _qc_with_one_flagged_spike()
+    kept = {"start": at, "difficulty": "judgement-call", "verdict": "anomaly",
+            "anomaly_type": "level_shift", "action": "keep",
+            "deliberation": "edges move in one sample; not in any noisy stretch",
+            "reason": "sharp step, both edges one sample, no storm on this date"}
+    with pytest.raises(ValueError, match="ships data you have just said is faulty"):
+        export_clean_data(qc=qc, decisions=[kept], precip_audited=None)
+
+    # a gap is the one type it stays legal for
+    gap = {**kept, "anomaly_type": "gap",
+           "reason": "11-day outage, far longer than any defensible imputation window"}
+    assert export_clean_data(qc=qc, decisions=[gap], precip_audited=None)["n_entries"] == 1
+
+
+# --- level shift is CORRECTED, not deleted (2026-08-25) -----------------------
+
+def test_correcting_a_level_shift_recovers_the_water_under_it():
+    """A shift is an OFFSET: the water underneath moved normally, so the shape inside
+    the window is real data at the wrong height. Measured on 01467200_l1's injected
+    shift, correction takes interior error from 6.95 FNU to 0.78 FNU against the true
+    values — deleting those 117 rows would have thrown all of it away."""
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    from src.agent_tools.wrappers import correct_level_shift
+
+    root = Path("data/injected/01467200/l1")
+    if not (root / "01467200_l1.csv").exists():
+        pytest.skip("injected dataset not present")
+    s_ = pd.read_csv(root / "01467200_l1.csv", parse_dates=["datetime"]
+                     ).set_index("datetime")["value"]
+    lab = pd.read_csv(root / "01467200_l1_labels.csv", parse_dates=["datetime"])
+    sh = lab.loc[lab.anomaly_type == "level_shift", "datetime"]
+    lo, hi = sh.min(), sh.max()
+
+    out = correct_level_shift(qc=saqc.SaQC(pd.DataFrame({"value": s_})),
+                              start=str(lo), end=str(hi))
+    got = out["qc"].data.to_pandas()["value"]
+    truth = lab.set_index("datetime")["true_value"]
+    inside = (got.index >= lo) & (got.index <= hi)
+
+    def rmse(v):
+        return float(np.sqrt(((v[inside] - truth[inside]) ** 2).mean()))
+
+    assert rmse(got) < rmse(s_) / 4, "correction should recover most of the offset"
+    # and it must not touch anything else
+    changed = (got - s_).abs() > 1e-9
+    assert int(changed[(changed.index < lo) | (changed.index > hi)].sum()) == 0
+
+
+def test_the_correction_writes_through_saqcs_flag_mask():
+    """§7.1's dfilter trap, third appearance. SaQC masks rows whose flag is >= dfilter
+    before a function runs, and processGeneric's DEFAULT (-inf) masks everything — so
+    the window, which flag_jumps has by definition already flagged, arrives as NaN and
+    the correction silently writes nothing while returning a normal result dict.
+    Probed: interior median 16.00 at the default, 10.00 at inf."""
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    from src.agent_tools.wrappers import correct_level_shift
+
+    idx = pd.date_range("2024-01-01", periods=300, freq="5min")
+    v = pd.Series(np.full(300, 10.0), index=idx)
+    v.iloc[100:200] += 6.0
+    qc = saqc.SaQC(pd.DataFrame({"value": v})).flagRange("value", min=0, max=14)
+    out = correct_level_shift(qc=qc, start=str(idx[100]), end=str(idx[199]))
+    got = out["qc"].data.to_pandas()["value"]
+    assert abs(float(got.iloc[100:200].median()) - 10.0) < 0.5, (
+        "the flagged window was masked out and the correction was lost")
+
+
+def test_a_window_whose_edges_disagree_is_reported_not_silently_corrected():
+    """A clean level shift steps up and back down by the same amount. A storm does not,
+    and a confident-looking offset on one is how real water gets rewritten."""
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    from src.agent_tools.wrappers import correct_level_shift
+
+    idx = pd.date_range("2024-01-01", periods=300, freq="5min")
+    v = pd.Series(np.full(300, 10.0), index=idx)
+    v.iloc[100:200] += 6.0
+    v.iloc[200:] += 6.0                      # steps up and never comes back
+    out = correct_level_shift(qc=saqc.SaQC(pd.DataFrame({"value": v})),
+                              start=str(idx[100]), end=str(idx[199]))
+    assert out["edges_agree"] is False
+    assert "disagree" in out["message"]
+
+
+def test_deleted_values_are_actually_gone_from_the_cleaned_file():
+    """§5 says the cleaned file carries deleted values as NaN and §1 promises a cleaned
+    dataset — but the frame came straight off qc.data with no action applied, so every
+    deleted value was still there at its original reading. Verified on run L:
+    2023-07-05T13:45 was action=delete in the flag log and read 16.1 in the clean CSV."""
+    from src.agent_tools.wrappers import export_clean_data
+    qc, at = _qc_with_one_flagged_spike()
+    out = export_clean_data(
+        qc=qc, precip_audited=frozenset({at}),
+        decisions=[{"start": at, "difficulty": "clear", "verdict": "anomaly",
+                    "anomaly_type": "spike", "action": "delete",
+                    "reason": "500 NTU single-sample excursion"}])
+    row = out["df"].loc[pd.Timestamp(at), "value"]
+    assert pd.isna(row), "a deleted value must not survive into the cleaned file"
+    assert out["n_values_deleted"] == 1
+
+
+def test_correcting_does_not_shadow_builtins_in_the_wrappers_module():
+    """SaQC's processGeneric injects its 35-name evaluation environment into the
+    __globals__ of whatever callable it is handed, and six of those names shadow
+    builtins: abs, id, len, max, min, sum. One call with a function defined in
+    wrappers.py therefore replaces `max` and `len` for every OTHER function in that
+    module for the rest of the process — which made `_build_flag_log`'s
+    `max(len(stamps), 1)` raise `AxisError: axis 1 is out of bounds` inside a test
+    that never touched this tool. The failure is remote, silent and order-dependent,
+    so it gets its own guard.
+    """
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    from src.agent_tools import wrappers as w
+
+    idx = pd.date_range("2024-01-01", periods=200, freq="5min")
+    v = pd.Series(np.full(200, 10.0), index=idx)
+    v.iloc[50:150] += 5.0
+    w.correct_level_shift(qc=saqc.SaQC(pd.DataFrame({"value": v})),
+                          start=str(idx[50]), end=str(idx[149]))
+
+    for name in ("max", "min", "len", "sum", "abs", "id"):
+        assert name not in vars(w), (
+            f"processGeneric leaked `{name}` into the wrappers module globals, "
+            "shadowing the builtin for every function in it")

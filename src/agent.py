@@ -38,6 +38,27 @@ from src.agent_tools import precipitation
 
 # Bump on every edit to SYSTEM_PROMPT and note the change in the commit message,
 # so a run in logs/*.jsonl can be tied to the exact prompt that produced it.
+# v0.18: a level shift is CORRECTED, not deleted — correct_level_shift shifts the
+#        window back by the step measured at its two edges. A shift is an offset, so
+#        the water underneath is real: run L deleted 117 rows of recoverable record,
+#        and correcting them instead takes interior error 6.95 -> 0.78 FNU.
+# v0.17: a level shift is settled by BOTH edges, not one. Removing the "anomaly + keep"
+#        escape hatch in v0.16 did not make run J treat the shift — it took the other
+#        exit and called it `normal`, on the unsound ground that the series wiggled
+#        inside the window. It also left "Default action: KEEP and flag, unless clearly
+#        erroneous" sitting directly above the new rule, contradicting it. Both fixed:
+#        two sharp edges around a held level is a rectangle and rivers do not make
+#        rectangles; within-window variability is explicitly not evidence.
+# v0.16: the rainfall audit is ENFORCED, not requested (export_clean_data refuses to
+#        delete an unaudited spike), and rain now flips the default to keeping rather
+#        than merely counting as evidence. Prompted since v0.13 and never once performed:
+#        the dispatch branch was missing, so every call returned "Unknown tool". Also:
+#        a level shift you call an artifact must be TREATED, not kept — the old wording
+#        ("verdict 'anomaly' ... even if you keep the values") is what produced run I's
+#        118 kept rows on a step it had just argued was a sensor artifact.
+# v0.15: stop deliberating over which timestamps to hand a batch tool — measured, one
+#        precip_context_points call cost 18,290 chars of thinking to produce a 74-char
+#        result. Paired with output_config effort=medium (see the client call).
 # v0.14: a jump is an EDGE, a level shift is a WINDOW. find_shift_windows pairs
 #        flag_jumps edges into candidate spans and measures interior elevation plus edge
 #        sharpness; the prompt now requires a decision span over the whole window. The
@@ -73,7 +94,7 @@ from src.agent_tools import precipitation
 #       override a specific verdict.
 # v0.5: phases replace the fixed STEP script (only inspect-first, range-before-spikes and
 #       export-last are forced); three context primitives exposed as tools.
-SYSTEM_PROMPT_VERSION = "v0.14-draft"
+SYSTEM_PROMPT_VERSION = "v0.18-draft"
 
 # The model is a CLAUDE.md §2 golden rule — do not change it without changing §2.
 MODEL = "claude-sonnet-4-6"
@@ -288,28 +309,49 @@ the main defence against a mis-parameterised detector wrecking a run.
     actually measured — never infer the shape from the flag's isolation, and never from
     what other points in the record looked like.
 
+    DO NOT DELIBERATE OVER WHICH TIMESTAMPS TO HAND A BATCH TOOL. describe_points and
+    precip_context_points take up to 300 at a time and cost about 90 tokens per point;
+    choosing between them costs far more than measuring all of them. Pass the whole
+    flagged set, or the whole set of points you are about to call spikes, and spend your
+    reasoning on the RESULTS instead. Measured on one run: composing a single
+    precip_context_points call took 18,290 characters of deliberation to produce a call
+    whose result was 74 characters — $0.37 of thinking to avoid $0.01 of measurement.
+    The same applies to get_flag_summary and other bookkeeping calls: they return counts,
+    so read them, do not reason about what they might say before calling them.
+
     A FLAG IS A CANDIDATE, NOT A VERDICT. Your verdict is the run's answer and is what
     gets scored; the detector only nominated the point. If you have not measured a point,
     you are not in a position to delete it — describe_points takes up to 300 timestamps in
     one call at about 90 tokens each, so measuring an entire detector's output costs a
     fraction of one wasted deletion.
 
-    BEFORE ANY SPIKE VERDICT, AUDIT IT AGAINST RAINFALL. Collect every timestamp you
-    intend to call a spike and pass them ALL to precip_context_points in one call —
-    including the ones that look clear-cut. That is not a formality: the points you are
-    most confident about from the series alone are exactly the ones outside evidence can
-    overturn, and some of them look like errors to the eye too. Turbidity rises because
-    rain washes sediment in, so an excursion with rain behind it has a physical cause.
+    BEFORE ANY SPIKE VERDICT, AUDIT IT AGAINST RAINFALL. THIS ONE IS ENFORCED: collect
+    every timestamp whose spike values you intend to delete or correct and pass them ALL
+    to precip_context_points in one call, or export_clean_data will refuse the export and
+    name the rows you skipped. Include the ones that look clear-cut. That is not a
+    formality and not a box to tick — it is the single most likely reason a deletion you
+    are confident about is wrong. Rainfall is the ONLY evidence you have that does not
+    come from the turbidity series itself, so it is the only thing that can overturn a
+    call the series makes look obvious. Many of the excursions in this record look like
+    errors to the eye AND to every detector, and are real water; nothing in the shape of
+    the trace will tell you which, because the shape is what made them look wrong.
 
     HOW MUCH THAT ANSWER IS WORTH, IN BOTH DIRECTIONS. The nearest station with full
     coverage is about 31 km away, and a summer storm cell is often smaller than that. So:
-      * RAIN BEFORE THE POINT is strong evidence the excursion is real. Deleting it anyway
-        needs a specific reason you state.
-      * NO RAIN is WEAK evidence. The cell may simply have missed the station. It does not
-        license a deletion on its own — it only fails to support the excursion.
-      * NO DATA is not "no rain". If the result says precipitation is unavailable, say so
-        and decide on the series alone; do not read it as dry weather.
-    Points you are NOT calling spikes do not need this audit.
+      * RAIN BEFORE THE POINT means the excursion HAS A PHYSICAL CAUSE, and your default
+        flips to keeping it: rain washed sediment in and the sensor recorded the result.
+        Deleting anyway is a decision you must justify against the rain, in the reason,
+        with a specific measurement — that the excursion is one sample wide when the rain
+        was spread over hours, that it recovered instantly, that it is physically
+        impossible for this river. "It looks like a spike" is not a rebuttal of rain.
+        Treat these as judgement-calls and write the deliberation.
+      * NO RAIN is WEAK evidence and does NOT license a deletion on its own. The cell may
+        simply have missed the station. It only fails to support the excursion, which
+        leaves the series measurements to carry the whole decision by themselves.
+      * NO DATA is not "no rain". If the result says precipitation is unavailable for a
+        point, say so and decide on the series alone; do not read it as dry weather. The
+        audit still counts as done for that point — you looked, and nothing was there.
+    Points you are keeping do not need this audit; it guards the irreversible act.
 
     Call ramp_context when a point is narrow and high-z but the surrounding HOURS look
     like they were going somewhere. slope_context sees 45 minutes; a storm peak can be the
@@ -396,8 +438,12 @@ the main defence against a mis-parameterised detector wrecking a run.
     still scored 0.9% recall, because 116 of the 117 corrupted rows were never claimed.
     Reporting the edge is not reporting the shift.
 
-    So pass flag_jumps' flagged_datetimes to find_shift_windows. It pairs the edges into
-    candidate windows and measures each one. Two numbers decide it, and you need BOTH:
+    So call find_shift_windows after flag_jumps, and CALL IT WITH NO `ats` ARGUMENT: it
+    then reads every jump the detector flagged straight from the flag history. Do not
+    hand it a chosen subset. A run that picked 76 of 145 jump timestamps left the real
+    shift's two edges out of its own list, got back one unrelated window, and concluded
+    the record had no level shifts — and nothing about that result looked wrong. It pairs
+    the edges into candidate windows and measures each one. Two numbers decide it, and you need BOTH:
       * interior_sigmas — how far the inside of the window sits from its surroundings.
       * onset_sharpness / end_sharpness — 1.0 means the level moved in ONE sample, 0.1
         means it ramped over hours.
@@ -409,10 +455,25 @@ the main defence against a mis-parameterised detector wrecking a run.
     end. A span covering only the edge claims one row and leaves the rest of the corrupted
     segment unreported.
 
+    THE SHAPE THAT SETTLES IT IS THE PAIR OF EDGES, AND YOU MUST LOOK AT BOTH. A storm
+    has at most ONE sharp edge — the onset — and then decays over hours or days; it does
+    not climb in one sample, sit flat at the new level, and step back down in one sample.
+    A window bounded by TWO sharp edges with a held level between them is a rectangle,
+    and rivers do not produce rectangles: that is a recalibration, a sensor swap, or a
+    units change. This is why find_shift_windows reports onset_sharpness AND
+    end_sharpness, and why level_shift_context alone is not enough to decide — it looks
+    at one edge, so it cannot see the shape that distinguishes the two.
+
+    WHAT IS NOT EVIDENCE: how much the series wiggles INSIDE the window. A shift offsets
+    a stretch of water, carrying that water's own variability with it, so the noise
+    inside the window tells you about the weather that day and nothing about whether the
+    offset is real. Do not reach for "there is genuine variability during the window" as
+    a reason to call a sharp, held, sharply-ended step normal — it is not one, and it was
+    used to wave away exactly such a step on a previous run.
+
     describe_point's level_shift block still gives you median before vs after, the step in
     robust sigmas, step_sharpness, and how long the new level held — use it on a single
     window you are unsure about, after find_shift_windows has narrowed the field.
-    Default action: KEEP and flag, unless clearly erroneous.
     Judgement — read this carefully, it is the hardest call you make. flag_jumps fires on
     every sharp change, and in turbidity most sharp changes are storm rising limbs and
     recession limbs, which are normal water behaviour. The discriminator that works best is
@@ -421,14 +482,33 @@ the main defence against a mis-parameterised detector wrecking a run.
     exactly that. Even so, a flash-flood onset is sharp and sustained and is
     indistinguishable from a real step in a single series, and the level_shift measurements
     are the weakest of the four — they were checked, and they misfire on storm peaks. Treat
-    every flag_jumps hit as "look here", not as "this is an artifact". Your default is KEEP
-    with an explanation; only recommend deletion if the step is instantaneous, sustained,
-    and physically implausible as water.
-    VERDICT: this is the type where the two calls come apart, so be deliberate. A storm
-    limb is verdict "normal" + keep. A step you judge to be a recalibration or sensor swap
-    is verdict "anomaly" (level_shift) even if you keep the values because you cannot
-    defensibly repair them — say that in the reason. Do not record "normal" merely because
-    you decided not to touch it; that throws away the finding.
+    every flag_jumps hit as "look here", not as "this is an artifact". Your default is to
+    leave the water alone; only conclude "artifact" if the step is instantaneous,
+    sustained, and physically implausible as water.
+    VERDICT AND ACTION MOVE TOGETHER HERE, and there are exactly two ways to finish:
+      * You judge it real water — a storm limb, a genuine step change in the river. That
+        is verdict "normal" + keep. It is a real finding: it records that you looked at
+        your own detector's hit and rejected it.
+      * You judge it an artifact — a recalibration, a sensor swap. That is verdict
+        "anomaly" (level_shift), and the action is CORRECT, not delete. Call
+        correct_level_shift with the window's bounds: it measures the step at the two
+        edges and shifts the window back by it. A level shift is an OFFSET — the sensor
+        reported the wrong number, but the water underneath moved normally, so the shape
+        inside the window is real data sitting at the wrong height. Deleting it throws
+        away hours of good record for no reason. Measured on this project's data,
+        correcting the injected shift took the interior error from 6.95 FNU to 0.78 FNU
+        against the true water; deleting the same 117 rows would have destroyed all of
+        it. Delete a shifted window only if the correction cannot be trusted — if
+        `edges_agree` comes back false, the two edges disagree about the step and the
+        window may be a storm rather than an offset. Whichever you choose, leaving the
+        wrong values in place is not an option: export_clean_data refuses that pair.
+    There is no third option where you call it an artifact and keep the values anyway.
+    (The one type that genuinely has no treatment is a gap too long to fill — that is why
+    "anomaly + keep" exists at all, and it is limited to gaps.) A level shift is a WINDOW,
+    so the decision span must cover the whole window, not just the edges flag_jumps found:
+    take the bounds from find_shift_windows / shift_window_context and write ONE span from
+    onset to end. Do not record "normal" merely because you decided not to touch it; that
+    throws away the finding.
 
   GAP — a run of missing values (NaN).
     Detect with: flag_nan.
@@ -500,6 +580,10 @@ Context — these say WHAT THE DATA LOOKS LIKE there (see §4.1)
 
 Action
   impute_rolling       Fills NaN gaps with a rolling median. Set max_gap deliberately.
+  correct_level_shift  Shifts a level-shifted window back by the step measured at its
+                       two edges. THE right action for a level shift you judge an
+                       artifact — the water under an offset is real, so correcting
+                       recovers it where deleting throws it away.
 
 Every tool takes a `field` argument naming the value column; it defaults to "value" and you
 should leave it alone unless the summary shows a different column name. Every detector
@@ -910,19 +994,42 @@ _STREAM_ATTEMPTS = 4
 _STREAM_BACKOFF_SECONDS = 5.0
 
 
+def _is_retryable(exc: Exception) -> bool:
+    """Would re-issuing this request plausibly succeed?
+
+    Transport failures and server-side 5xx/429s: yes. A 400, an auth failure or a
+    validation error: no — those fail identically every time, and burning
+    `_STREAM_ATTEMPTS` on one costs a full conversation re-send per attempt.
+    """
+    if isinstance(exc, (httpx.HTTPError, anthropic.APIConnectionError)):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        return status >= 500 or status == 429
+    return "overloaded" in str(exc).lower()
+
+
 def _stream_message(client: "anthropic.Anthropic", **kwargs):
     """One streaming request, retrying a failure that happens *during* the stream.
 
     Re-issuing is safe: the request is the whole conversation so far, so a retry asks
-    the same question again rather than continuing a half-received answer. Anything
-    the SDK already handles (429/5xx before the first byte) never reaches here.
+    the same question again rather than continuing a half-received answer.
+
+    THIS CATCHES `anthropic.APIError` AS WELL AS `httpx.HTTPError`, and the distinction
+    is not academic (2026-08-25). The SDK's `max_retries` stops applying the moment the
+    first byte arrives, so a 5xx delivered as an error event *inside* an open stream
+    reaches here with no retry behind it — and until this catch was widened, an
+    `APIStatusError: Internal server error` at step 8 of run K ended the process and
+    discarded eight completed steps. This is the same shape as the `httpx.ReadTimeout`
+    that killed a run on 2026-08-18: the handler existed and named the wrong exception
+    type. `_is_retryable` keeps a 400 or an auth failure from burning four re-sends.
     """
     for attempt in range(1, _STREAM_ATTEMPTS + 1):
         try:
             with client.messages.stream(**kwargs) as stream:
                 return stream.get_final_message()
-        except httpx.HTTPError as exc:
-            if attempt == _STREAM_ATTEMPTS:
+        except (httpx.HTTPError, anthropic.APIError) as exc:
+            if attempt == _STREAM_ATTEMPTS or not _is_retryable(exc):
                 raise
             print(
                 f"  stream failed ({type(exc).__name__}: {exc}); "
@@ -930,6 +1037,16 @@ def _stream_message(client: "anthropic.Anthropic", **kwargs):
                 file=sys.stderr,
             )
             time.sleep(_STREAM_BACKOFF_SECONDS * attempt)
+
+
+def _norm_stamp(at) -> str:
+    """One canonical spelling for a timestamp, so `2023-07-05 13:45` and
+    `2023-07-05T13:45:00` compare equal. The precipitation audit ledger is a set of
+    strings and the model does not spell timestamps consistently between calls."""
+    try:
+        return pd.Timestamp(at).strftime("%Y-%m-%dT%H:%M:%S")
+    except (ValueError, TypeError):
+        return str(at)
 
 
 def run_agent(
@@ -957,6 +1074,35 @@ def run_agent(
     # §2 golden rule: the key comes from .env, never from source. load_dotenv does
     # not overwrite a variable already exported in the shell, so an explicitly set
     # ANTHROPIC_API_KEY still wins.
+    # Which gauge's rain to read. The stem is `<gauge>_l<level>` (§5), so the gauge is
+    # everything before the first underscore; fall back to the module default when the
+    # runner was given no stem (a bare library call).
+    precip_gauge = stem.split("_")[0] if stem else precipitation.DEFAULT_GAUGE
+
+    # Every timestamp that has actually COME BACK from a precipitation call with a
+    # real answer. `export_clean_data` refuses to delete a spike that is not in here
+    # (§7.7), so the requirement is enforced against evidence the run really obtained
+    # rather than against the agent's claim to have looked.
+    precip_audited: set[str] = set()
+
+    def _record_precip_audit(result: dict) -> None:
+        """Record every timestamp this precipitation call came back for.
+
+        The ledger tracks that the run LOOKED, not that it got a useful answer. A
+        point no station covers is recorded too, and deliberately: requiring a
+        positive answer would make a timestamp outside the rain gauge's coverage
+        permanently undeletable, and the run would have no way out of that except to
+        ship values it believes are wrong. §7.7's asymmetry — presence of rain is
+        strong evidence, absence is weak, and "no data" is neither — is carried by
+        the tool's own result text, which says so on every uncovered point. It is not
+        this ledger's job, and trying to enforce it here deadlocks the run instead.
+        """
+        if result.get("at"):                       # the single-point form
+            precip_audited.add(_norm_stamp(result["at"]))
+        for row in result.get("points", ()):       # the batch form
+            if isinstance(row, dict) and row.get("at"):
+                precip_audited.add(_norm_stamp(row["at"]))
+
     load_dotenv()
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise RuntimeError(
@@ -1052,6 +1198,22 @@ def run_agent(
                 # moved to 4.7 or later the default flips to "omitted" and the
                 # thinking text comes back EMPTY — pass display="summarized" then.
                 thinking={"type": "adaptive"},
+                # EFFORT WAS NEVER SET, so it defaulted to `high` — nobody chose that.
+                # Measured on the 2026-08-22 run: 72% of output tokens (64,358 of 89,371)
+                # were internal thinking that is billed but never returned, ~$0.97 of a
+                # $2.26 run. `effort` is the parameter that controls exactly that spend.
+                # `medium` is the first step down; treat the quality cost as unmeasured
+                # until a run at this setting is scored against the `high` baseline
+                # (run_20260822_095436: spike precision 0.509, recall 0.873, macro-F1
+                # 0.772). If precision holds, this is free; if it does not, raise it back.
+                # `high` while the level-shift work is being measured: run E at `high`
+                # is the only clean baseline (macro-F1 0.772), and changing effort at the
+                # same time as a fix is what made runs G and H unattributable. `medium`
+                # is worth ~29% of output tokens and looked quality-neutral on run G,
+                # then gap recall fell to 0.761 on run H — but 1.000 and 0.761 are both
+                # `medium`, so that spread is unexplained variance, not a measured effect.
+                # Settling it needs 2-3 runs per setting, not one.
+                output_config={"effort": "high"},
                 # Prompt caching. Measured on the 2026-08-10 run: 88% of the bill was
                 # input tokens, cache_read_input_tokens was 0 on every step, and the
                 # conversation is re-sent in full each turn — the exact shape caching
@@ -1083,10 +1245,13 @@ def run_agent(
             # was: a transient overload that outlasted the retries is worth re-running,
             # a 400 or auth failure is not, and the report is the only place a reader
             # finds out.
-            transient = isinstance(
-                exc, (anthropic.RateLimitError, anthropic.InternalServerError,
-                      anthropic.APIConnectionError, httpx.TransportError)
-            ) or "overloaded" in str(exc).lower()
+            # Use the same predicate the retry loop uses, rather than a second list of
+            # exception classes that can drift from it. Run K's failure logged as the
+            # GENERIC `APIStatusError` carrying "Internal server error", so an isinstance
+            # check against `InternalServerError` reported a plainly transient 500 as
+            # permanent — telling the reader that re-running would not help, when it was
+            # the only thing that would.
+            transient = _is_retryable(exc)
             _log_event({"event": "api_error", "step": step, "transient": transient,
                         "error": f"{type(exc).__name__}: {exc}"})
             final_report = (
@@ -1177,6 +1342,7 @@ def run_agent(
                                 # not the model's — so these are injected, not in the schema.
                                 tool_args = {
                                     **tool_args, "output_dir": output_dir, "stem": stem,
+                                    "precip_audited": frozenset(precip_audited),
                                 }
                             # wrappers mutate qc and take qc=
                             result = func(qc=current_qc, **tool_args)
@@ -1192,6 +1358,27 @@ def run_agent(
                         elif hasattr(context, tool_name):
                             # context tools observe and take source=
                             result = func(source=current_qc, **tool_args)
+                        elif hasattr(precipitation, tool_name):
+                            # THIS BRANCH WAS MISSING UNTIL 2026-08-25, and its absence
+                            # was silent in exactly the way that matters: `_get_tool_function`
+                            # resolved the precipitation tools happily, the schemas were
+                            # published to the model, and the prompt has MANDATED a rainfall
+                            # audit of every spike since v0.13 — but the dispatch chain
+                            # checked only `wrappers` and `context` and then raised, so every
+                            # call came back `Unknown tool: precip_context_points`. §7.7 read
+                            # as "precipitation cannot move the synthetic benchmark"; the
+                            # actual reason the numbers never moved is that the tool never ran.
+                            #
+                            # `gauge` is injected, not in the schema, for the same reason
+                            # `output_dir` is: which gauge this series belongs to is a fact
+                            # about the run, not a judgement for the model, and the module's
+                            # "01467200" default would silently answer with the WRONG
+                            # river's rain on any other dataset.
+                            result = func(
+                                source=current_qc,
+                                **{"gauge": precip_gauge, **tool_args},
+                            )
+                            _record_precip_audit(result)
                         else:
                             raise ValueError(f"Unknown tool: {tool_name}")
 

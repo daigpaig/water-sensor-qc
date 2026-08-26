@@ -1031,6 +1031,48 @@ _LEVEL_SHIFT_CONTEXT = {
 # Action tools
 # ---------------------------------------------------------------------------
 
+_CORRECT_LEVEL_SHIFT = {
+    "name": "correct_level_shift",
+    "description": (
+        "CORRECT a level shift by shifting its window back by the step measured at its "
+        "own two edges. THIS IS THE RIGHT ACTION FOR A LEVEL SHIFT, not delete: a shift "
+        "is an OFFSET, so the water underneath moved normally and the shape inside the "
+        "window is real data sitting at the wrong height. Deleting it throws away hours "
+        "of good record; subtracting the offset recovers it. Measured on this project's "
+        "data, correcting the injected shift took the interior error from 6.95 FNU to "
+        "0.78 FNU against the true water, and changed zero rows outside the window. "
+        "Take `start` and `end` from find_shift_windows. Both edges are measured and "
+        "reported separately: a clean level shift steps up and back down by the same "
+        "amount, so if `edges_agree` comes back false the window may be a storm rather "
+        "than an offset — check it before relying on the correction. After calling this, "
+        "record the segment as verdict 'anomaly', anomaly_type 'level_shift', action "
+        "'correct'."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "start": {
+                "type": "string",
+                "description": "First timestamp of the shifted window, ISO 8601.",
+            },
+            "end": {
+                "type": "string",
+                "description": "Last timestamp of the shifted window, ISO 8601.",
+            },
+            "edge_window": {
+                "type": "string",
+                "description": (
+                    "How much series either side of each edge to average when measuring "
+                    "the step. Default '2h' — wide enough to average out 5-minute noise, "
+                    "narrow enough not to reach into a storm beyond the window."
+                ),
+            },
+        },
+        "required": ["start", "end"],
+    },
+}
+
+
 _IMPUTE_ROLLING = {
     "name": "impute_rolling",
     "description": (
@@ -1202,7 +1244,12 @@ _FIND_SHIFT_WINDOWS = {
             "field": {"type": "string", "default": "value",
                       "description": "Column holding the measurements. Default 'value'."},
             "ats": {"type": "array", "items": {"type": "string"},
-                    "description": "Jump timestamps — normally flag_jumps' flagged_datetimes."},
+                    "description": "OPTIONAL, and you should normally OMIT it. Left out, "
+                                   "every timestamp flag_jumps flagged is read straight "
+                                   "from the flag history, which is what you want. Pass a "
+                                   "list only to ask about specific edges — a subset that "
+                                   "happens to leave out a real shift's two edges makes "
+                                   "that shift invisible, and the result looks normal."},
             "min_hours": {"type": "number", "default": 1.0,
                           "description": "Shortest window to consider, in hours."},
             "max_hours": {"type": "number", "default": 48.0,
@@ -1261,6 +1308,7 @@ TOOL_SCHEMAS: list[dict] = [
     _PRECIP_CONTEXT_POINTS,
     _PRECIP_CONTEXT,
     # Action
+    _CORRECT_LEVEL_SHIFT,
     _IMPUTE_ROLLING,
 ]
 

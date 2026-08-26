@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from src.workbench.decision_audit import (
+    CATEGORIES, UNHANDLED_ANOMALY,
     build_cases, build_html, build_payload, categorise, context_samples,
 )
 from src.workbench.provenance import load_trace
@@ -117,3 +118,54 @@ def test_an_inspected_but_unflagged_point_is_not_filed_as_nothing():
     assert categorise("", "", flagged=False, inspected=True) == "inspected-not-flagged"
     assert categorise("", "", flagged=False, inspected=False) == ""
     assert categorise("", "spike", flagged=False, inspected=True) == "undetected"
+
+
+# --- the verdict, not the action, decides found-vs-missed (§5.1) ---------------
+
+def test_an_anomaly_the_agent_identified_and_kept_is_not_a_miss():
+    """§6 makes `keep` the DEFAULT action for a level shift, so scoring the action
+    filed every correctly-found shift under `missed`. Measured on run I: the page
+    said missed=117 — every row of the one level shift — while evaluate.py scored
+    that same flag log 1.000. Two readers of one log must not disagree about
+    whether the event was found."""
+    assert categorise("keep", "level_shift", flagged=True, verdict="anomaly") == "identified-kept"
+    assert "identified-kept" not in UNHANDLED_ANOMALY
+
+
+def test_a_miss_is_an_anomaly_the_agent_called_normal():
+    for verdict in ("normal", "undecided"):
+        assert categorise("keep", "spike", flagged=True, verdict=verdict) == "missed"
+
+
+def test_an_anomaly_verdict_on_real_water_is_not_filed_as_a_quiet_keep():
+    """The mirror case. §10 scores the verdict, so this costs precision even though
+    the value survived — filing it under `kept` hid it among correct decisions."""
+    assert categorise("keep", "", flagged=True, verdict="anomaly") == "false-anomaly"
+    assert categorise("keep", "", flagged=True, verdict="normal") == "kept"
+
+
+def test_a_gap_called_normal_is_a_miss_however_right_the_action_looks():
+    assert categorise("keep", "gap", flagged=True, verdict="anomaly") == "left-missing"
+    assert categorise("keep", "gap", flagged=True, verdict="normal") == "missed"
+
+
+def test_a_log_written_before_verdicts_existed_renders_as_it_always_did():
+    """Back-compat is load-bearing: silently recategorising an old run would make
+    two archived pages of the same log disagree."""
+    assert categorise("keep", "spike", flagged=True) == "missed"
+    assert categorise("keep", "gap", flagged=True) == "left-missing"
+    assert categorise("keep", "", flagged=True) == "kept"
+
+
+def test_every_category_the_classifier_can_emit_is_declared():
+    """CATEGORIES drives the sidebar, the colour table and the CLI counts; a bucket
+    missing from it renders as an uncoloured, uncountable ghost."""
+    emitted = {
+        categorise(a, l, flagged=f, inspected=i, verdict=v)
+        for a in ("keep", "delete", "correct", "impute", "")
+        for l in ("", "spike", "plateau", "level_shift", "gap")
+        for f in (True, False)
+        for i in (True, False)
+        for v in ("", "anomaly", "normal", "undecided")
+    } - {""}
+    assert emitted <= set(CATEGORIES), emitted - set(CATEGORIES)

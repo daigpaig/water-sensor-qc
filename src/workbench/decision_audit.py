@@ -18,7 +18,20 @@ Categories (pick with 1-6, or the counts in the sidebar):
                    label file never recorded — pass --raw and the panel tells you
                    whether the same excursion exists in the approved base.
   deleted          removed, and the labels agree it was an anomaly.
-  missed           a labelled anomaly that WAS flagged, and the agent kept anyway.
+  identified-kept  a labelled anomaly the agent FOUND — verdict `anomaly` — and chose
+                   not to treat the value. NOT a miss: §6 makes `keep` the default for
+                   a level shift, and §5.1 allows `anomaly` + `keep` wherever a segment
+                   cannot be defensibly corrected. This bucket exists because without it
+                   a correct detection was filed under `missed`: on run I all 117 rows of
+                   the one level shift the agent identified almost exactly read as misses,
+                   directly contradicting the scorer, which gave it F1 1.000.
+  missed           a labelled anomaly that WAS flagged and the agent then called NORMAL
+                   (or never adjudicated). The agent looked and got it wrong — which is
+                   the only thing that should carry that name.
+  false-anomaly    normal water the agent called an anomaly but did not remove. The
+                   mirror of `identified-kept`, and hidden inside `kept` for the same
+                   reason: §10 scores the verdict, so this is a false positive even
+                   though the value survived.
   undetected       a labelled anomaly NO detector flagged. Upstream of the agent.
   imputed          a gap the agent filled.
   overwritten-anomaly  a labelled anomaly impute_rolling overwrote before the agent
@@ -75,9 +88,13 @@ REMOVING_ACTIONS = frozenset({"delete", "correct"})
 
 CATEGORIES = (
     "wrongly-deleted", "missed", "overwritten-anomaly", "undetected",
-    "overwritten-water", "deleted", "imputed", "left-missing", "kept",
-    "inspected-not-flagged",
+    "overwritten-water", "false-anomaly", "deleted", "identified-kept",
+    "imputed", "left-missing", "kept", "inspected-not-flagged",
 )
+
+# §5.1: the verdict is the run's answer, the action only what it did about the value.
+# A verdict of `anomaly` means the agent FOUND the thing, whatever it then chose to do.
+FOUND_IT = "anomaly"
 
 # Categories in which a labelled anomaly went unhandled. Summed in the CLI output so
 # the headline cannot read "missed=0" while thirteen anomalies sit in another bucket.
@@ -101,12 +118,30 @@ def context_samples(index: pd.DatetimeIndex) -> int:
     return max(8, int(round(CONTEXT_WINDOW / step)))
 
 
-def categorise(action: str, label: str, flagged: bool, inspected: bool = False) -> str:
-    """Which of the six buckets one row falls into.
+def categorise(action: str, label: str, flagged: bool, inspected: bool = False,
+               verdict: str = "") -> str:
+    """Which bucket one row falls into.
 
-    `label` is the §5 anomaly_type, or "" for normal water.
+    `label` is the §5 anomaly_type, or "" for normal water. `verdict` is the agent's
+    §5.1 answer — `anomaly`, `normal`, `undecided`, or "" for a log written before the
+    field existed.
+
+    **The verdict decides whether a kept row was found or missed, not the action.**
+    This function was action-only until 2026-08-25, which meant a labelled anomaly the
+    agent correctly identified and deliberately left in place was filed as `missed`.
+    That is not a miss by any reading: §6 makes `keep` the DEFAULT action for a level
+    shift, and §5.1 exists precisely so that `anomaly` + `keep` can say "I found this
+    and cannot defensibly treat it". Measured on run I, the page reported `missed=117`
+    — every row of the single level shift the agent bounded to within one sample —
+    while `evaluate.py` scored that same log 1.000 on level_shift. Two artefacts
+    reading the same flag log must not contradict each other about whether the run
+    found the event.
+
+    An empty `verdict` falls back to the old action-based behaviour, so a pre-§5.1 log
+    renders exactly as it always did rather than being silently recategorised.
     """
     is_anomaly = bool(label)
+    found_it = verdict == FOUND_IT
     if not flagged:
         if is_anomaly:
             return "undetected"
@@ -136,8 +171,15 @@ def categorise(action: str, label: str, flagged: bool, inspected: bool = False) 
     # "missed" bucket is swamped by correct behaviour: on 03447687_l1 it read 1,763,
     # of which all but a handful were long outages the agent deliberately left alone.
     if label == "gap":
-        return "left-missing"
-    return "missed" if is_anomaly else "kept"
+        # A gap the agent called a gap and left alone is both a correct detection and
+        # the correct action, so it stays out of every miss bucket. One the agent
+        # called NORMAL is a false negative in §10 however right the action looks,
+        # and falls through to `missed` below.
+        if found_it or not verdict:
+            return "left-missing"
+    if is_anomaly:
+        return "identified-kept" if found_it else "missed"
+    return "false-anomaly" if found_it else "kept"
 
 
 def build_cases(
@@ -174,7 +216,8 @@ def build_cases(
         flagged = at in flag_log.index
         action = str(flag_log["action"].get(at, "")) if flagged else ""
         label = str(label_type.get(at, ""))
-        category = categorise(action, label, flagged, at in inspected)
+        verdict = str(flag_log["verdict"].get(at, "")) if flagged else ""
+        category = categorise(action, label, flagged, at in inspected, verdict)
         if not category:
             continue
         entry = _flag_entry(flag_log, at) if flagged else None
@@ -197,7 +240,7 @@ def build_cases(
             # The whole reason this page exists (§5.1): the verdict is the run's answer,
             # the action only what it did about it. They are shown separately because a
             # gap correctly identified and left unfilled is `anomaly` + `keep`.
-            "verdict": str(flag_log["verdict"].get(at, "")) if flagged else "",
+            "verdict": verdict,
             "anomaly_type": str(flag_log["anomaly_type"].get(at, "")) if flagged else "",
             "flagged_by": str(flag_log["flagged_by"].get(at, "")) if flagged else "",
             "action": action or "(never flagged)",
@@ -399,11 +442,14 @@ const COLOR = {
   "undetected":"#a855f7", "overwritten-water":"#fb7185", "deleted":"#22c55e",
   "imputed":"#38bdf8", "left-missing":"#7dd3fc", "kept":"#64748b",
   "inspected-not-flagged":"#94a3b8",
+  "identified-kept":"#2dd4bf", "false-anomaly":"#f472b6",
 };
 const BLURB = {
   "wrongly-deleted":"Removed a value the labels call normal water — review these first.",
   "deleted":"Removed, and the labels agree it was an anomaly.",
-  "missed":"A labelled anomaly that was flagged, then kept.",
+  "missed":"A labelled anomaly that was flagged, then called normal. The agent looked and got it wrong.",
+  "identified-kept":"A labelled anomaly the agent identified and deliberately left in place. A correct detection, not a miss.",
+  "false-anomaly":"Normal water the agent called an anomaly but did not remove. Wrong verdict, value intact.",
   "undetected":"A labelled anomaly no detector flagged.",
   "imputed":"A gap the agent filled.",
   "overwritten-anomaly":"A labelled anomaly the imputer overwrote before the agent judged it — a miss in all but name.",
@@ -451,7 +497,7 @@ function renderSide() {
   }
   h += `<div class="hint">Click any point on either plot — including one that was never
         flagged — and the panel says why it got the verdict it got.
-        <kbd>1</kbd>-<kbd>9</kbd> category, <kbd>J</kbd>/<kbd>K</kbd> step,
+        <kbd>1</kbd>-<kbd>0</kbd> category, <kbd>J</kbd>/<kbd>K</kbd> step,
         <kbd>W</kbd>/<kbd>T</kbd>/<kbd>M</kbd> why / trace / measurements.</div>`;
   const rows = inCat();
   for (let i = 0; i < rows.length; i++) {
@@ -655,10 +701,22 @@ function renderPanel(at, c) {
              false positive.` : `Pass <code>--raw</code> to check it against the approved base.`}`];
   } else if (c.category === "missed") {
     note = c.measured
-      ? [`warn`, `A labelled anomaly that was flagged and measured, and kept anyway. The
-          measurement below is what the agent had — read it against its stated reason.`]
+      ? [`warn`, `A labelled ${c.label} that was flagged and measured, and the agent then
+          called it <b>${c.verdict || "nothing at all"}</b>. The measurement below is what it
+          had — read it against its stated reason.`]
       : [`bad`, `A labelled anomaly that was flagged but <b>never measured</b>. No
           describe_point(s) call covered it, so a decision span swept it up unexamined.`];
+  } else if (c.category === "identified-kept") {
+    note = [`ok`, `<b>The agent found this.</b> It flagged the row, called it a
+      <b>${c.anomaly_type || c.label}</b>, and chose to leave the value in place rather
+      than treat it. That is not a miss: §6 makes <code>keep</code> the default action for
+      a level shift, and §5.1 allows <code>anomaly</code>&nbsp;+&nbsp;<code>keep</code>
+      wherever a segment cannot be defensibly corrected. §10 scores the verdict, so this
+      row counts as a correct detection.`];
+  } else if (c.category === "false-anomaly") {
+    note = [`warn`, `<b>The agent called this an anomaly and the labels call it normal
+      water</b> — but it did not remove the value, so nothing was destroyed. It still
+      counts against precision: §10 scores the verdict, not the action.`];
   } else if (c.category === "overwritten-anomaly") {
     note = [`bad`, `<b>A labelled ${c.label} that the agent never judged.</b>
       impute_rolling overwrote it before any decision was made — SaQC filters
@@ -676,7 +734,7 @@ function renderPanel(at, c) {
       the chance to judge it — this is detector tuning, not decision quality.`];
   } else {
     note = [(c.category === "kept" || c.category === "left-missing") ? "flat" : "ok",
-            BLURB[c.category]];
+            BLURB[c.category] || c.category];
   }
   let h = tabs + `<div class="note ${note[0]}">${note[1]}</div>`;
   h += row("verdict", `<b>${verdictText(c)[0]}</b> &mdash; the run's answer, and what §10 scores`);
@@ -715,7 +773,14 @@ addEventListener("keydown", (e) => {
   if (e.key === "w") { setTab("why"); return; }
   if (e.key === "t") { setTab("trace"); return; }
   if (e.key === "m") { setTab("raw"); return; }
-  if (/^[1-9]$/.test(e.key)) { pick(Object.keys(COLOR)[+e.key - 1]); return; }
+  if (/^[0-9]$/.test(e.key)) {
+    // Index into the NON-EMPTY categories, not into COLOR: a fixed slice of COLOR
+    // left any bucket past the ninth unreachable from the keyboard.
+    const live = Object.keys(COLOR).filter(c => D.counts[c]);
+    const n = e.key === "0" ? 10 : +e.key;
+    if (live[n - 1]) pick(live[n - 1]);
+    return;
+  }
   if (e.key === "j" || e.key === "ArrowDown") { sel++; draw(); }
   else if (e.key === "k" || e.key === "ArrowUp") { sel--; draw(); }
 });
@@ -773,6 +838,10 @@ def main(argv: list[str] | None = None) -> int:
         parts = ", ".join(f"{payload['counts'][c]} {c}" for c in UNHANDLED_ANOMALY
                           if payload["counts"][c])
         print(f"  {unhandled} labelled anomalies went unhandled ({parts}).")
+    found_kept = payload["counts"]["identified-kept"]
+    if found_kept:
+        print(f"  {found_kept} labelled anomaly rows were identified and deliberately "
+              "kept (§6/§5.1) — correct detections, NOT misses.")
     print(f"  {len(cases):,} clickable points out of {len(series):,} rows; "
           "the rest were never flagged and are not labelled anomalies.")
     if not payload["has_raw"]:

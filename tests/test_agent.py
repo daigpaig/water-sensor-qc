@@ -388,6 +388,11 @@ def test_cli_flag_log_carries_the_agents_decisions(mock_anthropic, tmp_path):
 
     spike_at = idx[20].strftime("%Y-%m-%dT%H:%M:%S")
     resp1 = _tool_step("flag_range", {"min": 0, "max": 100}, "c1")
+    # §7.7: deleting a spike that was never checked against rainfall is refused, so a
+    # run that means to delete one has to make this call. This gauge has no rain data
+    # at all, which is exactly the case that must NOT deadlock: the tool answers "no
+    # station covers this", the timestamp counts as looked-at, and the export proceeds.
+    resp_precip = _tool_step("precip_context_points", {"ats": [spike_at]}, "c1b")
     resp2 = _tool_step(
         "export_clean_data",
         {"decisions": [
@@ -405,7 +410,7 @@ def test_cli_flag_log_carries_the_agents_decisions(mock_anthropic, tmp_path):
     resp3.content = [text_block]
     resp3.model_dump.return_value = {"mock": "resp3"}
 
-    _wire_stream(mock_client, [resp1, resp2, resp3])
+    _wire_stream(mock_client, [resp1, resp_precip, resp2, resp3])
 
     assert main([str(csv_path), "--output-dir", str(series_dir),
                  "--log-dir", str(tmp_path / "logs")]) == 0
@@ -601,3 +606,132 @@ def test_a_stream_that_keeps_failing_raises_so_the_run_can_export_what_it_has():
             agent_module._stream_message(_Client(), model="m")
     finally:
         agent_module._STREAM_BACKOFF_SECONDS = monkey
+
+
+# --- every published schema must actually be reachable (2026-08-25) ------------
+
+def test_every_published_tool_has_a_dispatch_path():
+    """The precipitation tools were published to the model, resolved fine by
+    `_get_tool_function`, and MANDATED by the prompt since v0.13 — and every call came
+    back `Unknown tool: precip_context_points`, because the dispatch if/elif chain
+    checked only `wrappers` and `context` before raising. Nothing failed loudly: the
+    model saw a tool error, worked around it, and the run looked normal. §7.7's claim
+    that rainfall "cannot move the synthetic benchmark" was measured on a tool that
+    had never once executed.
+
+    A schema the model can call and the runner cannot dispatch is the exact shape of
+    that bug, so assert the two sets agree rather than testing one tool.
+    """
+    from src.agent import _get_tool_function, context, precipitation
+    from src.agent_tools import wrappers
+    from src.agent_tools.schemas import TOOL_SCHEMAS
+
+    for schema in TOOL_SCHEMAS:
+        name = schema["name"]
+        _get_tool_function(name)          # resolvable...
+        assert (hasattr(wrappers, name) or hasattr(context, name)
+                or hasattr(precipitation, name)), (
+            f"{name} is published to the model but the dispatch chain in run_agent "
+            "has no branch that can reach it"
+        )
+
+
+def test_the_runner_asks_the_right_river_for_its_rain():
+    """`gauge` is absent from the schema and defaults to 01467200 inside the module, so
+    without injection every other gauge would be answered with the wrong river's rain —
+    and the result would look perfectly well-formed."""
+    import inspect
+
+    from src.agent import run_agent
+    from src.agent_tools import precipitation
+
+    assert "gauge" not in inspect.signature(precipitation.precip_context).bind_partial().arguments
+    src = inspect.getsource(run_agent)
+    assert 'stem.split("_")[0]' in src, "the gauge must come from the dataset stem (§5)"
+    assert '"gauge": precip_gauge' in src, "the injected gauge must reach the tool call"
+
+
+# --- mid-stream API errors are retried too (2026-08-25) ------------------------
+
+def test_a_500_inside_an_open_stream_is_retried_not_fatal():
+    """The SDK's max_retries stops applying once the first byte arrives, so a 5xx
+    delivered as an error event INSIDE an open stream had no retry behind it: run K
+    died at step 8 on `APIStatusError: Internal server error` and discarded eight
+    completed steps. Same shape as the ReadTimeout that killed a run on 2026-08-18 —
+    the handler existed and named the wrong exception type."""
+    import anthropic
+    from unittest.mock import MagicMock, patch
+
+    from src.agent import _stream_message
+
+    boom = anthropic.APIStatusError(
+        "Internal server error",
+        response=MagicMock(status_code=500, headers={}),
+        body=None,
+    )
+    good = MagicMock(name="final")
+    client, calls = MagicMock(), []
+
+    def stream(**kwargs):
+        calls.append(1)
+        ctx = MagicMock()
+        if len(calls) == 1:
+            ctx.__enter__ = MagicMock(side_effect=boom)
+        else:
+            ctx.__enter__ = MagicMock(return_value=MagicMock(
+                get_final_message=MagicMock(return_value=good)))
+        ctx.__exit__ = MagicMock(return_value=False)
+        return ctx
+
+    client.messages.stream = stream
+    with patch("src.agent.time.sleep"):
+        assert _stream_message(client) is good
+    assert len(calls) == 2, "the 500 should have been retried exactly once"
+
+
+def test_a_request_that_will_never_succeed_is_not_retried_four_times():
+    """Each retry re-sends the whole conversation, so burning _STREAM_ATTEMPTS on a
+    400 costs real money to fail identically four times."""
+    import anthropic
+    from unittest.mock import MagicMock, patch
+
+    from src.agent import _stream_message
+
+    bad = anthropic.APIStatusError(
+        "invalid request",
+        response=MagicMock(status_code=400, headers={}),
+        body=None,
+    )
+    client, calls = MagicMock(), []
+
+    def stream(**kwargs):
+        calls.append(1)
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(side_effect=bad)
+        ctx.__exit__ = MagicMock(return_value=False)
+        return ctx
+
+    client.messages.stream = stream
+    with patch("src.agent.time.sleep"), pytest.raises(anthropic.APIStatusError):
+        _stream_message(client)
+    assert len(calls) == 1
+
+
+def test_transient_is_judged_by_the_same_predicate_that_drives_the_retry():
+    """Run K's 500 arrived as the GENERIC APIStatusError, so an isinstance check
+    against InternalServerError reported a plainly transient failure as permanent —
+    telling the reader re-running would not help, when it was the only thing that would."""
+    import anthropic
+    from unittest.mock import MagicMock
+
+    from src.agent import _is_retryable
+
+    def status_error(code):
+        return anthropic.APIStatusError(
+            "boom", response=MagicMock(status_code=code, headers={}), body=None)
+
+    assert _is_retryable(status_error(500))
+    assert _is_retryable(status_error(529))
+    assert _is_retryable(status_error(429))
+    assert not _is_retryable(status_error(400))
+    assert not _is_retryable(status_error(401))

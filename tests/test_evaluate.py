@@ -357,3 +357,39 @@ def test_episode_scoring_is_marked_in_the_table():
     assert "0.500 *" in table
     assert "EPISODE OVERLAP" in table
     assert "counts of" in table
+
+
+def test_imputation_is_scored_on_gaps_only_not_every_injected_anomaly():
+    """§5: only injected GAPS have a true_value the imputer can be judged against.
+    The mask was `source == injected` alone, which also swept in spikes, plateaus and
+    level shifts — none of which the imputer touched. For a MISSED spike the cleaned
+    file still holds the 500-NTU reading, so its distance from the true water was
+    charged to the imputer and compared against a linear interpolation of a gap that
+    never existed. Measured on run N: 24 spike/plateau rows carried 82% of the squared
+    error against 78 real gap rows, and the headline read 7.866 vs 2.655 where the gaps
+    alone read 1.765 vs 1.509.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from src.evaluate import score_imputation
+
+    idx = pd.date_range("2024-01-01", periods=12, freq="5min")
+    truth = pd.Series(np.full(12, 10.0), index=idx)
+    raw = truth.copy()
+    raw.iloc[4:6] = np.nan          # a real gap
+    clean = raw.copy()
+    clean.iloc[4:6] = 10.2          # imputed, small error
+    clean.iloc[9] = 500.0           # a MISSED spike, left in place — not an imputation
+
+    labels = pd.DataFrame({
+        "datetime": idx,
+        "anomaly_type": ["", "", "", "", "gap", "gap", "", "", "", "spike", "", ""],
+        "source": ["", "", "", "", "injected", "injected", "", "", "", "injected", "", ""],
+        "true_value": [np.nan] * 4 + [10.0, 10.0] + [np.nan] * 3 + [10.0] + [np.nan] * 2,
+    })
+
+    score = score_imputation(clean, raw, labels, idx)
+    assert score.n_imputed == 2, "only the two gap rows are the imputer's work"
+    assert score.rmse < 1.0, (
+        f"rmse {score.rmse} — the 490-FNU miss on the undeleted spike leaked in")
