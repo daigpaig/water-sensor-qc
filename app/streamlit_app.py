@@ -41,42 +41,69 @@ if "history" not in st.session_state:
 if "current_file" not in st.session_state:
     st.session_state.current_file = None
 
+MOCK_DATA_DIR = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'mock')))
+
+
+def _load_mock_decisions():
+    """Load pre-generated mock decisions from data/mock/63680_decisions.json."""
+    decisions_path = MOCK_DATA_DIR / "63680_decisions.json"
+    if decisions_path.exists():
+        return json.loads(decisions_path.read_text())
+    return []
+
+
 def mock_run_agent(qc, max_steps, log_dir):
-    """A mock version of run_agent for testing without an API key."""
-    # Simulate processing time
+    """A mock version of run_agent for testing without an API key.
+
+    When the uploaded dataset matches the mock 63680 series (672 rows), loads
+    pre-generated flags and decisions from data/mock/.  Otherwise falls back to
+    simple midpoint-based flags so any CSV still produces visible output.
+    """
     with st.spinner("Mock agent is thinking..."):
         time.sleep(2)
-        
+
     df = qc.data.to_pandas().copy()
     if df.index.name != "datetime":
         df = df.reset_index()
-        
-    df["flag"] = None
-    
-    # Randomly flag some data just for visualization if any data exists
-    if len(df) > 0:
-        mid_point = len(df) // 2
-        if mid_point > 0:
-            # Add some standard anomalies
-            df.iloc[mid_point:mid_point+3, df.columns.get_loc("flag")] = "Spike"
-            df.iloc[mid_point+10:mid_point+13, df.columns.get_loc("flag")] = "Plateau"
-            # Add a borderline case
-            if mid_point+25 < len(df):
-                df.iloc[mid_point+25, df.columns.get_loc("flag")] = "Borderline Spike"
-            if "value" in df.columns:
-                df.iloc[mid_point:mid_point+3, df.columns.get_loc("value")] = None
-                df.iloc[mid_point+10:mid_point+13, df.columns.get_loc("value")] = None
 
-    report = "Mock Report:\n\nThe agent successfully ran in mock mode. No real API calls were made.\nFound 3 spikes, 1 plateau, and 1 borderline case."
-    
+    decisions = []
+
+    # Check if this looks like the mock 63680 dataset
+    clean_path = MOCK_DATA_DIR / "63680_clean.csv"
+    if len(df) == 672 and clean_path.exists():
+        # Load pre-generated flags from the mock clean file
+        mock_clean = pd.read_csv(clean_path)
+        df["flag"] = mock_clean["flag"]
+        decisions = _load_mock_decisions()
+    else:
+        # Fallback: simple midpoint-based flags for any other CSV
+        df["flag"] = None
+        if len(df) > 0:
+            mid = len(df) // 2
+            if mid > 0:
+                df.iloc[mid:mid+3, df.columns.get_loc("flag")] = "Spike"
+                df.iloc[mid+10:mid+13, df.columns.get_loc("flag")] = "Plateau"
+
+    report = (
+        "Mock Report\n"
+        "===========\n\n"
+        "The agent successfully ran in mock mode. No real API calls were made.\n\n"
+        "**Findings:**\n"
+        "- 2 spike events detected and deleted (1-sample and 2-sample excursions)\n"
+        "- 1 storm peak flagged but **kept** as genuine signal (14-sample width, "
+        "5.5 h recovery)\n"
+        "- 1 plateau (stuck sensor) detected and deleted (13 samples at exactly 4.2 FNU)\n"
+        "- 1 gap (8 samples, 2 h) imputed with rolling median\n"
+    )
+
     summary = RunSummary(
-        steps=2,
-        input_tokens=1000,
-        output_tokens=200,
-        est_cost_usd=0.005,
+        steps=8,
+        input_tokens=12400,
+        output_tokens=3200,
+        est_cost_usd=0.085,
         log_path="logs/mock_run.jsonl"
     )
-    return qc, df, report, summary
+    return qc, df, report, summary, decisions
 
 def plot_results(original_df, clean_df):
     """Generate a Plotly chart showing the series and flagged points."""
@@ -104,29 +131,15 @@ def plot_results(original_df, clean_df):
     
     # If we have flags, plot them
     if "flag" in clean.columns:
-        # Standard anomalies
-        anomalies = clean[clean["flag"].notna() & (clean["flag"] != "Borderline Spike")]
+        anomalies = clean[clean["flag"].notna()]
         if not anomalies.empty:
             fig.add_trace(go.Scatter(
                 x=anomalies["datetime"],
                 y=orig.loc[anomalies.index, "value"] if "value" in orig.columns else anomalies["value"],
                 mode='markers',
-                name='Flagged Anomaly',
-                marker=dict(color='red', size=8, symbol='x'),
+                name='Flagged',
+                marker=dict(color='red', size=8, symbol='circle-open', line=dict(width=2, color='red')),
                 text=anomalies["flag"],
-                hovertemplate="Time: %{x}<br>Value: %{y}<br>Flagged by: %{text}<extra></extra>"
-            ))
-            
-        # Borderline anomalies
-        borderline = clean[clean["flag"] == "Borderline Spike"]
-        if not borderline.empty:
-            fig.add_trace(go.Scatter(
-                x=borderline["datetime"],
-                y=orig.loc[borderline.index, "value"] if "value" in orig.columns else borderline["value"],
-                mode='markers',
-                name='Borderline Case (Click Me!)',
-                marker=dict(color='orange', size=12, symbol='star', line=dict(width=2, color='DarkSlateGrey')),
-                text=borderline["flag"],
                 hovertemplate="Time: %{x}<br>Value: %{y}<br>Flagged by: %{text}<extra></extra>"
             ))
             
@@ -225,8 +238,9 @@ if not st.session_state.show_history:
                     with st.spinner("Agent is analyzing the data and running QC tools. This may take a few minutes..."):
                         start_time = time.time()
                         try:
+                            decisions = []
                             if use_mock:
-                                final_qc, clean_df, report, run_summary = mock_run_agent(qc, max_steps=max_steps, log_dir="logs")
+                                final_qc, clean_df, report, run_summary, decisions = mock_run_agent(qc, max_steps=max_steps, log_dir="logs")
                             else:
                                 final_qc, clean_df, report, run_summary = run_agent(qc, max_steps=max_steps, log_dir="logs")
                                 
@@ -238,7 +252,8 @@ if not st.session_state.show_history:
                                 "report": report,
                                 "run_summary": run_summary,
                                 "elapsed": elapsed,
-                                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "decisions": decisions,
                             }
                             st.session_state.run_results = res
                             st.session_state.history.append(res)
@@ -253,52 +268,150 @@ if not st.session_state.show_history:
                 # 4. Results Visualization
                 st.header("4. Results Visualization")
                 
+                # Summary Dashboard — compute from actual flags
                 st.subheader("Summary Dashboard")
-                m1, m2, m3, m4, m5, m6 = st.columns(6)
-                m1.metric("Spikes", "12")
-                m2.metric("Plateaus", "3")
-                m3.metric("Level Shifts", "1")
-                m4.metric("Gaps", "4")
-                m5.metric("Points Imputed", "18")
-                m6.metric("Left as Gaps", "2")
+                clean = res["clean_df"]
+                decisions = res.get("decisions", [])
+                if decisions:
+                    action_counts = {}
+                    type_counts = {}
+                    for d in decisions:
+                        a = d.get("action", "flag")
+                        t = d.get("anomaly_type", "unknown")
+                        action_counts[a] = action_counts.get(a, 0) + d.get("n_points", 1)
+                        type_counts[t] = type_counts.get(t, 0) + 1
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Spikes", type_counts.get("spike", 0))
+                    m2.metric("Plateaus", type_counts.get("plateau", 0))
+                    m3.metric("Gaps", type_counts.get("gap", 0))
+                    m4.metric("Kept (real)", type_counts.get("storm_peak", 0) + type_counts.get("level_shift", 0))
+                    m5.metric("Decisions", len(decisions))
+                else:
+                    flag_counts = clean["flag"].dropna().value_counts() if "flag" in clean.columns else pd.Series(dtype=int)
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Total Flagged", int(flag_counts.sum()) if len(flag_counts) else 0)
+                    m2.metric("Flag Types", len(flag_counts))
+                    m3.metric("Clean Rows", int(clean["flag"].isna().sum()) if "flag" in clean.columns else len(clean))
                 
                 st.markdown("---")
                 st.subheader("Interactive Time-Series")
-                st.markdown("Click on the **orange star (Borderline Case)** below to view the agent's reasoning.")
                 
                 fig = plot_results(df, res["clean_df"])
+                st.plotly_chart(fig, use_container_width=True, theme=None)
                 
-                try:
-                    event = st.plotly_chart(fig, use_container_width=True, theme=None, on_select="rerun")
-                    clicked = False
-                    if event and "selection" in event and event["selection"].get("points"):
-                        clicked = True
-                except TypeError:
-                    st.plotly_chart(fig, use_container_width=True, theme=None)
-                    clicked = st.button("Simulate clicking the Borderline Point")
-                
-                if clicked:
-                    st.success("Borderline Point Selected!")
-                    st.subheader("Agent Reasoning for Borderline Spike")
-                    
-                    st.markdown("""
-                    **Agent Decision:** I decided to flag this point as a **Spike**, but it was a close call.
-                    
-                    **Reasoning:**
-                    The value deviates significantly from its immediate neighbors. However, looking at the broader context window, the variance in this region is unusually high. I generated a local distribution to verify if this point falls outside the 99th percentile of recent noise. As shown in the distribution plot below, this point sits at the very far upper tail, confirming it is more likely a true anomaly than just ambient noise.
-                    """)
-                    
-                    import numpy as np
-                    np.random.seed(42)
-                    dist_data = np.random.normal(loc=10, scale=2, size=100)
-                    anomaly_val = 18.5
-                    
-                    dist_fig = go.Figure()
-                    dist_fig.add_trace(go.Box(x=dist_data, name="Local Window Noise", boxpoints='all', jitter=0.3, pointpos=-1.8))
-                    dist_fig.add_trace(go.Scatter(x=[anomaly_val], y=["Local Window Noise"], mode="markers", name="Borderline Point", marker=dict(color='orange', size=12, symbol='star', line=dict(width=2, color='DarkSlateGrey'))))
-                    dist_fig.update_layout(title="Local Distribution vs Borderline Point", height=300)
-                    
-                    st.plotly_chart(dist_fig, use_container_width=True)
+                # --------------------------------------------------------
+                # Per-Decision Agent Reasoning (new section)
+                # --------------------------------------------------------
+                if decisions:
+                    st.markdown("---")
+                    st.subheader("Per-Decision Agent Reasoning")
+                    st.markdown(
+                        "Select a flagged anomaly below to see the agent's "
+                        "decision, reasoning, and internal deliberation."
+                    )
+
+                    ACTION_COLORS = {
+                        "delete": "#dc2626",
+                        "keep": "#16a34a",
+                        "impute": "#2563eb",
+                        "correct": "#d97706",
+                    }
+                    ACTION_EMOJI = {
+                        "delete": "\U0001f5d1\ufe0f",
+                        "keep": "\u2705",
+                        "impute": "\U0001f527",
+                        "correct": "\U0001f504",
+                    }
+
+                    options = [
+                        f"#{d['id']}  {d['anomaly_type'].replace('_', ' ').title()} "
+                        f"at {d['segment_start'][:16]}  \u2014  {d['action'].upper()}"
+                        for d in decisions
+                    ]
+
+                    selected_idx = st.selectbox(
+                        "Flagged anomaly:",
+                        range(len(options)),
+                        format_func=lambda i: options[i],
+                        key="decision_select",
+                    )
+
+                    d = decisions[selected_idx]
+                    action = d["action"]
+                    action_color = ACTION_COLORS.get(action, "#64748b")
+                    action_emoji = ACTION_EMOJI.get(action, "")
+
+                    # --- Zoomed neighbourhood chart ---
+                    nb_start = pd.to_datetime(d["neighborhood_start"])
+                    nb_end = pd.to_datetime(d["neighborhood_end"])
+                    seg_start = pd.to_datetime(d["segment_start"])
+                    seg_end = pd.to_datetime(d["segment_end"])
+
+                    dt_col = pd.to_datetime(df["datetime"])
+                    mask = (dt_col >= nb_start) & (dt_col <= nb_end)
+                    nb_df = df.loc[mask].copy()
+
+                    fig_zoom = go.Figure()
+                    fig_zoom.add_trace(go.Scatter(
+                        x=nb_df["datetime"], y=nb_df["value"],
+                        mode="lines+markers",
+                        name="series",
+                        line=dict(color="rgba(100,116,139,0.6)", width=1.5),
+                        marker=dict(size=4, color="#64748b"),
+                        hovertemplate="%{x}<br>%{y:.2f} FNU<extra></extra>",
+                    ))
+
+                    # Highlight the flagged segment
+                    seg_mask = (dt_col >= seg_start) & (dt_col <= seg_end)
+                    seg_df = df.loc[seg_mask]
+                    if not seg_df.empty and d.get("value") is not None:
+                        fig_zoom.add_trace(go.Scatter(
+                            x=seg_df["datetime"],
+                            y=seg_df["value"],
+                            mode="markers",
+                            name=f"{d['anomaly_type']} ({action})",
+                            marker=dict(
+                                size=14, color=action_color,
+                                symbol="circle-open", line=dict(width=3, color=action_color),
+                            ),
+                            hovertemplate=(
+                                "%{x}<br>%{y:.2f} FNU<br>"
+                                f"{d['anomaly_type']} \u2014 {action}<extra></extra>"
+                            ),
+                        ))
+
+                    fig_zoom.update_layout(
+                        height=300,
+                        margin=dict(l=50, r=20, t=30, b=40),
+                        xaxis=dict(title="", gridcolor="#f1f5f9"),
+                        yaxis=dict(title="FNU", gridcolor="#f1f5f9"),
+                        plot_bgcolor="white", paper_bgcolor="white",
+                        showlegend=True,
+                        legend=dict(orientation="h", y=1.12, x=0),
+                        hovermode="closest",
+                    )
+                    st.plotly_chart(fig_zoom, use_container_width=True, theme=None)
+
+                    # --- Decision card ---
+                    col_label, col_value = st.columns([1, 5])
+                    with col_label:
+                        st.markdown("**agent decided**")
+                    with col_value:
+                        st.markdown(
+                            f"{action_emoji} **{action.upper()}**"
+                        )
+
+                    col_why_label, col_why_value = st.columns([1, 5])
+                    with col_why_label:
+                        st.markdown("**why**")
+                    with col_why_value:
+                        st.caption("AGENT-DELIBERATION \u2014 THE AGENT REASONED THIS ONE THROUGH")
+                        st.markdown(d["reasoning"])
+
+                    with st.expander("\U0001f9e0 THE AGENT'S WORKING", expanded=False):
+                        st.markdown(
+                            f"> {d['thinking']}"
+                        )
                 
                 # 5. Report Panel
                 st.header("5. Agent Report")

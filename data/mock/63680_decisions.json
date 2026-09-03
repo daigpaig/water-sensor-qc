@@ -1,0 +1,72 @@
+[
+  {
+    "id": 1,
+    "segment_start": "2023-09-08 14:00:00",
+    "segment_end": "2023-09-08 14:00:00",
+    "value": 11.8,
+    "action": "delete",
+    "anomaly_type": "spike",
+    "flagged_by": "flag_spike_unilof",
+    "n_points": 1,
+    "reasoning": "1-sample excursion, robust_z=8.3, recovers in 1 sample (15 min), step_sigmas_local=14.1. Extremely high z and instant recovery \u2014 textbook spike. No storm context: the surrounding 6 h window is flat at 5.2\u00b10.3 FNU.",
+    "thinking": "Width=1 sample and z=8.3 are clearly spike-like. Recovery=1 sample (15 min) is instant \u2014 far too fast for any physical event. step_sigmas_local=14.1 shows the point moves 14\u00d7 its immediate neighbours. For a real flush event at 15-minute resolution I would expect recovery \u22659 samples (2.25 h) with a wider excursion. The instant recovery and width of 1 sample make this unambiguous. Deleted.",
+    "neighborhood_start": "2023-09-08 10:00:00",
+    "neighborhood_end": "2023-09-08 18:00:00"
+  },
+  {
+    "id": 2,
+    "segment_start": "2023-09-09 10:30:00",
+    "segment_end": "2023-09-09 10:45:00",
+    "value": 10.5,
+    "action": "delete",
+    "anomaly_type": "spike",
+    "flagged_by": "flag_spike_unilof",
+    "n_points": 2,
+    "reasoning": "2-sample excursion, robust_z=7.7, recovers in 6 samples (30 min), step_sigmas_local=12.8. High z and locally prominent despite the slightly extended recovery.",
+    "thinking": "Width=2 samples and z=7.7 are clearly spike-like. Recovery=6 samples=30 min is borderline at 5-minute resolution. However, step_sigmas_local=12.8 shows the point moves 12\u00d7 its immediate neighbours \u2014 far above the ~1.6 level of a false positive. For a real flush event at 5-minute resolution I would expect recovery \u22659 samples (45 min) with a wider excursion. The 30-min recovery is fast and the width is narrow, so the spike interpretation wins. Deleted. Would have kept if recovery were \u22659 samples or width \u22654 samples.",
+    "neighborhood_start": "2023-09-09 06:30:00",
+    "neighborhood_end": "2023-09-09 14:45:00"
+  },
+  {
+    "id": 3,
+    "segment_start": "2023-09-09 23:15:00",
+    "segment_end": "2023-09-09 23:15:00",
+    "value": 8.91,
+    "action": "keep",
+    "anomaly_type": "storm_peak",
+    "flagged_by": "flag_spike_unilof",
+    "n_points": 1,
+    "reasoning": "Flagged by UniLOF (thresh=1.5), but describe_point returns: width=14 samples, recovery=22 samples (5.5 h), robust_z=1.8, reads_like='storm_peak'. The excursion is 14 samples wide and takes over 5 hours to recover \u2014 this is a genuine storm first-flush event, not a sensor artifact. Kept as real signal.",
+    "thinking": "This point is at the top of what looks like a storm hydrograph. The width (14 samples) and recovery time (22 samples, 5.5 h) are both well outside spike range. robust_z=1.8 is elevated but not extreme \u2014 within the range I\u2019d expect for a moderate storm peak. The surrounding hours show a gradual rise over ~3 h followed by a slow recession, which is the textbook shape of a turbidity response to a rainfall event. UniLOF flagged it because the local density is low at the peak, but that is exactly what a storm peak looks like. If I deleted this I would be removing real water-quality signal. Overriding the default \u2018delete\u2019 action \u2014 keeping this as genuine extreme event.",
+    "neighborhood_start": "2023-09-09 17:15:00",
+    "neighborhood_end": "2023-09-10 05:15:00"
+  },
+  {
+    "id": 4,
+    "segment_start": "2023-09-10 16:30:00",
+    "segment_end": "2023-09-10 19:30:00",
+    "value": 4.2,
+    "action": "delete",
+    "anomaly_type": "plateau",
+    "flagged_by": "flag_constants",
+    "n_points": 13,
+    "reasoning": "13-sample constant run at exactly 4.2 FNU (3 h 15 min). thresh=0.01, so any reading with <0.01 variation over the window is flagged. The surrounding noise sd is 0.25 FNU, so 13 identical readings is impossible from real water \u2014 stuck sensor. Deleted.",
+    "thinking": "flagConstants found a 13-sample run at exactly 4.2 with zero variation. The series\u2019 noise sd in this window is ~0.25 FNU, so the probability of 13 consecutive readings within 0.01 of each other by chance is vanishingly small. This is a stuck sensor \u2014 the reading froze, probably due to a fouled wiper or a firmware hang. The value 4.2 is within the normal range for this sensor, so it is not obviously wrong by magnitude alone, but the zero-variation signature is definitive. Deleting the entire 3.25 h window.",
+    "neighborhood_start": "2023-09-10 12:30:00",
+    "neighborhood_end": "2023-09-10 23:45:00"
+  },
+  {
+    "id": 5,
+    "segment_start": "2023-09-11 10:00:00",
+    "segment_end": "2023-09-11 11:45:00",
+    "value": null,
+    "action": "impute",
+    "anomaly_type": "gap",
+    "flagged_by": "flag_nan",
+    "n_points": 8,
+    "reasoning": "8-sample gap (2 h). Short enough to impute defensibly with rolling median (window=3h). Surrounding values are stable at 5.1\u00b10.3 FNU with no trend \u2014 interpolation will land in the right range. Filled 8 of 8 samples.",
+    "thinking": "flag_nan found 8 consecutive NaN rows spanning 2 hours. The values on either side are stable (5.0\u20135.4 FNU, no trend, no storm in progress), so a rolling median fill will produce reasonable values. window=\u20183h\u2019 is wider than the gap (2 h) so interpolateByRolling will have context on both sides. I would NOT impute if the gap were during a storm recession or if the surrounding values showed a trend, because the median would smooth out real dynamics. Here the signal is flat, so imputation is safe.",
+    "neighborhood_start": "2023-09-11 06:00:00",
+    "neighborhood_end": "2023-09-11 16:00:00"
+  }
+]
