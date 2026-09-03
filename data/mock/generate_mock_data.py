@@ -78,7 +78,7 @@ def main():
     clean_df.loc[spike1_idx, "flag"] = "flag_spike_unilof"
     clean_df.loc[spike2_idx, "flag"] = "flag_spike_unilof"
     clean_df.loc[spike2_idx + 1, "flag"] = "flag_spike_unilof"
-    clean_df.loc[borderline_idx, "flag"] = "flag_spike_unilof"
+    clean_df.loc[borderline_idx, "flag"] = "Borderline Spike"
     for i in range(plateau_start, plateau_end):
         clean_df.loc[i, "flag"] = "flag_constants"
     for i in range(gap_start, gap_end):
