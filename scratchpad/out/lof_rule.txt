@@ -1,0 +1,40 @@
+  done 01467200_l1
+  done 01467200_l2
+  done 01467200_l3
+  done 02054550_l1
+  done 02054550_l2
+  done 02054550_l3
+  done 040851385_l1
+  done 040851385_l2
+  done 040851385_l3
+  done 02198840_l1
+  done 02198840_l2
+  done 02198840_l3
+  done 03447687_l1
+  done 03447687_l2
+  done 03447687_l3
+  done 08041770_l1
+  done 08041770_l2
+  done 08041770_l3
+
+=== does the candidate count TRACK the number of true spikes? ===
+rule          corr(n_cand, n_true)  median cand      cand range  median recall  median prec
+abs 1.3                       0.72         1378        294-3505          0.996        0.072
+abs 1.5                       0.71          710        168-1982          0.973        0.118
+abs 1.8                       0.72          398         88-1213          0.941        0.221
+abs 2.2                       0.79          238          48-758          0.865        0.325
+budget 175                   -0.29          168         167-174          0.688        0.380
+mad 4                         0.70         5986      1561-12539          1.000        0.017
+mad 6                         0.71         3629        944-8673          1.000        0.027
+mad 8                         0.71         2545        686-6523          1.000        0.040
+
+=== the sparse gauge that exposed this (21 true spikes) ===
+      rule  n_cand   recall     prec
+   abs 1.3     294 1.000000 0.071429
+   abs 1.5     168 0.952381 0.119048
+   abs 1.8      88 0.857143 0.204545
+   abs 2.2      48 0.666667 0.291667
+     mad 4    1561 1.000000 0.013453
+     mad 6     944 1.000000 0.022246
+     mad 8     686 1.000000 0.030612
+budget 175     174 0.952381 0.114943

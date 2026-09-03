@@ -293,7 +293,7 @@ _FLAG_CONSTANTS = {
             "window": {
                 "type": ["string", "null"],
                 "description": (
-                    "Rolling window size as a pandas offset string, e.g. '3h', '6h', '12h'. "
+                    "Rolling window size as a pandas offset string. USE '1h' unless you have a specific reason not to: this is how long the sensor must stay stuck before it registers, so a 6h window silently declines every plateau shorter than six hours. Required — do not leave null."
                     "Practical range: '3h'–'12h'. Required — do not leave null."
                 ),
                 "default": None,
@@ -1073,66 +1073,32 @@ _CORRECT_LEVEL_SHIFT = {
 }
 
 
-_IMPUTE_ROLLING = {
-    "name": "impute_rolling",
+_IMPUTE_LINEAR = {
+    "name": "impute_linear",
     "description": (
-        "Fills NaN gaps using a rolling window median (or other aggregation). "
-        "Set max_gap to the longest gap you are willing to impute — any gap longer than "
-        "max_gap is left as NaN and reported in the result. "
-        "Do NOT impute long outages (hours to days); rolling median on a large gap produces "
-        "flat, unrealistic values that degrade data quality more than leaving them as NaN. "
-        "WORKFLOW: call inspect_dataset then flag_nan first to see gap sizes, then decide "
-        "an appropriate max_gap before calling this tool. "
-        "Practical range for window and max_gap: '1h'–'6h'. Default 3h. "
-        "window must be at least as large as max_gap so the roller has enough context "
-        "to bridge the gap (§7.1). "
-        "func='median' is more robust than 'mean' near anomalous neighbours — keep it. "
-        "The result includes n_gaps_filled, n_gaps_skipped_large, and a gaps_summary list "
-        "so you can audit exactly what was and was not filled."
+        "Fill short gaps by LINEAR INTERPOLATION between the readings either side. "
+        "Gaps longer than max_gap are left as NaN and reported — filling a multi-hour "
+        "or multi-day outage with a straight line invents data rather than repairing "
+        "it, and an honest hole is better. A gap is filled WHOLE or not at all. "
+        "You do NOT need to fill the holes left by values you delete: a deleted value "
+        "is a gap, and export_clean_data applies the same rule to it, so a deleted "
+        "1-3 sample spike is interpolated automatically while a deleted plateau, "
+        "running hours, is correctly left missing. Call flag_nan first so you can see "
+        "the gap distribution before choosing max_gap."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "field": {
-                "type": "string",
-                "description": "Column name that holds the measurement values. Default 'value'.",
-                "default": "value",
-            },
-            "window": {
-                "type": ["string", "null"],
-                "description": (
-                    "Rolling window size as a pandas offset string, e.g. '3h', '6h'. "
-                    "Must be >= max_gap so the roller can bridge the full gap. "
-                    "Practical range: '1h'–'6h'. Required — do not leave null."
-                ),
-                "default": None,
-            },
-            "func": {
-                "type": "string",
-                "enum": ["median", "mean"],
-                "description": "Aggregation function for the rolling window. Default 'median'.",
-                "default": "median",
-            },
-            "min_periods": {
-                "type": "integer",
-                "description": (
-                    "Minimum number of non-NaN values required in the window to produce an "
-                    "imputed value. 0 means impute even when most of the window is NaN. Default 0."
-                ),
-                "default": 0,
-            },
             "max_gap": {
-                "type": ["string", "null"],
+                "type": "string",
                 "description": (
-                    "Maximum gap duration to impute, as a pandas offset string, e.g. '3h', '1h'. "
-                    "Gaps longer than this are skipped and left as NaN. "
-                    "Always set this — do not impute long maintenance outages or multi-hour dropouts. "
-                    "Practical range: '1h'–'6h'. If null, all gaps up to window size are filled."
+                    "Longest gap to fill, as a pandas offset string. Default '1h', "
+                    "which is the project standard — leave it alone unless you have a "
+                    "specific measured reason drawn from the gap distribution."
                 ),
-                "default": None,
             },
         },
-        "required": ["window"],
+        "required": [],
     },
 }
 
@@ -1309,7 +1275,7 @@ TOOL_SCHEMAS: list[dict] = [
     _PRECIP_CONTEXT,
     # Action
     _CORRECT_LEVEL_SHIFT,
-    _IMPUTE_ROLLING,
+    _IMPUTE_LINEAR,
 ]
 
 # Convenience: look up a schema by tool name

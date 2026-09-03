@@ -1,0 +1,20 @@
+  done 01467200_l1
+  done 01467200_l2
+  done 01467200_l3
+  done 02054550_l1
+  done 02054550_l2
+  done 02054550_l3
+  done 040851385_l1
+  done 040851385_l2
+  done 040851385_l3
+
+edges of REAL shift windows : n=8  median 12.23  p10 9.63
+edges of FALSE windows      : n=46  median 2.72  p90 11.47
+
+  cutoff   real kept   false killed
+       2      100.0%          23.9%
+       3      100.0%          69.6%
+       4      100.0%          78.3%
+       5      100.0%          84.8%
+       6      100.0%          87.0%
+       8      100.0%          87.0%

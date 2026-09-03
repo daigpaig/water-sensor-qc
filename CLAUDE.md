@@ -107,6 +107,8 @@ deployment, Docker, CI beyond a basic test run).
 │       ├── provenance.py # rebuilds one point's story from the run log (§10.1)
 │       ├── param_sweep.py # sweep one param, score vs labels, plot (§7.2)
 │       ├── candidates.py # propose anomalies in a "clean" series for review (§9.1)
+│       ├── precip_overlay.py # turbidity vs rainfall on one time axis; click or look up
+│       │                     #   any point for the §7.7 lag windows, every station (§9.5)
 │       └── review.py     # keyboard-driven labelling page + merge back to labels (§9.1)
 ├── app/
 │   └── streamlit_app.py  # UI
@@ -132,6 +134,7 @@ deployment, Docker, CI beyond a basic test run).
 │   ├── tune_ramp_rule.py      # fits §7.3's ramp thresholds, same held-out discipline
 │   ├── find_precip.py         # searches NWIS for rain gauges near a turbidity gauge (§7.7)
 │   ├── verify_precip.py       # proves a candidate really covers the project window (§7.7)
+│   ├── verify_precip_new_gauges.py # the same measurement for 02054550 / 040851385 (§9.4)
 │   ├── probe_cache_ttl.py     # is `ttl` accepted on top-level cache_control? (§8)
 │   ├── probe_noise_reads_like.py # the §7.4 noisy-stretch guard's hit rates
 │   ├── tune_zscore.py         # flagZScore min_residuals on quantised data (§7.1)
@@ -332,7 +335,12 @@ directions are not symmetric:
 
 A row the imputer filled gets `verdict='anomaly', anomaly_type='gap'` deterministically, for
 the same reason its `action` is forced to `impute`: §5 says every missing run is a gap, so
-this is a fact about the data rather than a call the agent makes.
+this is a fact about the data rather than a call the agent makes. **The same now holds for
+any row `flagNAN` flagged, whatever span covers it** (2026-08-31): §9 lets a plateau or
+level_shift span reach over dropouts, but reaching over them must not RETYPE them.
+Measured on run P, all six of its gap "errors" were NaN rows inside a plateau or
+level_shift span, found by flagNAN and then relabelled by the covering span
+(`n_missing_rows_retyped_to_gap` reports the count).
 
 **Every flagged row needs a decision or the run scores as if it claimed nothing.** §10 counts
 only `verdict='anomaly'` as a positive claim, so an export without `decisions` produces a log
@@ -345,7 +353,7 @@ that is syntactically valid and evidentially empty.
 | Type               | Signature in the data                      | Detected by                          | Default action                                     |
 | ------------------ | ------------------------------------------ | ------------------------------------ | -------------------------------------------------- |
 | Spike              | one/few values far from neighbours         | `flagUniLOF`, `flagZScore`, `flagRange` | delete                                          |
-| Plateau / stuck    | identical value repeated for a long window | `flagConstants` (+ `flagPlateau` if offset) | delete or flag                             |
+| Plateau / stuck    | identical value repeated for a long window | `flagConstants` (`window='1h'`; 6h silently declines every shorter plateau) | **delete**, and it stays a hole (§7.9)     |
 | Level shift / jump | permanent step to a new level              | `flagJumps`                          | judge first: real water → `normal`+keep; artifact → `anomaly`+**correct** via `correct_level_shift` (§7.8) |
 | Gap (missing)      | NaN run                                    | `flagNAN`                            | impute (short gaps only)                           |
 
@@ -928,6 +936,28 @@ decisions, each load-bearing:
 answers with the **wrong river's rain** — and the result is perfectly well-formed, so
 nothing downstream can tell.
 
+**HOW STRONG IS IT, MEASURED (2026-08-31).** Over **1,471** spike candidates across all
+nine datasets, split by ground truth:
+
+| `WET_INCHES` | P(rain \| real spike) | P(rain \| real water) | P(real water \| rained) |
+| --- | ---: | ---: | ---: |
+| 0.00 | 21.1% | 31.5% | 54.2% |
+| **0.02** (live) | 14.9% | 27.1% | **59.1%** |
+| 0.10 | 9.1% | 18.5% | 61.5% |
+| 0.40 | 3.2% | 8.9% | 69.0% |
+
+Base rate with no rain information: **44.2%**. So rain is a REAL but WEAK signal — it
+moves a spike candidate from 44% to 59% likely-real-water. Two consequences:
+
+- **The prompt must weight it, not defer to it.** v0.16 said a rain hit "flips your
+  default to keeping"; run P then kept 22 points on that basis and **45.5% of them were
+  injected anomalies** — almost exactly the 41% the table predicts. Fixed in v0.21.
+- **`WET_INCHES` stays at 0.02.** Raising it to 0.10 buys 2.4 points of precision and
+  drops coverage 298 -> 195 candidates; 0.40 reaches 69% on 84 points. Neither survives
+  the bin noise. The threshold is not where the value is.
+- A spike-shaped point WITH rain is therefore the definition of a §7.11 judgement call:
+  the two instruments genuinely disagree and neither is decisive.
+
 **IT CANNOT MOVE THE SYNTHETIC BENCHMARK, AND THAT IS NOT A BUG.** Measured on the
 Part B run: of deleted rows, 18% of false positives had rain in the preceding 12h versus
 16% of true injected spikes. No separation — because §9 injects spikes at random
@@ -967,8 +997,10 @@ It is a detector-plus-corrector that finds offsets itself. On this record
 It rewrites storm limbs by tens of FNU and never touches the actual artifact. Right name,
 wrong job — which is §2's "unless SaQC has no equivalent" clause.
 
-**`find_shift_windows` takes its jumps from the FLAG HISTORY, not from the agent**
-(2026-08-25). `ats` is optional and omitting it is the documented default. Run M chose
+**`find_shift_windows` takes its jumps from the FLAG HISTORY, and `ats` is ADDITIVE**
+(2026-08-25). Making `ats` merely *optional* was not enough — run O passed a 74-jump
+subset anyway and lost the shift exactly as run M had, so the history is now always
+unioned in and a caller's list can only add to it. Run M chose
 **76 of 145** jump timestamps to pass, its subset excluded the injected shift's two
 edges, the tool returned one unrelated window, and the run concluded the record had no
 level shifts — with nothing about the result looking wrong. Runs K and L passed 134 and
@@ -977,6 +1009,30 @@ subset gets picked. This is the §8 "do not deliberate over which timestamps to 
 batch tool" failure, which the prompt warned about for `describe_points` and
 `precip_context_points` only. Reading the edges from `qc._flags.history` (matching on the
 test's `func` name, §7.1) removes the class of error rather than warning about it.
+
+**EDGE SHARPNESS IS A RATIO AND NEEDS A SCALE CHECK** (2026-08-31).
+`_edge_sharpness` is `max(single-sample move) / |net step|`, so on a noisy storm limb —
+where the net step is the same size as the ordinary jitter — it parks near 1.0 and reports
+"the level moved in one sample" when nothing sharp happened. Run P corrected a false window
+at 2023-12-21 on exactly this: `onset_sharpness` 1.07 from a net step of 3.35 FNU against
+local noise of 1.93. `_step_over_noise` adds the missing check, and it separates cleanly:
+
+| | n | median | 
+| --- | ---: | ---: |
+| edges of REAL shift windows | 8 | **12.2** (p10 9.63) |
+| edges of FALSE windows | 46 | **2.7** |
+
+| cutoff | real edges kept | false edges killed |
+| ---: | ---: | ---: |
+| 3 | 100% | 69.6% |
+| **5** (`SHIFT_MIN_STEP_SIGMAS`) | **100%** | **84.8%** |
+| 6 | 100% | 87.0% |
+
+On 01467200_l1 this takes the candidate windows from 3 level-shift-like to **1**, and it
+is the real one (step/noise 8.88; the false 12-21 window reads 1.58). **The real sample is
+8 edges** — the margin is wide, the sample is not. The windowed scale is floored by the
+series-wide one (§7.3's pattern): without that, a clean step in calm water divides by a
+zero MAD and reads as unmeasurable, which is the opposite of the truth.
 
 **TRAP 1 — `processGeneric`'s `dfilter` default silently discards the correction.** §7.1's
 `interpolateByRolling` trap, third appearance. SaQC masks rows whose flag is >= `dfilter`
@@ -1007,6 +1063,192 @@ still there at its original reading. Verified on run L: `2023-07-05T13:45` was
 The whole delete pathway was a label. It now nulls those rows and reports
 `n_values_deleted`. `correct` needs no branch there, because `correct_level_shift` writes
 through `qc` when the agent calls it.
+
+---
+
+### 7.10 Sizing the SPIKE detectors: measure, never guess (2026-08-25)
+
+**No summary statistic of a record predicts `flag_spike_unilof.thresh`.** Swept across all
+nine datasets for the threshold that fits a fixed candidate budget, the rank correlations
+are: **contamination level +0.78**, `robust_sigma/step_sigma` +0.57, `rel_noise` −0.56,
+median +0.40, `step_sigma` −0.16. The thing that predicts it is the number of anomalies
+present, which is exactly what a run cannot know; and the runner-up would be fitted on
+**three gauges**, which is how §7.4's noise rule got 60% where fitted and 33% held out.
+
+So `context.spike_scale` does what §7.6 did for `flag_jumps`: it measures the statistic
+each detector actually thresholds, **on this record**, and quotes the quantile that lands
+a triageable candidate count. Self-calibrating — the same call returns 1.95 on one gauge
+and 3.45 on another, both emitting ~175 candidates. `inspect_dataset` returns the block.
+
+- **`flagUniLOF`'s score is readable via `assignUniLOF`**, so its threshold comes straight
+  off the distribution. **`flagZScore` has no such accessor** and its internals differ from
+  the obvious rolling median/MAD approximation — a first version used that approximation
+  and overshot the budget by **3-6x**, which silently gave the z-score six times UniLOF's
+  candidates and made it look far better than it is. Its threshold is bisected on the real
+  call instead (~2.7 s for the whole block).
+- **THE THRESHOLD IS ABSOLUTE, NOT A CANDIDATE QUOTA** (2026-09-02, `SPIKE_LOF_THRESH
+  = 1.8`). The first version quoted the quantile of |LOF| that emitted ~175 candidates.
+  That was §7.6's fix imported to a detector that does not have §7.6's problem:
+  `flag_jumps.thresh` is in FNU and varied 12x across gauges, so a quantile genuinely
+  normalises it, but **LOF is a local DENSITY RATIO** — 1.8 means "1.8x sparser than its
+  neighbours" on any river at any cadence. Pinning the count therefore normalises nothing
+  and discards the one thing the score reports: how many points are unusual. Measured over
+  **all 18 datasets** (nine 5-min, nine legacy 15-min), rank correlation between candidate
+  count and the number of injected spikes actually present:
+
+  | rule | corr(count, n_true) | count range | median recall | median precision |
+  | --- | ---: | ---: | ---: | ---: |
+  | quota 175 (was) | **-0.29** | **167-174** | 0.688 | 0.380 |
+  | **abs 1.8** | **+0.72** | 88-1213 | **0.941** | 0.221 |
+  | abs 2.2 | +0.79 | 48-758 | 0.865 | 0.325 |
+  | median + k*MAD | +0.70 | 686-12539 | 1.000 | 0.017-0.040 |
+
+  The quota's count is *slightly anti-correlated* with the truth. Its failure runs both
+  ways: on 08041770_l1 (**21** injected spikes) it emitted 168 candidates and capped
+  detector precision at 0.13 before the agent judged anything — most of that run's 108
+  wrongly-deleted rows; and on 01467200_l3 (**337** spikes) 169 candidates capped recall
+  at **0.454**, which no detector or agent could have escaped. `abs 1.8` fixes both
+  directions: 0.889 -> 1.000 recall on l1, 0.454 -> 0.970 on l3, and 174 -> 88 candidates
+  on the sparse gauge. **The MAD-of-scores family is out**: perfect recall at 0.017-0.040
+  precision, because the MAD of LOF scores is tiny so even `median + 8*MAD` is a low bar.
+  1.8 is fitted on the HELD-OUT gauges only (02054550, 040851385); 2.2 scores better on
+  that fit but drops to 0.667 recall on the sparsest record.
+- **The budget survives only as a CEILING** (`SPIKE_BUDGET_LOF = 1000`), and the result
+  says when it binds. §7.5's finding stands — the run's largest precision gain came from
+  measuring EVERY flagged point — but a ceiling that rarely binds is a different thing
+  from a quota that always does. `MAX_POINTS_CEILING` went 300 -> **1000** to match, since
+  a tool RESULT is input rather than output (it never touches `MAX_TOKENS`) and costs a
+  measured ~97 tokens/point: ~$0.32 for 594 points, ~$0.65 for 1,213, against a ~$3 run.
+  1000 is the right number because `wrappers.MAX_FLAGGED_DATETIMES` is 1000 — a detector
+  hands the agent at most that many timestamps, so a larger ceiling could never be filled.
+  **UNVERIFIED**: whether the agent reasons as carefully over 600 rows of JSON as over
+  100. §7.5 measured the 20 -> 100 jump; 100 -> 600 is untested, and attention rather than
+  cost is the risk.
+- **`n = 10`, not 20** (`context.SPIKE_LOF_N`). `n` is a neighbourhood in SAMPLES: at 5-min
+  cadence n=20 spans 100 minutes, and a 1-3 sample spike barely dents the density of its
+  own neighbourhood. At an equal candidate budget **n=10 beat n=20 on 8 of 9 datasets and
+  tied on the ninth** (median spike recall **0.688 vs 0.521**), on all three gauges, so
+  this is not fitted to the gauge we report. §9.1's candidate tuner found the same
+  independently. This is the FOURTH constant expressed in samples invalidated by the
+  15-min -> 5-min move (§7.3's slope window, §9.1's `CONTEXT_SAMPLES`, §7.4's noise
+  thresholds, now this) — check the others whenever the cadence changes.
+- **Run BOTH detectors: they are complementary, not redundant.** At ~150 candidates each,
+  the z-score found up to 44 true spikes UniLOF missed and UniLOF up to 131 the z-score
+  missed. **But the union is only a slight win, not a step change**: at equal TOTAL budget
+  it scores median 0.746 from 230 candidates against LOF-alone's 0.709 from 300, and beats
+  LOF-alone on just **3 of 9** datasets. Worth running for the cheaper candidate count and
+  the independent second view; not worth claiming as a recall breakthrough.
+- **The budget is the binding constraint, not the threshold.** `describe_points` caps at
+  300 (§7.3) and §7.5 measured that the run's biggest precision gain came from measuring
+  EVERY flagged point. A threshold that buys recall by emitting 600 candidates puts the
+  agent back to deleting rows it never looked at, which is how spike precision was 0.227.
+  `SPIKE_BUDGET_LOF` (175) + `SPIKE_BUDGET_ZSCORE` (125) is sized to fit that cap.
+
+---
+
+### 7.11 Difficulty is DERIVED, not declared (2026-08-31)
+
+**`difficulty` was self-reported and unchecked, so the field that §10.1's review queue is
+built from could say anything.** Run P marked a span covering 1,977 rows `"clear"`, and
+one of the rows it swept up was an injected spike the run had itself measured at 8.8
+robust sigmas, kept because `precip_context_points` said it had rained.
+
+`wrappers.evidence_conflicts` derives difficulty from the measurements instead. The runner
+keeps an `evidence` ledger — the same injection pattern as `precip_audited` — recording
+what `describe_points` and `precip_context*` returned per timestamp, and
+`export_clean_data` **refuses** two things:
+
+- a **blanket claiming a contested point** — it must get its own span;
+- **`difficulty: "clear"`** on a contested point — it must be `judgement-call`, which
+  already forces a `deliberation`.
+
+**Why these pairs, and why it is worth enforcing.** Measured over the 218 points run P
+measured:
+
+| | n | decided wrong |
+| --- | ---: | ---: |
+| evidence CONFLICTS | 49 | **69.4%** |
+| evidence agrees | 169 | 16.6% |
+| — `spike` vs noisy stretch | 27 | 81% |
+| — `spike` vs rain | 26 | 54% |
+
+A 4.2x signal, and the sharpest predictor of error in the run.
+
+**Read the limits before claiming this fixes the score.** Conflicted points hold **55%**
+of the run's errors, so gating them addresses about half. And the blanket itself is only
+**10 of 62** errors: 52 were points the agent judged individually, with a specific reason,
+and got wrong anyway (blanket rows were wrong 8.5% of the time, own-span rows 51.5% — a
+base-rate effect, since a blanket says "normal" and most flagged points are normal). This
+makes the record honest and feeds the review queue; **spike precision ~0.5 is a separate
+problem and no explanation format will move it.**
+
+**Budget was NOT the reason for the catch-all**, which is worth stating because it is the
+obvious excuse. Run P flagged 7,872 rows, but 7,216 were gaps (deterministic), only 218
+were ever measured, and just 26 were contested — roughly 16k tokens at the observed
+617/span, affordable even at the old 64k ceiling. The run wrote proper deliberations for 5
+of the 26 and blanketed the other 21. It had the room; it had permission.
+
+---
+
+### 7.9 One fill rule: linear, one hour, everything (2026-08-25)
+
+**Every NaN run of an hour or less is filled by linear interpolation; anything longer is
+left as an honest hole.** One rule, applied to natural gaps, injected gaps, and the holes
+left by rows the agent deletes. `wrappers.MAX_FILL_GAP`.
+
+- **A DELETED VALUE IS A GAP.** Removing a 1-3 sample spike and leaving a permanent hole
+  is not a repair, and that is what was happening: run N left **218** of them, because
+  the imputer runs as a tool mid-loop while deletions are only applied in
+  `export_clean_data` at the very end, so nothing could ever fill them. The export now
+  applies the same rule after nulling, and reports `n_rows_refilled_after_delete`.
+- **The cap is what makes one rule enough.** A deleted spike is 1-3 samples, so it always
+  fills. A deleted plateau runs hours, so it never does — no special case needed for the
+  type, which is why §6's plateau default can simply be `delete`.
+- **The rolling median is REMOVED, on measurement.** `interpolateByRolling` fills only
+  where its window finds context, so it repaired the ENDS of a gap and left the middle:
+  on 01467200_l1 it filled 23 of 27, 23 of 35 and 23 of 55 rows on three of the four
+  injected gap events (§7.1's half-fill trap, live). Head to head:
+
+  | | coverage | RMSE |
+  | --- | ---: | ---: |
+  | rolling median | 62% | 1.765 |
+  | linear, same rows | 62% | 1.509 |
+  | **linear, every gap row** | **100%** | **1.659** |
+
+  Linear at full coverage beats the median at partial coverage, so there is no trade.
+  The mechanism: a centred rolling median is a LEVEL estimator, linear interpolation
+  follows the TREND between the gap's endpoints, so the median loses on any sloped gap by
+  construction and loses by more the faster the water moves (+0.05 FNU on flat gaps,
+  +0.31 on fast ones).
+- **THE LINE IS ANCHORED ON MEDIANS, NOT ON THE TWO READINGS EITHER SIDE.** Each endpoint
+  is the median of the real readings within `ANCHOR_WINDOW` (**15 min**, a duration —
+  never a sample count, §7.3) of the gap edge, placed at their mid-time. §6 notes that
+  artifacts cluster at gap EDGES, and a line anchored on two individual points is hostage
+  to both. Measured across all nine datasets, corrupting one reading immediately before
+  each injected gap:
+
+  | | clean edges | one junk reading per edge |
+  | --- | ---: | ---: |
+  | **median-anchored** | **1.719** | **1.720** |
+  | point-anchored linear | 1.659 | **54.562** |
+  | rolling median | 2.376 | 2.970 |
+
+  Point-anchored linear is 32x worse under a single bad edge reading, because that value
+  is smeared across every row of the gap. The median anchor is essentially immune, costs
+  ~4% on clean edges, and beats the rolling median in BOTH conditions. A run with real
+  data on only one side is skipped rather than extrapolated.
+- **The write goes through `_write_series`**, which carries both §7.8 traps: `dfilter=inf`
+  so the fill is not discarded by SaQC's flag mask, and `types.FunctionType(code, {}, ...)`
+  so `processGeneric` cannot shadow six builtins in `wrappers`.
+- **Filled rows are marked with `setFlags`** (flag 25, DOUBTFUL) so they appear in the
+  history and the §5 log can record `action='impute'`. The history stores the bare method
+  name, so `_flagged_by_row` maps `setFlags` to `impute_linear` via `_DISPLAY_NAME` — a
+  reader needs the tool that acted, not the SaQC primitive. Nothing else calls `setFlags`;
+  a test holds that line.
+- **RMSE alone REWARDS NOT FILLING**, so §10 now prints coverage beside it. Measured on
+  the injected gaps: filling only the shortest event (7% of rows) scores **0.698**, filling
+  every one scores **1.659** — the flattering number is the one that repaired almost
+  nothing.
 
 ---
 
@@ -1506,7 +1748,7 @@ manifest to `data/comparison/<gauge>/`.
   feeds `src.datasets.inject`, which globs `data/raw/approved/` and only that (§9). The CSVs are
   gitignored and regenerable; `data/comparison/README.md` is committed.
 
-### 9.4 Precipitation (checked 2026-08-18 — available, not yet pulled)
+### 9.4 Precipitation (checked 2026-08-18; PULLED for all three gauges 2026-08-25)
 
 Rain is the one piece of evidence that settles the hardest call the agent makes. §7.3
 measured that a storm peak and a spike are separated by *width* and *recovery time*, and
@@ -1544,12 +1786,82 @@ Verified over 2023-07-01 → 2025-07-01, all **100% approved**:
   evidence than "rain recorded" — an asymmetry any tool built on this must respect rather
   than treating absence as refutation.
 
-**Nothing has been pulled.** This is a documented availability check; wiring precipitation
+**PULLED FOR ALL THREE GAUGES (2026-08-25), and the table above understated two of
+them.** `PRECIP_STATIONS` held entries for `01467200` only, so a pull for either other
+gauge raised. Re-running `find_precip.py` and then MEASURING every candidate over the
+window (`scratchpad/verify_precip_new_gauges.py` — the catalog's begin/end describes the
+SITE, §7.7) found closer usable stations than §9.4 originally recorded, and three per
+gauge rather than one:
+
+| turbidity gauge | stations pulled | nearest | cadence |
+| --- | --- | ---: | --- |
+| `02054550` Roanoke | 371520080015100, 371824080002600, 371518079591700 | **7.0 km** | all 5-min, ≥99.5% complete |
+| `040851385` Fox R | 04085078, 04072150, 04085108 | **7.9 km** | 15-min ×2 (event-driven), 5-min ×1 |
+| `01467200` Delaware | 400145074555401, 01473169 | 19.9 km (partial) | unchanged |
+
+Fox R's two nearest buckets report **more** rows than their modal step predicts (127%
+and 143%), i.e. they tip on events rather than on a clock; `04085108` is further out at
+18.6 km but is a true 5-min series, which is why it is pulled alongside them.
+
+**The manifest `note` was a hardcoded sentence naming 31.1 km** — 01467200's separation,
+written when 01467200 was the only gauge — and it was stamped verbatim into every
+gauge's manifest. Not cosmetic: distance is exactly what calibrates how much weight
+"no rain recorded" carries (§7.7's asymmetry), so the note told a reader of the Roanoke
+page to discount evidence from a bucket **7.0 km** away as if it were 31 km. It is now
+derived from the pulled stations (`pull_precip._distance_note`).
+
+The original availability check follows; wiring precipitation
 into the pipeline would mean a `src/datasets/pull_precip.py`, a place for it in the §5
 contracts, and a §7 context tool that reads it — none of which exist, and the last would
 change what the agent is given rather than how it reasons. Note also that the "one variable
 per run" golden rule (§2) governs the *QC target*; rain would be read-only context, not a
 second variable to clean, but that reading should be confirmed before building on it.
+(Those three things now all exist — `pull_precip.py`, `data/precip/` in §5, and §7.7's
+`precip_context` — so read this paragraph as the record of a decision already taken.)
+
+### 9.5 Seeing rain and turbidity together (`precip_overlay.py`, 2026-08-25)
+
+§7.7 gives the AGENT rain as three numbers per point. A person cannot tell from three
+numbers at a time whether those numbers are being read sensibly — you have to watch the
+storm arrive and the turbidity respond, then click into the point and read the same
+breakdown the agent read. `src/workbench/precip_overlay.py` is that view: turbidity and
+one selected rain station on a shared time axis, §5 ground-truth anomalies as coloured
+markers (the `visualize_injected.py` palette, so the two pages read alike), and a panel
+that answers any timestamp you click or type.
+
+    python -m src.workbench.precip_overlay 01467200 --level 1
+    python -m src.workbench.precip_overlay data/raw/approved/02054550_turbidity_63680.csv --gauge 02054550
+
+- **The panel reports EVERY station, not the plotted one.** §7.7's caveat is that a
+  convective cell 5-15 km across can rain on one bucket and not its neighbour, so where
+  they disagree that disagreement IS the evidence. Measured on 02054550, three buckets
+  inside 11 km at one injected spike: **1.19 / 1.56 / 0.76 in** over the same 12h. A
+  single-station panel would have shown one of those three numbers and looked certain.
+- **"No coverage" and "0.00 in" render differently, and never interchangeably.** Each
+  station carries coverage intervals measured from its own timestamps against its own
+  modal step; a timestamp outside them shows `—` and says nothing is known. This is the
+  §7.7 failure that matters most, because "no rain" reads as evidence FOR deleting a point.
+- **The page opens on the best-COVERED station, not the nearest.** `precip_context` may
+  fall through to the next station when the closest has no data; a plotted panel cannot.
+  On 01467200 the nearest bucket starts 2024-10, so opening on it showed eighteen months
+  of blank rain panel beside a record full of storms — which reads as "it never rained".
+- **Only the 210k-point turbidity line is `scattergl`; everything else is SVG.** Every
+  scattergl trace shares one regl context, so restyling ANY of them pays to rebuild that
+  line's buffers. Measured: the one-point selection marker cost **1.9 s per lookup** on the
+  WebGL path. Likewise the rain panel is ONE trace whose arrays are swapped, not one trace
+  per station toggled with `visible` — the toggle made the first station switch take
+  **42 s**, because it recalculates the whole figure and cold-builds the never-drawn
+  traces. Both fixed, and each render is now folded into a single `Plotly.update` carrying
+  data, x-range and both y-ranges together: lookup **9.0 s → 0.55 s**, zoom 1.1 s → 0.10 s,
+  station switch 42 s → 1.0 s. **Any new interaction here must keep that discipline** —
+  three separate Plotly calls each pay the full 210k-point recalculation.
+- Rain bars carry **only nonzero observations**. Lossless for a bar chart and for a
+  window sum, and it is what makes full resolution affordable: 76 inches of 0.01 in tips
+  is ~4,000 rows out of ~210,000. Coverage comes from the full index, so dropping the
+  zeros can never be mistaken for the station going quiet.
+- The §9.1 page traps all apply and are all avoided: naive ISO strings rather than `Date`
+  objects, `gd.on(...)` wired only after the first draw, and the focus window expressed as
+  a DURATION rather than a sample count.
 
 ---
 

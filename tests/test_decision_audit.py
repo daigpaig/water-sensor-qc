@@ -169,3 +169,31 @@ def test_every_category_the_classifier_can_emit_is_declared():
         for v in ("", "anomaly", "normal", "undecided")
     } - {""}
     assert emitted <= set(CATEGORIES), emitted - set(CATEGORIES)
+
+
+def test_cases_carry_the_raw_types_the_confusion_matrix_needs(tmp_path):
+    """The page builds its per-type matrix from `lt` (labelled type) and `pt` (the
+    agent's claim). `pt` must be empty unless the verdict was `anomaly`: §10 scores the
+    verdict, so a flagged row the agent REJECTED is a negative prediction, not a
+    positive one for whatever type the detector happened to guess."""
+    values, labels, flag_log, trace = _fixture(tmp_path)
+    cases = {c["at"]: c for c in build_cases(values, labels, flag_log, trace)}
+
+    hit = next(c for c in cases.values() if c["at"].startswith("2024-01-01T12:30"))
+    assert (hit["lt"], hit["pt"]) == ("spike", "spike")      # a true positive
+
+    # the second injected spike was never flagged: labelled, but no claim
+    missed = next(c for c in cases.values() if c["category"] == "undetected")
+    assert missed["lt"] == "spike" and missed["pt"] == ""
+
+
+def test_a_rejected_flag_is_not_a_positive_prediction(tmp_path):
+    values, labels, flag_log, trace = _fixture(tmp_path)
+    flag_log = flag_log.copy()
+    flag_log.loc[flag_log.index[0], "verdict"] = "normal"
+    flag_log.loc[flag_log.index[0], "anomaly_type"] = ""
+    cases = build_cases(values, labels, flag_log, trace)
+
+    row = next(c for c in cases if c["at"].startswith("2024-01-01T12:30"))
+    assert row["pt"] == "", "verdict=normal must not count as claiming a type"
+    assert row["lt"] == "spike", "the label is unchanged — this is a false negative"

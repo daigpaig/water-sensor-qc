@@ -3,7 +3,7 @@
 Each function wraps a SaQC 2.8 method and returns the tool-result dict defined in
 CLAUDE.md §5. Utility (inspect_dataset, get_flag_summary, export_clean_data),
 detection (flag_range, flag_constants, flag_plateau, flag_spike_unilof, flag_zscore,
-flag_jumps, flag_nan), action (impute_rolling), and context (describe_point,
+flag_jumps, flag_nan), action (impute_linear, correct_level_shift), and context (describe_point,
 describe_points -- thin pass-throughs to context.py, see §7.3) tools.
 
 NOTE: verify every SaQC method name/signature against the SaQC 2.8 API before use.
@@ -177,17 +177,23 @@ def inspect_dataset(qc: saqc.SaQC, field: str = "value") -> dict:
     # from `std` instead set thresh at roughly the 60th percentile of ordinary
     # window-to-window movement, got 2,865 flags, and blanket-kept all of them.
     jumps = context.jump_scale(series)
+    # What thresh makes each SPIKE detector emit a triageable number of candidates
+    # (§7.10). Same reasoning as jump_scale: no summary statistic of the record predicts
+    # it, so it is measured from each detector's own score distribution on this record.
+    spikes = context.spike_scale(qc, field=field)
     return {
         "tool": "inspect_dataset",
         "params": {"field": field},
         "n_rows": summary.n_rows,
         "message": (
             "Dataset inspected. " + noise.get("message", "") + " " + jumps.get("message", "")
+            + " " + spikes.get("message", "")
         ),
         "qc": qc,
         "summary": summary.to_dict(),
         "noise_profile": {k: v for k, v in noise.items() if k not in ("tool", "params")},
         "jump_scale": {k: v for k, v in jumps.items() if k not in ("tool", "params")},
+        "spike_scale": {k: v for k, v in spikes.items() if k not in ("tool", "params")},
     }
 
 
@@ -309,8 +315,9 @@ def _rationale(source: str, action: str, flagged_by: str, reason: str) -> str:
     if source == "deterministic":
         if action == "impute":
             return (
-                f"Filled by impute_rolling. No judgement was recorded for this row — "
-                f"{_IMPUTE_FUNC} wrote a value here and that is what the log reflects."
+                f"Filled by {_IMPUTE_FUNC}: linear interpolation across a gap of "
+                f"{MAX_FILL_GAP} or less. No judgement was recorded for this row — "
+                "code decided it, and that is what the log reflects."
             )
         return (
             f"Flagged by {flagged_by}, but no decision span covered it, so the agent "
@@ -398,7 +405,15 @@ def _validate_verdict(
 
 # A row flagged only by the imputer was, factually, imputed — there is nothing for the
 # agent to adjudicate, so it is not counted as undecided.
-_IMPUTE_FUNC = "interpolateByRolling"
+_IMPUTE_FUNC = "impute_linear"
+_DISPLAY_NAME = {"setFlags": _IMPUTE_FUNC}
+
+# One rule for everything (2026-08-25): any NaN run of an hour or less is filled by
+# linear interpolation, anything longer is left as an honest hole. It applies to natural
+# gaps, to injected ones, and to the holes left by rows the agent deleted — a deleted
+# spike IS a gap, and 1-3 samples always falls inside the cap. A plateau the agent
+# deletes runs hours, so it stays NaN by the same rule rather than by a special case.
+MAX_FILL_GAP = "1h"
 
 
 def _flagged_by_row(qc: saqc.SaQC, field: str) -> pd.Series:
@@ -411,6 +426,11 @@ def _flagged_by_row(qc: saqc.SaQC, field: str) -> pd.Series:
     names: dict[pd.Timestamp, list[str]] = {}
     for col in history.hist.columns:
         test_name = history.meta[col].get("func", col)
+        # `impute_linear` marks the rows it filled with SaQC's setFlags, whose history
+        # entry is the bare method name. Nothing else in this module calls setFlags, so
+        # the mapping is unambiguous — and a reader of the flag log needs the TOOL that
+        # acted, not the SaQC primitive it used (a test holds that sole-caller line).
+        test_name = _DISPLAY_NAME.get(test_name, test_name)
         for stamp in history.hist.index[history.hist[col] > 0]:
             names.setdefault(stamp, [])
             if test_name not in names[stamp]:
@@ -647,6 +667,20 @@ def _build_flag_log(
     # no claim about any of them.
     verdicts[imputed_rows] = "anomaly"
     anomaly_types[imputed_rows] = "gap"
+
+    # A MISSING ROW IS A GAP, whatever span covers it (2026-08-31). §5: "every missing
+    # run is labelled gap" is a fact about the data, not a call the agent makes — the
+    # same reasoning that forces the type on an imputed row above. §9 lets a plateau or
+    # level_shift span dropouts, so a segment span legitimately reaches over NaN rows,
+    # but reaching over them must not RETYPE them. Measured on run P: all six of its
+    # gap "errors" were NaN rows inside a plateau or level_shift span, found by flagNAN
+    # and then relabelled by the covering span. flagNAN flags exactly the missing rows,
+    # so its presence in `flagged_by` is the reliable marker after the imputer has run
+    # and the data no longer shows NaN.
+    was_missing = flagged_by.str.contains("flagNAN", regex=False).to_numpy()
+    retyped = was_missing & (verdicts == "anomaly").to_numpy() & (anomaly_types != "gap").to_numpy()
+    anomaly_types[retyped] = "gap"
+    n_retyped_to_gap = int(retyped.sum())
     # Nobody adjudicated these, which is neither "anomaly" nor "normal" (§10 scores it
     # as no claim in either direction). Naming it keeps a forgotten segment visible
     # instead of letting it read as a considered "normal".
@@ -688,6 +722,7 @@ def _build_flag_log(
     stats = {
         "n_entries": len(entries),
         "n_undecided": int((actions == UNDECIDED).sum()),
+        "n_missing_rows_retyped_to_gap": n_retyped_to_gap,
         "n_keep_rewritten_to_impute": n_keep_overridden,
         "n_by_verdict": {
             verdict: int((verdicts == verdict).sum())
@@ -730,6 +765,85 @@ def _build_flag_log(
 # quietly, so it is enforced here instead, against evidence the run actually obtained.
 PRECIP_AUDITED_ACTIONS = frozenset({"delete", "correct"})
 MAX_UNAUDITED_LISTED = 20
+
+
+# §7.11: a point whose evidence CONFLICTS is a judgement call, and difficulty is derived
+# from the measurements rather than taken on the agent's word. Measured on run P over the
+# 218 points it measured: conflicted points were decided WRONG 69.4% of the time against
+# 16.6% for the rest — a 4.2x signal, and the sharpest predictor of error in the run.
+ELEVATED_NOISE_FOR_CONFLICT = 2.0
+
+
+def evidence_conflicts(row: dict | None) -> list[str]:
+    """Which measurements disagree about this point. Empty means they all point one way.
+
+    Each pair below is one instrument saying "artifact" while another says "real water".
+    Measured error rates on run P: `spike_vs_noise` 81% wrong, `spike_vs_rain` 54% wrong.
+    Rain earns its place despite being the weaker signal — over 1,471 spike candidates it
+    moves P(real water) from a 44% base rate only to 59%, and it is exactly that
+    near-balance which makes a spike-shaped point with rain behind it a judgement call
+    rather than something a catch-all should settle silently.
+    """
+    if not row:
+        return []
+    out, reads, noise = [], row.get("reads_like"), row.get("noise_ratio")
+    if reads == "spike" and row.get("rained") is True:
+        out.append("shape says spike, but it rained beforehand")
+    if reads == "spike" and isinstance(noise, (int, float)) \
+            and noise > ELEVATED_NOISE_FOR_CONFLICT:
+        out.append("shape says spike, but the surrounding stretch is noisy "
+                   f"(noise_ratio {noise})")
+    if reads == "noisy-stretch" and row.get("rained") is False:
+        out.append("reads as a noisy stretch, but no rain to explain the movement")
+    return out
+
+
+def _require_graded_reasoning(entries: list[dict], evidence: dict | None) -> None:
+    """A contested point must be judged on its own, and its difficulty must be honest.
+
+    Two refusals, both §13 "fail loudly", both aimed at the same failure: run P swept 21
+    of the 26 points whose shape and rainfall disagreed into a whole-record catch-all
+    marked `difficulty: "clear"`, and one of them was an injected spike it had measured
+    at 8.8 robust sigmas. Nothing objected, because `difficulty` was self-declared and a
+    blanket was explicitly permitted.
+
+    ``evidence`` is ``None`` for any caller that is not the agent runner, which switches
+    the check off rather than failing a library call that never measured anything.
+    """
+    if not evidence:
+        return
+    swept, miscalled = [], []
+    for e in entries:
+        why = evidence_conflicts(evidence.get(e["datetime"]))
+        if not why:
+            continue
+        by = e.get("decided_by") or {}
+        if e.get("rationale_source") == "blanket":
+            swept.append(e["datetime"])
+        elif by.get("difficulty") == "clear":
+            miscalled.append((e["datetime"], why[0]))
+    if swept:
+        shown = ", ".join(sorted(swept)[:MAX_UNAUDITED_LISTED])
+        raise ValueError(
+            f"{len(swept)} point(s) whose own measurements DISAGREE were swept up by a "
+            f"catch-all span instead of being judged: {shown}"
+            + (f" (and {len(swept) - MAX_UNAUDITED_LISTED} more)"
+               if len(swept) > MAX_UNAUDITED_LISTED else "")
+            + ". These are the hardest calls in the run — one instrument says artifact "
+            "and another says real water — and they are decided wrong far more often "
+            "than points where the evidence agrees. A blanket cannot settle them: give "
+            "each its own span saying what each side showed and what tipped you."
+        )
+    if miscalled:
+        shown = "; ".join(f"{t} ({w})" for t, w in miscalled[:5])
+        raise ValueError(
+            f"{len(miscalled)} decision(s) are marked difficulty='clear' on points whose "
+            f"measurements disagree: {shown}"
+            + (f"; and {len(miscalled) - 5} more" if len(miscalled) > 5 else "")
+            + ". Nothing about those calls is clear-cut. Mark them 'judgement-call' and "
+            "write the deliberation — that is what the review queue is built from, and "
+            "calling a contested point clear hides it from the reader."
+        )
 
 
 def _require_precip_audit(entries: list[dict], audited) -> None:
@@ -778,6 +892,7 @@ def export_clean_data(
     output_dir: str | Path | None = None,
     stem: str | None = None,
     precip_audited: frozenset[str] | set[str] | None = None,
+    evidence: dict | None = None,
 ) -> dict:
     """
     Takes the final, cleaned data and gives it back as a simple spreadsheet-like format,
@@ -814,6 +929,7 @@ def export_clean_data(
 
     entries, stats = _build_flag_log(qc, field, decisions)
     _require_precip_audit(entries, precip_audited)
+    _require_graded_reasoning(entries, evidence)
 
     # ACTUALLY REMOVE WHAT THE RUN DECIDED TO DELETE (2026-08-25). §5 says the cleaned
     # file carries "deleted values as NaN", and §1 promises a cleaned dataset — but this
@@ -831,7 +947,17 @@ def export_clean_data(
         mask = df.index.isin(pd.to_datetime(sorted(deleted)))
         n_deleted = int(mask.sum() - df.loc[mask, field].isna().sum())
         df.loc[mask, field] = np.nan
-    stats = {**stats, "n_values_deleted": n_deleted}
+
+    # A DELETED VALUE IS A GAP, so it gets the same treatment any other gap gets
+    # (2026-08-25). Removing a 1-3 sample spike and leaving a permanent hole is not a
+    # repair: run N left 218 of them, because the imputer runs as a tool mid-loop and
+    # deletions are only applied here, at the end — so nothing could ever fill them.
+    # The fill is capped at MAX_FILL_GAP like everything else, which is why a deleted
+    # spike always fills and a deleted plateau, running hours, stays an honest hole.
+    filled_series, refilled, _ = _linear_fill(df[field], MAX_FILL_GAP)
+    df[field] = filled_series
+    stats = {**stats, "n_values_deleted": n_deleted,
+             "n_rows_refilled_after_delete": int(len(refilled))}
 
     flags_path = None
     if output_dir is not None and stem is not None:
@@ -848,6 +974,9 @@ def export_clean_data(
         + f". Actions taken: {stats['n_by_action']}."
         + (f" {stats['n_values_deleted']} value(s) removed from the cleaned file."
            if stats.get("n_values_deleted") else "")
+        + (f" {stats['n_rows_refilled_after_delete']} of the resulting hole(s) were "
+           f"linearly interpolated (gaps of {MAX_FILL_GAP} or less); the rest were left "
+           "missing." if stats.get("n_rows_refilled_after_delete") else "")
     )
     if flags_path:
         msg += f" Written to {flags_path}."
@@ -877,7 +1006,7 @@ def export_clean_data(
     if stats["n_keep_rewritten_to_impute"]:
         msg += (
             f" NOTE: {stats['n_keep_rewritten_to_impute']} row(s) you marked 'keep' were"
-            " filled by impute_rolling and are recorded as 'impute' — their value was"
+            " filled by impute_linear and are recorded as 'impute' — their value was"
             " replaced, so 'keep' would misdescribe the file. If you meant to sweep up"
             " only your spike/jump flags, narrow that span so it does not span the gaps."
         )
@@ -1090,7 +1219,7 @@ def flag_plateau(qc: saqc.SaQC, field: str = "value", min_length="1h", max_lengt
     return _build_result("flag_plateau", params, qc, qc_out, field)
 
 
-def flag_spike_unilof(qc: saqc.SaQC, field: str = "value", n=20, thresh=None, density='auto', slope_correct=True) -> dict:
+def flag_spike_unilof(qc: saqc.SaQC, field: str = "value", n=context.SPIKE_LOF_N, thresh=None, density='auto', slope_correct=True) -> dict:
     """
     Flags sudden, sharp "spikes" in the data (outliers) using a smart math trick called
     Local Outlier Factor. It looks for points that are very different from their neighbors.
@@ -1145,137 +1274,150 @@ def flag_nan(qc: saqc.SaQC, field: str = "value") -> dict:
     return _build_result("flag_nan", params, qc, qc_out, field)
 
 
-def impute_rolling(
+# How much series either side of a gap is averaged to place the line's endpoints.
+# A DURATION, never a sample count: this project has been bitten four times by a tuned
+# constant expressed in samples silently changing meaning when the cadence did (§7.3).
+ANCHOR_WINDOW = "15min"
+
+
+def _anchor(series: pd.Series, at: pd.Timestamp, side: str) -> tuple:
+    """A robust (time, value) endpoint for the line, from the readings on one side.
+
+    Returns the MEDIAN of the real readings within :data:`ANCHOR_WINDOW` of the gap
+    edge, placed at their mid-time — not the single nearest reading. Anchoring a line
+    on two individual points makes the whole fill hostage to either of them, and §6
+    notes that artifacts cluster at gap EDGES: a suspicious value immediately beside a
+    dropout is more likely to be telemetry junk than real water. A median over the
+    window shrugs that off while still following the trend, which a rolling median
+    cannot do and a point-anchored line does not survive.
+    """
+    span = pd.Timedelta(ANCHOR_WINDOW)
+    if side == "before":
+        seg = series.loc[at - span: at].dropna()
+    else:
+        seg = series.loc[at: at + span].dropna()
+    if seg.empty:
+        # Another gap sits against this one inside the anchor window. Fall back to the
+        # single nearest real reading rather than refusing to fill.
+        rest = series.loc[:at].dropna() if side == "before" else series.loc[at:].dropna()
+        if rest.empty:
+            return None, None
+        return (rest.index[-1], float(rest.iloc[-1])) if side == "before" else \
+               (rest.index[0], float(rest.iloc[0]))
+    stamps = seg.index.astype("int64").to_numpy()
+    return pd.Timestamp(int(stamps.mean())), float(seg.median())
+
+
+def _linear_fill(series: pd.Series, max_gap: str | None) -> tuple[pd.Series, pd.DatetimeIndex, list]:
+    """Interpolate every NaN run no longer than *max_gap* along a median-anchored line.
+
+    Returns ``(filled_series, index_of_rows_filled, runs_left_alone)``.
+
+    **A run is filled WHOLE or not at all**, which is the point of replacing the rolling
+    median. `interpolateByRolling` fills only where its window finds context, so it
+    filled the ends of a gap and left the middle: measured on 01467200_l1 it filled 23
+    of 27, 23 of 35 and 23 of 55 rows on three of the four injected gap events (§7.1's
+    half-fill trap). That biases the error metric optimistically, because the rows it
+    declines are the ones furthest from any real reading.
+
+    A run with real data on only one side is skipped: there is no second point to draw
+    a line to, and continuing the last value outward is invention, not interpolation.
+    """
+    runs = _find_nan_runs(series)
+    if not runs:
+        return series, pd.DatetimeIndex([]), []
+    cap = pd.Timedelta(max_gap) if max_gap is not None else None
+    fillable = [r for r in runs if cap is None or r["duration_td"] <= cap]
+    skipped = [r for r in runs if cap is not None and r["duration_td"] > cap]
+
+    out = series.copy()
+    for run in fillable:
+        t0, v0 = _anchor(series, run["start"], "before")
+        t1, v1 = _anchor(series, run["end"], "after")
+        if t0 is None or t1 is None or t1 <= t0:
+            continue                      # no two anchors: leave it missing
+        idx = series.loc[run["start"]: run["end"]].index
+        frac = (idx.astype("int64").to_numpy() - t0.value) / (t1.value - t0.value)
+        out.loc[idx] = v0 + frac * (v1 - v0)
+    changed = out.notna() & series.isna()
+    return out, series.index[changed], skipped
+
+
+def _write_series(qc: saqc.SaQC, field: str, values: pd.Series) -> saqc.SaQC:
+    """Write *values* into *field*, past SaQC's flag mask and without polluting globals.
+
+    Both hazards are §7.8's: `processGeneric`'s `dfilter` default masks every flagged
+    row so the write silently does nothing, and it injects a 35-name environment into
+    the callable's `__globals__`, shadowing six builtins in whatever module defined it.
+    """
+    def _replace(_):
+        return values
+
+    isolated = types.FunctionType(_replace.__code__, {}, "_replace", None,
+                                  _replace.__closure__)
+    return qc.processGeneric(field, func=isolated, dfilter=np.inf)
+
+
+def impute_linear(
     qc: saqc.SaQC,
     field: str = "value",
-    window=None,
-    func: str = "median",
-    min_periods: int = 0,
-    max_gap: str | None = None,
+    max_gap: str | None = MAX_FILL_GAP,
 ) -> dict:
-    """Fill NaN gaps using a rolling window median (or other aggregation).
+    """Fill short gaps by linear interpolation between the readings either side.
 
-    Only fills gaps whose duration is <= max_gap. Longer gaps are left as NaN
-    and reported in the result so the agent knows they were skipped.
+    Replaces the rolling-median imputer, on measurement rather than preference. A
+    centred rolling median is a LEVEL estimator — it predicts the local median — where
+    linear interpolation follows the TREND between the gap's two endpoints, so the
+    median loses on any sloped gap by construction and loses by more the faster the
+    water is moving (measured deficit +0.05 FNU on flat gaps, +0.31 on fast ones).
+    Head to head on 01467200_l1: the rolling median managed RMSE 1.765 over 62% of the
+    injected gap rows, while linear scores 1.509 on those same rows and 1.659 over
+    *all* of them — better error at higher coverage, so there is no trade being made.
 
-    max_gap: pandas offset string, e.g. '3h'. If None, all gaps are imputed
-    up to what the window can reach. Always set max_gap to the longest gap you
-    are willing to accept; do not impute multi-day outages.
+    Gaps longer than *max_gap* are left as NaN and reported. Filling a multi-day outage
+    with a straight line is invention, not repair.
     """
-    params = {"window": window, "func": func, "min_periods": min_periods, "max_gap": max_gap}
+    before = qc.data.to_pandas()[field]
+    filled, touched, skipped = _linear_fill(before, max_gap)
 
-    # --- 1. Analyse gaps before touching the data ---
-    pre_series = qc.data.to_pandas()[field]
-    nan_runs   = _find_nan_runs(pre_series)
+    qc_out = qc
+    if len(touched):
+        qc_out = _write_series(qc, field, filled)
+        # flag=25 (DOUBTFUL) so the filled rows appear in the history and the §5 flag
+        # log can record action='impute' for them (§7.1: read attribution from the
+        # history, never from qc.flags).
+        qc_out = qc_out.setFlags(field, data=list(touched), flag=25)
 
-    max_gap_td = pd.Timedelta(max_gap) if max_gap is not None else None
-
-    fillable_runs  = []
-    too_large_runs = []
-    for run in nan_runs:
-        if max_gap_td is not None and run["duration_td"] > max_gap_td:
-            too_large_runs.append(run)
-        else:
-            fillable_runs.append(run)
-
-    # --- 2. Call SaQC's interpolateByRolling ---
-    # flag=25 (DOUBTFUL) so imputed rows appear in the flag history (§7.1).
-    #
-    # dfilter=np.inf is load-bearing. SaQC masks every row whose flag is >= `dfilter`
-    # before a function runs, and the default masks BAD — so a row an earlier detector
-    # flagged looks MISSING to the imputer, which fills it, silently replacing a real
-    # reading that was never absent. Measured on 03447687_l1 (2026-08-10): 1,879 rows
-    # that were never NaN were rewritten with a rolling median, 1,866 of them ordinary
-    # water and 13 of them injected anomalies the agent consequently never judged.
-    # It also corrupted three separate measurements — evaluate.py's spike precision,
-    # and the `missed` counts on both audit pages — because an overwritten row carries
-    # `action=impute` and reads as a successful gap fill.
-    #
-    # np.inf means nothing is masked, so the imputer sees the real data and fills only
-    # genuine NaN. Verified in scratchpad/probe_impute_dfilter.py: a flagged spike
-    # survives untouched while a real gap is still filled.
-    pre_nans = int(pre_series.isna().sum())
-    qc_out   = qc.interpolateByRolling(
-        field, window=window, func=func, min_periods=min_periods, flag=25,
-        dfilter=np.inf,
+    gaps = sorted(_find_nan_runs(before), key=lambda r: r["n_rows"], reverse=True)
+    summary = [
+        {"start": r["start"].isoformat(), "end": r["end"].isoformat(),
+         "duration": str(r["duration_td"]), "n_rows": r["n_rows"],
+         "skipped_too_large": any(r["start"] == k["start"] for k in skipped)}
+        for r in gaps[:MAX_GAPS_SUMMARY]
+    ]
+    n_skipped_rows = sum(r["n_rows"] for r in skipped)
+    msg = (
+        f"Linearly interpolated {len(touched)} row(s) across "
+        f"{len(gaps) - len(skipped)} gap(s) of {max_gap} or less. "
+        f"{len(skipped)} gap(s) ({n_skipped_rows} row(s)) were longer than {max_gap} "
+        "and were left as NaN — say so in your report rather than filling them."
     )
-    post_series = qc_out.data.to_pandas()[field]
-    post_nans   = int(post_series.isna().sum())
-    n_imputed   = pre_nans - post_nans
-    n_total     = len(pre_series)
+    if len(gaps) > MAX_GAPS_SUMMARY:
+        msg += (f" gaps_summary lists the {MAX_GAPS_SUMMARY} longest of {len(gaps)}; "
+                "the counts above are exact.")
+    return {
+        "tool": "impute_linear",
+        "params": {"field": field, "max_gap": max_gap},
+        "n_flagged": len(touched),
+        "n_imputed": len(touched),
+        "n_gaps_total": len(gaps),
+        "n_gaps_skipped_too_long": len(skipped),
+        "n_rows_left_missing": n_skipped_rows,
+        "gaps_summary": summary,
+        "message": msg,
+        "qc": qc_out,
+    }
 
-    # --- 3. Warn if any too-large gap was partially filled ---
-    # SaQC's rolling window naturally can't bridge a gap wider than `window`,
-    # but it will fill the edges.  Report every such case explicitly.
-    partial_fill_warnings: list[str] = []
-    for run in too_large_runs:
-        run_slice = post_series.loc[run["start"]:run["end"]]
-        n_partial  = int(run_slice.notna().sum())
-        if n_partial > 0:
-            partial_fill_warnings.append(
-                f"Gap {run['start'].isoformat()}–{run['end'].isoformat()} "
-                f"({run['duration_td']}) exceeds max_gap='{max_gap}': "
-                f"{n_partial} edge row(s) were partially filled."
-            )
-
-    # --- 4. Build gap summary (JSON-serialisable, for agent context) ---
-    gaps_summary = [
-        {
-            "start":           run["start"].isoformat(),
-            "end":             run["end"].isoformat(),
-            "duration":        str(run["duration_td"]),
-            "n_rows":          run["n_rows"],
-            "skipped_too_large": (max_gap_td is not None and run["duration_td"] > max_gap_td),
-        }
-        for run in nan_runs
-    ]
-
-    # --- 5. Compose message ---
-    pct_imputed = round(n_imputed / n_total, 4) if n_total > 0 else 0.0
-    msg_parts   = [
-        f"Imputed {n_imputed} values ({pct_imputed * 100:.1f}%) across "
-        f"{len(fillable_runs)} of {len(nan_runs)} gap(s). "
-        f"{post_nans} NaN(s) remain."
-    ]
-    if too_large_runs:
-        msg_parts.append(
-            f"{len(too_large_runs)} gap(s) exceeded max_gap='{max_gap}' and were not imputed."
-        )
-    if partial_fill_warnings:
-        msg_parts.append("PARTIAL FILL WARNING: " + " | ".join(partial_fill_warnings))
-
-    msg = " ".join(msg_parts)
-
-    result = _build_result("impute_rolling", params, qc, qc_out, field, custom_msg=msg)
-    result["n_imputed"]            = n_imputed
-    result["n_gaps_total"]         = len(nan_runs)
-    result["n_gaps_filled"]        = len(fillable_runs)
-    result["n_gaps_skipped_large"] = len(too_large_runs)
-    # Longest gaps first, then capped: which gaps were too long to fill is the decision
-    # this list informs, and those are exactly the ones at the top.
-    by_length = sorted(gaps_summary, key=lambda g: g["n_rows"], reverse=True)
-    result["gaps_summary"]         = by_length[:MAX_GAPS_SUMMARY]
-    if len(by_length) > MAX_GAPS_SUMMARY:
-        result["message"] += (
-            f" NOTE: gaps_summary lists the {MAX_GAPS_SUMMARY} longest of"
-            f" {len(by_length)} gaps; the counts above cover all of them."
-        )
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Context tools (CLAUDE.md §7.3)
-#
-# Thin pass-throughs to src/agent_tools/context.py. The measurement lives there;
-# these exist so every tool the agent can call is reachable from one module with
-# one calling convention -- `qc` first, like every wrapper above. They OBSERVE:
-# nothing here flags or mutates, so the results carry no `qc` key and the caller's
-# SaQC object is unchanged (`inspect_dataset` sets that precedent in §5).
-#
-# Only the two aggregators are wrapped. The eight primitives behind them stay
-# library functions: nine near-identical tools would eat the 25-call cap, and
-# describe_point already returns all of them at once.
-# ---------------------------------------------------------------------------
 
 def describe_point(
     qc: saqc.SaQC,

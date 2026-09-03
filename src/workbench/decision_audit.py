@@ -241,6 +241,13 @@ def build_cases(
             # the action only what it did about it. They are shown separately because a
             # gap correctly identified and left unfilled is `anomaly` + `keep`.
             "verdict": verdict,
+            # Raw types for the confusion matrix, so the page never parses display
+            # strings. `pt` is the agent's CLAIM and is empty unless the verdict was
+            # `anomaly` — §10 scores the verdict, so a flagged row the agent rejected
+            # is a negative prediction, not a positive one of some other type.
+            "lt": label,
+            "pt": (str(flag_log["anomaly_type"].get(at, ""))
+                   if flagged and verdict == "anomaly" else ""),
             "anomaly_type": str(flag_log["anomaly_type"].get(at, "")) if flagged else "",
             "flagged_by": str(flag_log["flagged_by"].get(at, "")) if flagged else "",
             "action": action or "(never flagged)",
@@ -368,6 +375,33 @@ _TEMPLATE = r"""<!DOCTYPE html>
          font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
          display:grid; grid-template-columns:320px 1fr; }
   #side { border-right:1px solid var(--line); background:var(--panel); overflow-y:auto; }
+  .types { padding:8px 10px; border-bottom:1px solid var(--line); }
+  .types .lbl { font-size:10px; color:#6b7280; text-transform:uppercase;
+                letter-spacing:.06em; margin-bottom:5px; }
+  .chip { display:inline-block; padding:3px 9px; margin:2px 3px 2px 0; border-radius:11px;
+          border:1px solid var(--line); font-size:11px; cursor:pointer; user-select:none;
+          color:#9aa3b2; }
+  .chip.on { background:#1e293b; color:#e5e7eb; border-color:#475569; }
+  .cm { display:grid; grid-template-columns:auto 1fr 1fr; gap:2px; padding:8px 10px 4px; }
+  .cm div { padding:5px 6px; font-size:11px; }
+  .cm .hd { color:#6b7280; font-size:9.5px; text-transform:uppercase;
+            letter-spacing:.05em; text-align:center; align-self:end; }
+  .cm .rh { color:#6b7280; font-size:9.5px; text-transform:uppercase;
+            letter-spacing:.05em; writing-mode:vertical-rl; transform:rotate(180deg);
+            text-align:center; grid-row:span 1; }
+  .cell { border:1px solid var(--line); border-radius:4px; cursor:pointer;
+          text-align:center; background:#0f1115; }
+  .cell:hover { border-color:#64748b; }
+  .cell.on { border-color:#e5e7eb; background:#1e293b; }
+  .cell .v { font-size:16px; font-weight:600; display:block; }
+  .cell .k { font-size:9px; color:#6b7280; letter-spacing:.05em; }
+  .cell.tp .v { color:#22c55e; } .cell.fp .v { color:#ef4444; }
+  .cell.fn .v { color:#f59e0b; } .cell.tn .v { color:#64748b; }
+  .metrics { display:flex; gap:10px; padding:2px 10px 9px; border-bottom:1px solid var(--line); }
+  .metrics div { flex:1; text-align:center; }
+  .metrics .v { font-size:15px; font-weight:600; color:#e5e7eb; }
+  .metrics .k { font-size:9px; color:#6b7280; text-transform:uppercase; letter-spacing:.05em; }
+  .note-tn { padding:0 10px 8px; font-size:10px; color:#6b7280; line-height:1.4; }
   /* min-width:0 is load-bearing: a grid item defaults to min-width:auto, so the wide
      <pre> and the plotly SVG stop this column from ever shrinking and the whole page
      scrolls sideways with the panel clipped off-screen. */
@@ -487,10 +521,76 @@ const byAt = new Map(D.cases.map(c => [c.at, c]));
 let cat = "wrongly-deleted";
 let sel = 0;
 
-const inCat = () => D.cases.filter(c => c.category === cat);
+const inCat = () => cell
+  ? D.cases.filter(c => cellOf(c) === cell)
+  : D.cases.filter(c => c.category === cat);
+
+// --- the confusion matrix, per anomaly type (§10 scores the VERDICT) ----------
+// A point counts as a positive PREDICTION only where the agent said verdict=anomaly,
+// and as a positive TRUTH only where the labels give it a type. With several types
+// selected the matrix is micro-averaged over them: a spike the agent called a plateau
+// is a false negative for spike AND a false positive for plateau, which is exactly how
+// evaluate.py scores it.
+const TYPES = ["spike", "plateau", "level_shift", "gap"];
+let sel_types = new Set(TYPES);
+let cell = null;                     // "tp" | "fp" | "fn" | "tn", or null
+
+function cellOf(c) {
+  const t = sel_types.has(c.lt), p = sel_types.has(c.pt);
+  if (t && p) return c.lt === c.pt ? "tp" : "fp";   // right place, wrong name = FP
+  if (t && !p) return "fn";
+  if (!t && p) return "fp";
+  return "tn";
+}
+function matrixCounts() {
+  const n = {tp:0, fp:0, fn:0, tn:0};
+  for (const c of D.cases) n[cellOf(c)]++;
+  // Every row the page does not carry is a point no detector flagged and the labels
+  // call water: a true negative. Counting only the clickable cases would report a TN
+  // count two orders of magnitude too small.
+  n.tn += D.n_rows - D.cases.length;
+  return n;
+}
+function toggleType(t) {
+  if (sel_types.has(t)) sel_types.delete(t); else sel_types.add(t);
+  if (!sel_types.size) sel_types = new Set(TYPES);   // never leave it empty
+  sel = 0; draw();
+}
+function pickCell(k) { cell = (cell === k ? null : k); cat = null; sel = 0; draw(); }
 
 function renderSide() {
   let h = `<h1>Decision audit<small>${D.title}</small></h1>`;
+  h += `<div class="types"><div class="lbl">anomaly type &mdash; click to toggle</div>`;
+  for (const t of TYPES) {
+    h += `<span class="chip ${sel_types.has(t)?"on":""}" onclick="toggleType('${t}')">${t}</span>`;
+  }
+  h += `</div>`;
+
+  const n = matrixCounts();
+  const prec = n.tp + n.fp ? n.tp / (n.tp + n.fp) : 0;
+  const rec  = n.tp + n.fn ? n.tp / (n.tp + n.fn) : 0;
+  const f1   = prec + rec ? 2 * prec * rec / (prec + rec) : 0;
+  const box = (k, label) =>
+    `<div class="cell ${k} ${cell===k?"on":""}" onclick="pickCell('${k}')">
+       <span class="v">${n[k].toLocaleString()}</span><span class="k">${label}</span></div>`;
+  h += `<div class="cm">
+          <div></div><div class="hd">agent: anomaly</div><div class="hd">agent: not</div>
+          <div class="rh">labelled</div>${box("tp","true pos")}${box("fn","false neg")}
+          <div class="rh">not</div>${box("fp","false pos")}${box("tn","true neg")}
+        </div>
+        <div class="metrics">
+          <div><span class="v">${prec.toFixed(3)}</span><span class="k">precision</span></div>
+          <div><span class="v">${rec.toFixed(3)}</span><span class="k">recall</span></div>
+          <div><span class="v">${f1.toFixed(3)}</span><span class="k">F1</span></div>
+        </div>
+        <div class="note-tn">Click a cell to page through its points. True negatives
+          include the ${(D.n_rows - D.cases.length).toLocaleString()} rows no detector
+          touched; only the flagged-then-rejected ones are listed.
+          ${sel_types.has("level_shift") ? `<br><b>Per ROW.</b> §10 scores level_shift by
+          EPISODE — "was the event found" rather than "how much of its window was
+          claimed" — so the scorer's number for that type will differ from this one and
+          both are right.` : ``}</div>`;
+
   for (const c of Object.keys(COLOR)) {
     h += `<div class="cat ${c===cat?"on":""}" style="color:${COLOR[c]}" onclick="pick('${c}')">
             <span>${c}</span><span class="n">${D.counts[c]}</span></div>`;
@@ -511,7 +611,7 @@ function renderSide() {
   $("side").innerHTML = h;
 }
 
-function pick(c) { cat = c; sel = 0; draw(); }
+function pick(c) { cat = c; cell = null; sel = 0; draw(); }
 
 function overview() {
   const stride = Math.max(1, Math.ceil(D.n_rows / 3000));

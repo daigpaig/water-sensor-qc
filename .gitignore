@@ -58,3 +58,11 @@ data/agent_runs/
 # ignored, since they are the evidence for the §9 gauge choice.
 scratchpad/out/screen_5min_catalog.csv
 scratchpad/out/probe5/
+
+# Agent RUN artefacts parked in the scratchpad while comparing runs (runT/U/V).
+# Same rule as data/agent_runs/ above: regenerable by re-running the agent, and
+# the flag log + cleaned CSV are tens of MB. The small tuning RESULT tables
+# beside them (*.txt, the tune_*/screen_* CSVs) are evidence and stay tracked.
+scratchpad/out/run*_flags.json
+scratchpad/out/run*_clean.csv
+scratchpad/out/*.log

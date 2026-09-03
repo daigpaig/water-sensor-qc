@@ -410,10 +410,16 @@ def test_describe_points_batches_a_hundred_by_default_and_clamps_beyond_the_ceil
     assert raised["n_described"] == 250, "max_points must stay agent-settable"
 
     clamped = ctx.describe_points(series, ats=ats, max_points=5000)
-    assert clamped["n_described"] == ctx.MAX_POINTS_CEILING == 300
+    assert clamped["n_described"] == ctx.MAX_POINTS_CEILING
+    # The ceiling tracks MAX_FLAGGED_DATETIMES rather than a number of its own: a
+    # detector hands the agent at most that many timestamps, so a larger ceiling here
+    # could never be filled and a smaller one would silently discard candidates the
+    # detector did surface (raised 300 -> 1000 with the absolute LOF threshold, §7.10).
+    from src.agent_tools.wrappers import MAX_FLAGGED_DATETIMES
+    assert ctx.MAX_POINTS_CEILING == MAX_FLAGGED_DATETIMES
     # The message must name the cap that was APPLIED, not the one that was asked
     # for — otherwise a clamped call reads as if 5000 points were considered.
-    assert "max_points=300" in clamped["message"]
+    assert f"max_points={ctx.MAX_POINTS_CEILING}" in clamped["message"]
     assert "clamped from the 5000" in clamped["message"]
     assert clamped["params"]["max_points_requested"] == 5000
 
@@ -671,3 +677,32 @@ def test_find_shift_windows_says_so_rather_than_failing_with_no_jumps():
     out = C.find_shift_windows(source=qc)
     assert out["n_windows"] == 0
     assert "flag_jumps first" in out["message"]
+
+
+def test_a_caller_supplied_subset_cannot_hide_a_shift_the_detector_found():
+    """`ats` is ADDITIVE, never restrictive. Making it merely optional was not enough:
+    run M passed 76 of 145 jump timestamps and run O passed 74, both subsets excluded the
+    injected shift's own two edges, and both runs concluded the record had no level shifts
+    — with nothing about either result looking wrong. The history is now always unioned in,
+    so a bad subset can only add, never subtract."""
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    from src.agent_tools import context as C
+
+    idx = pd.date_range("2024-01-01", periods=2000, freq="5min")
+    rng = np.random.default_rng(0)
+    v = pd.Series(10 + rng.normal(0, 0.2, 2000), index=idx)
+    v.iloc[800:1000] += 8.0
+    qc = saqc.SaQC(pd.DataFrame({"value": v})).flagJumps("value", thresh=4.0, window="6h")
+
+    jumps = C._jump_stamps_from_history(qc, "value")
+    # hand it a subset chosen to exclude the shift's edges entirely
+    bad = [str(t) for t in jumps if not (idx[780] <= t <= idx[1020])]
+    out = C.find_shift_windows(source=qc, ats=bad)
+
+    assert out["params"]["n_from_history"] == len(jumps)
+    starts = [pd.Timestamp(w["start"]) for w in out["windows"]]
+    assert any(abs((s - idx[800]).total_seconds()) <= 3600 for s in starts), (
+        f"the shift at {idx[800]} was lost to the caller's subset: {starts}")

@@ -55,7 +55,7 @@ EXPECTED_TOOLS = {
     "precip_context",
     "precip_context_points",
     # Action
-    "impute_rolling",
+    "impute_linear",
     "correct_level_shift",
 }
 
@@ -231,11 +231,15 @@ def test_flag_jumps_required_params():
     assert "window" in required
 
 
-def test_impute_rolling_window_required():
-    """§7.1: window must exceed the gap length — must be required, not optional."""
-    s = TOOL_SCHEMA_BY_NAME["impute_rolling"]
-    required = s["input_schema"].get("required", [])
-    assert "window" in required
+def test_impute_linear_has_no_window_to_get_wrong():
+    """The old rolling imputer required `window`, because a window narrower than the
+    gap filled only its edges (§7.1's half-fill trap — measured live on 01467200_l1:
+    23 of 27, 23 of 35 and 23 of 55 rows on three of four injected gap events). Linear
+    interpolation works from the two readings bounding the run, so it fills a gap whole
+    or not at all and there is no window to size wrongly."""
+    s = TOOL_SCHEMA_BY_NAME["impute_linear"]
+    assert "window" not in s["input_schema"]["properties"]
+    assert s["input_schema"].get("required", []) == []
 
 
 def test_flag_zscore_window_required():

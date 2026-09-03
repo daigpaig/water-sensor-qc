@@ -1,0 +1,20 @@
+record 210,816 rows, 7,222 NaN
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 203, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/daigomoriwake/Documents/ds_personal_projects/water-sensor-qc/scratchpad/probe_plateau_nan.py", line 38, in <module>
+    main()
+    ~~~~^^
+  File "/Users/daigomoriwake/Documents/ds_personal_projects/water-sensor-qc/scratchpad/probe_plateau_nan.py", line 31, in main
+    out2 = saqc.SaQC(pd.DataFrame({"value": dense})).flagPlateau("value", min_length="1h")
+  File "/Users/daigomoriwake/Documents/ds_personal_projects/water-sensor-qc/.venv/lib/python3.13/site-packages/saqc/lib/types.py", line 229, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/daigomoriwake/Documents/ds_personal_projects/water-sensor-qc/.venv/lib/python3.13/site-packages/saqc/core/register.py", line 517, in inner
+    out = func(out, **kw)
+  File "/Users/daigomoriwake/Documents/ds_personal_projects/water-sensor-qc/.venv/lib/python3.13/site-packages/saqc/funcs/pattern.py", line 699, in flagPlateau
+    raise ValueError("Not a unitary sampling rate")
+ValueError: Not a unitary sampling rate
+flagPlateau(min_length='1h') flagged 5,152 rows
+   of which NaN in the input : 1,987
+   of which real readings    : 3,165

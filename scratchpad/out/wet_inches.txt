@@ -1,0 +1,21 @@
+  done 01467200_l1
+  done 01467200_l2
+  done 01467200_l3
+  done 02054550_l1
+  done 02054550_l2
+  done 02054550_l3
+  done 040851385_l1
+  done 040851385_l2
+  done 040851385_l3
+
+spike candidates with rain coverage: 1471 (821 really injected spikes, 650 really water)
+
+ WET_INCHES  P(rain|spike)  P(rain|water)  separation  what rained=true would imply
+       0.00          21.1%          31.5%       10.5%   P(water|rained)=54.2%  n=378
+       0.02          14.9%          27.1%       12.2%   P(water|rained)=59.1%  n=298
+       0.05          12.2%          22.5%       10.3%   P(water|rained)=59.3%  n=246
+       0.10           9.1%          18.5%        9.3%   P(water|rained)=61.5%  n=195
+       0.20           7.6%          14.5%        6.9%   P(water|rained)=60.3%  n=156
+       0.40           3.2%           8.9%        5.8%   P(water|rained)=69.0%  n=84
+
+base rate P(really water) with no rain information: 44.2%

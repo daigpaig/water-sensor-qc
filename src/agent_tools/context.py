@@ -1527,7 +1527,16 @@ DEFAULT_MAX_POINTS = 100
 # Hard ceiling, because the parameter is agent-settable and the cost is linear:
 # `MAX_FLAGGED_DATETIMES` is 1000, so an uncapped call could return ~90k tokens
 # in one result. 300 still covers a full detector output in a single call.
-MAX_POINTS_CEILING = 300
+# Raised 300 -> 1000 (2026-09-02) so an absolute LOF threshold's output can actually be
+# measured. A tool RESULT is input, not output, so this never touches MAX_TOKENS; the
+# cost is ~97 tokens/point measured, i.e. ~$0.32 for 594 points and ~$0.65 for 1,213
+# across a whole run once the 1h prompt cache is counted. 1000 matches
+# `wrappers.MAX_FLAGGED_DATETIMES`, which is the real constraint: a detector hands the
+# agent at most 1,000 timestamps, so a larger ceiling here could never be filled.
+# UNVERIFIED: §7.5 measured that 20 -> 100 helped because the run went from measuring
+# 0.43% of its decisions to all of them. Whether the agent reasons as CAREFULLY over 600
+# rows of JSON as over 100 is untested — cost is not the risk here, attention is.
+MAX_POINTS_CEILING = 1000
 
 
 def ramp_context(
@@ -1656,6 +1665,48 @@ def ramp_context(
             "reads_like": label, "message": msg}
 
 
+# A "step" smaller than this many local step-sigmas is indistinguishable from the
+# series' own jitter, and its sharpness ratio means nothing (§7.8). Measured over all
+# nine datasets: the edges of REAL shift windows score median 12.2 (p10 9.63), the edges
+# of FALSE ones median 2.7. A cutoff of 5 kills 84.8% of false edges and keeps 100% of
+# real ones. Note the real sample is 8 edges — the margin is wide, the sample is not.
+SHIFT_MIN_STEP_SIGMAS = 5.0
+
+
+def _step_over_noise(series, at, k: int = 6, span: str = "6h") -> float | None:
+    """The net step at a transition, in units of the LOCAL sample-to-sample noise.
+
+    `_edge_sharpness` is a pure ratio — largest single-sample move over the net step —
+    so on a noisy storm limb, where the net step is the same size as the ordinary
+    jitter, it parks near 1.0 and reports "the level moved in one sample" when nothing
+    sharp happened. Measured on run P's false positive: net step 3.35 FNU against local
+    noise 1.93, sharpness 1.07. The real shift on the same record: 6.75 against 0.59.
+    """
+    t = resolve_timestamp(series, at)
+    pos = _pos(series, t)
+    seg = series.iloc[max(0, pos - k): pos + k + 1].to_numpy(dtype=float)
+    if len(seg) < 4:
+        return None
+    before = np.nanmedian(seg[: max(1, len(seg) // 3)])
+    after = np.nanmedian(seg[-max(1, len(seg) // 3):])
+    net = abs(after - before)
+    window = series.loc[t - pd.Timedelta(span): t + pd.Timedelta(span)]
+    sigma = _MAD_TO_SIGMA * float(window.diff().abs().median())
+    # Floor the windowed scale with the series-wide one, the §7.3 pattern: a windowed MAD
+    # collapses to 0 on quantised turbidity and in any flat stretch. Without the floor a
+    # clean step in calm water divides by zero and reads as UNMEASURABLE — which is the
+    # opposite of the truth, since a step standing clear of no noise at all is the most
+    # level-shift-like thing there is.
+    floor = _MAD_TO_SIGMA * float(series.diff().abs().median())
+    sigma = max(sigma, floor if np.isfinite(floor) else 0.0)
+    if not np.isfinite(net):
+        return None
+    if sigma <= 0:
+        # Genuinely noiseless data: any real step is infinitely many sigmas.
+        return float("inf") if net > 0 else None
+    return float(net / sigma)
+
+
 def _edge_sharpness(series, at, k: int = 6) -> float | None:
     """Largest single-sample move at a transition, as a share of the net step across it.
 
@@ -1732,9 +1783,24 @@ def shift_window_context(source, start, end, field: str = VALUE_COL, pad: str = 
     end_sharp = _edge_sharpness(series, b)
     sharp_edges = [x for x in (onset, end_sharp) if x is not None]
     abrupt = bool(sharp_edges) and min(sharp_edges) >= SHIFT_EDGE_SHARPNESS
+
+    # Sharpness is a RATIO and needs a scale check before it means anything: a step no
+    # bigger than the local jitter scores ~1.0 without anything sharp having happened.
+    steps = [x for x in (_step_over_noise(series, a), _step_over_noise(series, b))
+             if x is not None]
+    step_over_noise = min(steps) if steps else None
+    real_step = step_over_noise is not None and step_over_noise >= SHIFT_MIN_STEP_SIGMAS
     elevated = interior_sigmas is not None and abs(interior_sigmas) >= SHIFT_INTERIOR_SIGMAS
 
-    if elevated and abrupt:
+    if elevated and abrupt and not real_step:
+        label = "event-like"
+        size = (f"only {step_over_noise:.1f}x" if step_over_noise is not None
+                else "not measurable against")
+        why = ("the interior is elevated and the edges LOOK abrupt, but the step at them "
+               f"is {size} the local sample-to-sample noise — too small to tell from the "
+               "series' own jitter. Edge sharpness is a ratio, so it reads ~1.0 on a "
+               "noisy limb where barely any net step occurred")
+    elif elevated and abrupt:
         label = "level-shift-like"
         why = ("the interior sits well away from its surroundings AND both edges are "
                "abrupt — the signature of a recalibration or sensor swap")
@@ -1754,6 +1820,7 @@ def shift_window_context(source, start, end, field: str = VALUE_COL, pad: str = 
         "surrounding_mean": _round(float(np.nanmean(surround)), 3),
         "interior_sigmas": _round(interior_sigmas, 1),
         "onset_sharpness": _round(onset, 2),
+        "step_over_noise": _round(step_over_noise, 2),
         "end_sharpness": _round(end_sharp, 2),
         "reads_like": label,
         "message": (
@@ -1801,10 +1868,17 @@ def find_shift_windows(source, ats=None, field: str = VALUE_COL, min_hours: floa
     reported once rather than as thirty windows with sliding start times.
     """
     series = as_series(source, field)
-    from_history = False
-    if not ats:
-        ats = _jump_stamps_from_history(source, field)
-        from_history = True
+    # `ats` is ADDITIVE, never restrictive (2026-08-25). Every jump in the flag history is
+    # always included, and anything the caller passes is added to it. Making `ats` merely
+    # OPTIONAL was not enough: run M chose 76 of 145 timestamps and run O chose 74, both
+    # subsets excluded the injected shift's two edges, and both runs concluded the record
+    # had no level shifts — with nothing about either result looking wrong. There is no
+    # legitimate use for "consider only these jumps and ignore the ones the detector
+    # found", so the option to get it wrong is removed rather than documented against.
+    from_history = _jump_stamps_from_history(source, field)
+    supplied = list(ats) if ats else []
+    ats = sorted(set(from_history) | {resolve_timestamp(series, a) for a in supplied})
+    if True:
         if not ats:
             return {
                 "tool": "find_shift_windows",
@@ -1819,7 +1893,8 @@ def find_shift_windows(source, ats=None, field: str = VALUE_COL, min_hours: floa
             }
     stamps = sorted({resolve_timestamp(series, a) for a in ats})
     params = {"field": field, "min_hours": min_hours, "max_hours": max_hours,
-              "jumps_from": "flag history" if from_history else "caller"}
+              "n_from_history": len(from_history), "n_supplied": len(supplied),
+              "jumps_from": "flag history + caller" if supplied else "flag history"}
 
     raw = []
     for i, a in enumerate(stamps):
@@ -1853,7 +1928,8 @@ def find_shift_windows(source, ats=None, field: str = VALUE_COL, min_hours: floa
         "tool": "find_shift_windows", "params": params,
         "n_jumps": len(stamps), "n_windows": len(merged), "n_level_shift_like": n_shift,
         "windows": [{k: r[k] for k in ("start", "end", "hours", "interior_sigmas",
-                                       "onset_sharpness", "end_sharpness", "reads_like")}
+                                       "onset_sharpness", "end_sharpness", "step_over_noise",
+                                       "reads_like")}
                     for r in shown],
         "message": (
             f"Paired {len(stamps)} jump(s) into {len(merged)} candidate window(s): "
@@ -2002,6 +2078,143 @@ def _jump_statistic(series: pd.Series, window: str) -> np.ndarray:
     bwd = s.rolling(window, min_periods=1).mean()
     fwd = s[::-1].rolling(window, min_periods=1, closed="left").mean()[::-1]
     return np.abs(bwd.to_numpy() - fwd.to_numpy())
+
+
+# How many candidates each spike detector should aim to emit. The binding constraint is
+# describe_points' MAX_POINTS_CEILING (300): §7.5 measured that the run's largest
+# precision gain came from measuring EVERY flagged point, and a detector that emits more
+# than can be measured puts the agent back to deleting rows it never looked at.
+# `flagUniLOF`'s threshold is an ABSOLUTE number, not a candidate quota (2026-09-02).
+# LOF is a local DENSITY RATIO — |LOF| = 1.8 means "1.8x sparser than its neighbours" on
+# any river at any cadence — so unlike flag_jumps' FNU threshold (§7.6) it has no units
+# problem for a quantile to normalise, and quoting a quantile only discards the one thing
+# the score legitimately reports: HOW MANY points are unusual.
+#
+# Measured over all 18 datasets (nine 5-min, nine legacy 15-min), rank correlation
+# between candidate count and the number of injected spikes actually present:
+#
+#     budget 175   -0.29   count 167-174     <- pinned, and slightly ANTI-correlated
+#     abs 1.8      +0.72   count 88-1213
+#     abs 2.2      +0.79   count 48-758
+#
+# 1.8 is fitted on the HELD-OUT gauges only (02054550, 040851385), never on the ones we
+# report. It is the knee: 2.2 scores better on the fit but collapses to 0.667 recall on
+# the sparsest record, and 1.5 emits 1,602 candidates for a median gain of 0.05 recall.
+SPIKE_LOF_THRESH = 1.8
+
+# The candidate budget survives ONLY as a CEILING. §7.5 measured that the run's largest
+# precision gain came from measuring every flagged point, so a detector must not emit
+# more than describe_points can cover — but a ceiling that rarely binds is a different
+# thing from a quota that always does. When it binds, the result says so.
+SPIKE_BUDGET_LOF = 1000
+SPIKE_BUDGET_ZSCORE = 125
+
+# flagUniLOF's neighbourhood, in SAMPLES. 10, not the 20 that §7.2 carried over from the
+# 15-min bases: at 5-min cadence n=20 spans 100 minutes, and a 1-3 sample spike barely
+# perturbs the density of its own neighbourhood. Measured at an equal candidate budget
+# across all nine datasets, n=10 beats n=20 on 8 and ties on the ninth (median spike
+# recall 0.688 vs 0.521). §9.1's candidate tuner found the same thing independently.
+SPIKE_LOF_N = 10
+
+
+def spike_scale(
+    source,
+    field: str = VALUE_COL,
+    n: int = SPIKE_LOF_N,
+    lof_budget: int = SPIKE_BUDGET_LOF,
+    zscore_budget: int = SPIKE_BUDGET_ZSCORE,
+) -> dict:
+    """What threshold makes each spike detector emit a triageable number of candidates?
+
+    The §7.6 pattern, applied to spikes. NO SUMMARY STATISTIC OF THE RECORD PREDICTS
+    THESE THRESHOLDS: measured across the nine injected datasets, the threshold that
+    fits a fixed budget correlates +0.78 with the CONTAMINATION LEVEL -- which is
+    precisely what a run cannot know -- and only +0.57 with the best record statistic
+    (`robust_sigma / step_sigma`), on three gauges, which is far too few to fit on.
+    So this does not predict; it MEASURES, on this record, the statistic each detector
+    actually thresholds, and reports the quantile that lands the wanted candidate count.
+    That is self-calibrating: the same call gives 1.95 on one gauge and 3.45 on another
+    and both emit ~175 candidates.
+
+    `flagUniLOF` exposes its real score through `assignUniLOF`, so its threshold is read
+    straight off the score distribution. `flagZScore` has no such accessor and its
+    internals differ from the obvious rolling median/MAD approximation -- an early
+    version of this used that approximation and overshot the budget by 3-6x -- so its
+    threshold is bisected on the real call instead.
+    """
+    series = as_series(source, field)
+    clean = series.dropna()
+    params = {"field": field, "n": n, "lof_budget": lof_budget,
+              "zscore_budget": zscore_budget}
+    if len(clean) < 50:
+        return {"tool": "spike_scale", "params": params,
+                "message": "Series too short to characterise the spike detectors."}
+
+    qc = saqc.SaQC(pd.DataFrame({field: series}))
+    lof = qc.assignUniLOF(field, target="_lof", n=n).data.to_pandas()["_lof"].abs()
+    lof = lof.replace([np.inf, -np.inf], np.nan).dropna()
+    q = {f"p{p}": round(float(lof.quantile(p / 100)), 3)
+         for p in (50, 90, 99, 99.5, 99.9)}
+    # Absolute first; the budget only trims when the record genuinely has more
+    # candidates than the measurement pipeline can cover.
+    lof_thresh = SPIKE_LOF_THRESH
+    n_at_thresh = int((lof >= lof_thresh).sum())
+    lof_capped = n_at_thresh > lof_budget
+    if lof_capped:
+        lof_thresh = round(float(lof.quantile(max(0.0, 1 - lof_budget / len(lof)))), 2)
+        n_at_thresh = int((lof >= lof_thresh).sum())
+
+    # §7.1: on quantised turbidity a windowed MAD collapses to ~0 and any wiggle scores
+    # an enormous modified z, so `thresh` stops meaning anything without this floor.
+    step_sigma = _MAD_TO_SIGMA * float(series.diff().abs().median())
+    min_residuals = round(3 * step_sigma, 4)
+
+    lo, hi, z_thresh, z_n = 2.0, 400.0, None, None
+    for _ in range(14):
+        mid = (lo + hi) / 2
+        try:
+            hits = int((qc.flagZScore(field, method="modified", window="6h",
+                                      thresh=round(mid, 2),
+                                      min_residuals=min_residuals)
+                        .flags[field] > 0).sum())
+        except Exception:                      # a threshold the method cannot evaluate
+            break
+        if hits <= zscore_budget:
+            z_thresh, z_n, hi = round(mid, 2), hits, mid
+        else:
+            lo = mid
+
+    return {
+        "tool": "spike_scale",
+        "params": params,
+        "lof_quantiles": q,
+        "lof_n": n,
+        "recommended_lof_thresh": lof_thresh,
+        "lof_candidates_at_thresh": n_at_thresh,
+        "lof_thresh_capped": lof_capped,
+        "zscore_min_residuals": min_residuals,
+        "zscore_window": "6h",
+        "recommended_zscore_thresh": z_thresh,
+        "message": (
+            f"Spike detectors, sized for this record. Run BOTH: they are complementary, "
+            f"each finds spikes the other misses. flag_spike_unilof(n={n}, "
+            f"thresh={lof_thresh}) emits {n_at_thresh} candidate(s) — that count is "
+            "meant to VARY with how many anomalies this record holds, so do not read a "
+            "small number as the detector underperforming"
+            + (f". NOTE: {lof_budget} was the ceiling and the threshold was raised to "
+               "stay inside what describe_points can measure, so the weakest candidates "
+               "were dropped" if lof_capped else "")
+            + "; "
+            + (f"flag_zscore(method='modified', window='6h', thresh={z_thresh}, "
+               f"min_residuals={min_residuals}) aims for ~{zscore_budget} "
+               f"(it emitted {z_n})."
+               if z_thresh is not None else
+               "flag_zscore could not be sized on this record — pick its thresh from "
+               "its own first result instead.")
+            + " These are MEASURED from this record's own score distributions, not "
+              "guessed: no summary statistic predicts them."
+        ),
+    }
 
 
 def jump_scale(

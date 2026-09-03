@@ -38,6 +38,29 @@ from src.agent_tools import precipitation
 
 # Bump on every edit to SYSTEM_PROMPT and note the change in the commit message,
 # so a run in logs/*.jsonl can be tied to the exact prompt that produced it.
+# v0.23: flagUniLOF's thresh is ABSOLUTE (1.8), not a candidate quota. The quota was a
+#        §7.6 fix imported to a detector with no units problem: LOF is a density ratio,
+#        so pinning the COUNT discarded the one thing the score reports. Measured over
+#        18 datasets, quota count-vs-truth correlation -0.29 against +0.72 for abs 1.8.
+#        describe_points ceiling 300 -> 1000 so the output can be measured.
+# v0.22: difficulty is DERIVED from the measurements, not declared. A point whose own
+#        evidence disagrees needs its own span + a deliberation, and the export refuses
+#        both a blanket over it and a "clear" on it. Measured: conflicted points are
+#        decided wrong 69% vs 17%. Also: plateau window 1h (6h silently declined every
+#        shorter plateau), and a missing row stays typed `gap` whatever span covers it.
+# v0.21: rain is a WEIGHTING, not a default-flip. v0.16 said a rain hit flips the
+#        default to keeping; measured over 1,471 spike candidates it only moves
+#        P(real water) from 44% to 59%, and run P kept 22 points on that basis and was
+#        wrong on 45.5% of them. Rain plus spike geometry is a judgement call, not a keep.
+# v0.20: run BOTH spike detectors, and take their thresholds from inspect_dataset's new
+#        spike_scale block rather than inventing them. n=10 not 20 (n counts SAMPLES;
+#        n=20 spans 100 min at 5-min cadence and a 1-3 sample spike barely dents it --
+#        n=10 wins on 8 of 9 datasets at equal budget). No summary stat predicts the
+#        thresh: it tracks contamination (+0.78) which the run cannot know.
+# v0.19: gaps are filled by LINEAR interpolation, capped at one hour, and that one rule
+#        covers deleted values too (a deleted spike is a gap). The rolling median is
+#        gone: it half-filled gaps -- 23 of 27, 23 of 35, 23 of 55 rows on three of four
+#        injected events -- and lost to linear on both error and coverage.
 # v0.18: a level shift is CORRECTED, not deleted — correct_level_shift shifts the
 #        window back by the step measured at its two edges. A shift is an offset, so
 #        the water underneath is real: run L deleted 117 rows of recoverable record,
@@ -94,7 +117,7 @@ from src.agent_tools import precipitation
 #       override a specific verdict.
 # v0.5: phases replace the fixed STEP script (only inspect-first, range-before-spikes and
 #       export-last are forced); three context primitives exposed as tools.
-SYSTEM_PROMPT_VERSION = "v0.18-draft"
+SYSTEM_PROMPT_VERSION = "v0.23-draft"
 
 # The model is a CLAUDE.md §2 golden rule — do not change it without changing §2.
 MODEL = "claude-sonnet-4-6"
@@ -117,7 +140,7 @@ MODEL = "claude-sonnet-4-6"
 # with nothing exported. `claude-sonnet-4-6` accepts up to 128,000 output tokens and
 # this client already streams, which is what large max_tokens requires, so the
 # headroom is free. Cost is unaffected — max_tokens is a ceiling, not a reservation.
-MAX_TOKENS = 64000
+MAX_TOKENS = 128000
 
 # Sonnet 4.6 pricing (USD per million tokens) — update if the model changes.
 _COST_PER_M_INPUT = 3.0
@@ -263,7 +286,9 @@ the main defence against a mis-parameterised detector wrecking a run.
 
   SPIKE — one or a few values far from their immediate neighbours, with the series
     returning to its prior level right afterwards.
-    Detect with: flag_spike_unilof (primary), flag_zscore (backup), flag_range (physical gate).
+    Detect with: flag_spike_unilof AND flag_zscore — run BOTH, they are complementary —
+    plus flag_range as a physical gate. Take every threshold from inspect_dataset's
+    `spike_scale` block; do not invent one.
     Confirm with: describe_points, then slope_context on anything still in doubt.
     Default action: DELETE.
     Judgement: a real spike is an EXTREMELY SHARP RISE FOLLOWED BY AN EXTREMELY SHARP FALL.
@@ -338,13 +363,15 @@ the main defence against a mis-parameterised detector wrecking a run.
 
     HOW MUCH THAT ANSWER IS WORTH, IN BOTH DIRECTIONS. The nearest station with full
     coverage is about 31 km away, and a summer storm cell is often smaller than that. So:
-      * RAIN BEFORE THE POINT means the excursion HAS A PHYSICAL CAUSE, and your default
-        flips to keeping it: rain washed sediment in and the sensor recorded the result.
-        Deleting anyway is a decision you must justify against the rain, in the reason,
-        with a specific measurement — that the excursion is one sample wide when the rain
-        was spread over hours, that it recovered instantly, that it is physically
-        impossible for this river. "It looks like a spike" is not a rebuttal of rain.
-        Treat these as judgement-calls and write the deliberation.
+      * RAIN BEFORE THE POINT makes real water MORE LIKELY, but only moderately, and you
+        must weigh it rather than defer to it. Measured over 1,471 spike candidates on
+        this project's gauges: a candidate with rain behind it is real water 59% of the
+        time, against a 44% base rate with no rain information. That is a genuine signal
+        and a weak one. It should tip a call the series measurements leave balanced; it
+        must NOT override clear shape evidence. A 1-sample excursion at 9 robust sigmas
+        that recovers immediately is an artifact whether or not it rained 8 hours ago.
+        Rain plus spike-shaped geometry is the definition of a JUDGEMENT CALL: say what
+        each side showed and what tipped you, and mark it as one.
       * NO RAIN is WEAK evidence and does NOT license a deletion on its own. The cell may
         simply have missed the station. It only fails to support the excursion, which
         leaves the series measurements to carry the whole decision by themselves.
@@ -416,10 +443,15 @@ the main defence against a mis-parameterised detector wrecking a run.
     These two find different failures — run both when you suspect either.
     Confirm with: describe_point / describe_points — the flatness block reports the run of
     unchanged samples containing the point, which is the stuck-sensor signature directly.
-    Default action: DELETE (the readings carry no information), or flag if short.
+    Default action: DELETE. A stuck sensor's readings are not the water, so leaving them
+    in the cleaned file ships values you have just called wrong, presented as real. The
+    hole they leave is honest, and it stays a hole: a plateau runs hours, so the one-hour
+    fill rule correctly declines it. Do not expect it to be interpolated, and do not ask
+    for that — a multi-hour straight line is invention.
     Judgement: genuinely calm water at night can be flat, but not flat to the resolution of
     the instrument for many hours. A flat run of 8+ consecutive unchanged samples reads as
-    stuck; a couple of repeated values does not.
+    stuck; a couple of repeated values does not. If you judge the flatness real, that is
+    verdict 'normal' + keep, not an anomaly you decline to treat.
 
   LEVEL_SHIFT — a step to a new level that persists.
     Detect with: flag_jumps, with thresh and window taken from inspect_dataset's jump_scale
@@ -514,9 +546,14 @@ the main defence against a mis-parameterised detector wrecking a run.
     Detect with: flag_nan.
     Default action: IMPUTE short gaps only; leave long ones missing.
     Judgement: every missing run is a gap, including the ones already present in the raw
-    record. Short gaps (roughly up to a few hours) can be imputed with impute_rolling. Long
-    outages must be left as NaN — filling a multi-hour or multi-day gap with a rolling
-    median produces a flat, invented stretch that is worse than an honest hole. You do not
+    record. Short gaps are filled by impute_linear, which interpolates linearly between
+    the readings either side, whole-gap or not at all. Long outages must be left as NaN —
+    a straight line across a multi-hour or multi-day gap is invented data, worse than an
+    honest hole. The project standard is a ONE HOUR cap and the default is already '1h';
+    leave it alone unless the gap distribution gives you a specific reason. You do NOT
+    need to fill the holes left by values you delete — a deleted value is a gap, and the
+    export applies the same one-hour rule to it, so a deleted spike is interpolated for
+    you and a deleted plateau, running hours, is correctly left missing. You do not
     need describe_points to confirm a gap: whether a value is missing is not a judgement
     call. It is still worth knowing that artifacts cluster at gap EDGES — a suspicious value
     immediately beside a dropout is more likely to be telemetry junk, and the gap block in
@@ -579,7 +616,8 @@ Context — these say WHAT THE DATA LOOKS LIKE there (see §4.1)
   stretch and returns its bounds.
 
 Action
-  impute_rolling       Fills NaN gaps with a rolling median. Set max_gap deliberately.
+  impute_linear        Fills short NaN gaps by linear interpolation between the readings
+                       either side. Whole-gap or not at all; max_gap defaults to "1h".
   correct_level_shift  Shifts a level-shifted window back by the step measured at its
                        two edges. THE right action for a level shift you judge an
                        artifact — the water under an offset is real, so correcting
@@ -596,11 +634,22 @@ you call a tool; do not invent parameters that are not in the schema.
 
 STARTING PARAMETERS (measured on this project's gauges — starting points, not hard bounds):
 
-  flag_spike_unilof   thresh 1.2-2.0, default 1.5, with n=20.
-                      Raise towards 2.0 when the base is naturally spiky or you are seeing
-                      obvious false positives. Lower towards 1.2 when spikes are clearly
-                      being missed or the base is calm. This threshold is a ratio, so the
-                      same range works on every gauge.
+  flag_spike_unilof   n=10, thresh = spike_scale.recommended_lof_thresh. USE THAT NUMBER.
+                      It is an ABSOLUTE threshold on the LOF score, which is a local
+                      density ratio: 1.8 means "1.8x sparser than its neighbours" and
+                      means the same thing on every river at every cadence.
+                      THE CANDIDATE COUNT IS SUPPOSED TO VARY. A record with 20 spikes
+                      should yield far fewer candidates than one with 300, and it does —
+                      measured, 88 candidates on one gauge and 338 on another from the
+                      identical threshold. Do not read a small count as the detector
+                      underperforming and do not lower the threshold to "get more to look
+                      at": you would be manufacturing false candidates. An earlier version
+                      of this tool did exactly that — it sized the threshold to always emit
+                      ~175 candidates — and on a record holding 21 real spikes it produced
+                      168, capping precision at 0.13 before any judgement was made.
+                      n=10 rather than 20: n counts SAMPLES, so at 5-min cadence n=20 spans
+                      100 minutes and a 1-3 sample spike barely dents its own
+                      neighbourhood; n=10 beat n=20 on 8 of 9 datasets.
   flag_zscore         method="modified", window "12h", thresh 6-12, default 8.
                       On quantised data (turbidity rounded to 0.1 FNU) the modified z-score
                       can flag hundreds of segments at any threshold, because the MAD
@@ -610,9 +659,13 @@ STARTING PARAMETERS (measured on this project's gauges — starting points, not 
   flag_range          min=0 always for turbidity; max 1000-2000 FNU. This is a physical
                       sanity gate, not a sensitivity knob. Set max from the series max in
                       the summary — do not set it so low that it clips real storm peaks.
-  flag_constants      thresh <= 0.05 (default 0.01), window "3h"-"12h".
-                      thresh must be far smaller than the series' noise. A thresh of 0.5 on
-                      a series with noise sd 0.05 flagged 2999 of 3000 rows. Keep it small.
+  flag_constants      thresh <= 0.05 (default 0.01), window "1h" — USE 1h UNLESS YOU HAVE
+                      A REASON NOT TO. `window` is how long the sensor must stay stuck
+                      before it registers, so a 6h window silently declines every plateau
+                      shorter than six hours: that is what produced the missed plateaus
+                      on an earlier run. thresh must be far smaller than the series'
+                      noise — a thresh of 0.5 on a series with noise sd 0.05 flagged 2999
+                      of 3000 rows. Keep thresh small and the window short.
   flag_plateau        min_length "1h"-"3h" (default "1h"). It must be set WELL BELOW the
                       true plateau length: on a 25-hour plateau, "1h" and "3h" hit it and
                       "6h" found nothing. This tool is crash-prone on some inputs; the
@@ -634,10 +687,9 @@ STARTING PARAMETERS (measured on this project's gauges — starting points, not 
                       parameter. If it is more than you can triage, raise thresh to
                       jump_scale.by_window[window].p99_9 rather than guessing. Precision
                       here is low no matter how you tune it (see §3).
-  impute_rolling      window "1h"-"6h" (default "3h"), func="median", and always set
-                      max_gap. window must be at least as large as max_gap or the roller
-                      cannot bridge the gap and will fill it only partway — which is worse
-                      than not filling it, because it manufactures values at the gap edges.
+  impute_linear       max_gap defaults to "1h", the project standard. There is no window
+                      to size: linear interpolation works from the two readings bounding
+                      the gap, so it fills a run whole or leaves it alone.
                       Check n_gaps_filled / n_gaps_skipped_large in the result.
 
 -------------------------------------------------------------------------------
@@ -750,12 +802,16 @@ PHASE 2 — DETECT, driven by what you find
   first. Two constraints on order, both technical rather than stylistic:
     - flag_range first among the detectors, as a physical gate, so grossly impossible values
       do not distort the neighbourhood statistics the spike detectors depend on.
-    - flag_nan before impute_rolling, so you choose max_gap from the gap distribution rather
+    - flag_nan before impute_linear, so you choose max_gap from the gap distribution rather
       than guessing at it.
-  The rest is a menu, not a sequence: flag_spike_unilof is the primary spike detector and
-  usually the right opening move; flag_zscore is a second opinion worth spending a call on
-  only if you have a reason to think UniLOF missed something (a second detector that agrees
-  adds confidence; one that disagrees is not automatically right); flag_constants catches a
+  The rest is a menu, not a sequence, with one exception: RUN BOTH SPIKE DETECTORS.
+  flag_spike_unilof and flag_zscore are complementary rather than redundant — measured at
+  an equal candidate budget on all nine datasets, each finds spikes the other misses (the
+  z-score contributed up to 44 that UniLOF did not, UniLOF up to 131 that the z-score did
+  not), and the union recovers materially more than either alone while still fitting inside
+  what describe_points can measure. Neither is "primary". A candidate only one of them
+  raises is not weaker for that — they are answering different questions, one about local
+  density and one about local deviation; flag_constants catches a
   stuck sensor and flag_plateau an offset segment; flag_jumps finds level shifts. You do not
   have to run all of them. A detector you have no reason to expect anything from is a wasted
   call, and saying "the summary gave me no reason to look for a stuck sensor here" is a
@@ -869,10 +925,12 @@ PHASE 5 — DECIDE, per segment
   is not. An unexplained verdict is a failure even if it is the right verdict.
 
 PHASE 6 — IMPUTE
-  After flag_nan, look at the gap-length distribution before calling impute_rolling. Choose
-  max_gap for what is defensible on this series, set window >= max_gap, and after the call
-  check n_gaps_filled against n_gaps_skipped_large and any partial-fill warning in the
-  message. Report both what you filled and what you deliberately left missing.
+  After flag_nan, look at the gap-length distribution, then call impute_linear. The
+  default max_gap of "1h" is the project standard — keep it unless the distribution gives
+  you a measured reason to differ. Afterwards check n_imputed against
+  n_gaps_skipped_too_long, and report both what you filled and what you deliberately left
+  missing. Filling less always makes the error metric look better, so what you skipped is
+  part of the result, not a footnote to it.
 
 PHASE 7 — SUMMARISE AND EXPORT
   Call get_flag_summary, then export_clean_data. Reserve the calls for these two; a run that
@@ -922,11 +980,23 @@ PHASE 7 — SUMMARISE AND EXPORT
   excursion whose fall decays over several samples is exactly the case that needs
   writing out.
 
-  ONE MORE THING ABOUT BLANKET SPANS. A span covering a large share of everything
-  flagged is recorded as a blanket, and the result tells you how many rows it swallowed.
-  A blanket is a legitimate way to say "everything else here is normal water" — but a
-  point you actually measured and formed a view about must get its own span, or the
-  record will say a catch-all spoke for it and your reasoning about it is lost.
+  A CATCH-ALL CANNOT SETTLE A CONTESTED POINT, AND THE EXPORT ENFORCES THIS. Where your
+  own measurements DISAGREE about a point — the shape reads spike but it rained
+  beforehand; the shape reads spike but the surrounding stretch is noisy; it reads as a
+  noisy stretch but no rain explains the movement — that point must get its own span,
+  and that span must be marked difficulty "judgement-call" with a deliberation. Two
+  refusals enforce it: a blanket claiming such a point, and difficulty "clear" on one.
+  This is not bookkeeping. Measured over the 218 points one run measured, the ones whose
+  evidence disagreed were decided WRONG 69% of the time against 17% for the rest — they
+  are the hardest calls you make and the likeliest to be wrong, and a catch-all
+  resolves them silently in whichever direction it happens to lean. One such run swept
+  21 of 26 contested points into a whole-record span marked "clear"; one of them was a
+  real spike it had measured at 8.8 robust sigmas and kept anyway.
+  There are far fewer of these than you might fear: most flagged rows are gaps, which
+  are deterministic, and a typical run has a few dozen genuinely contested points. You
+  have the budget to write each of them out.
+  A blanket over the REST — points whose evidence all points one way — remains a
+  legitimate way to say "everything else here is normal water".
 
 PHASE 8 — REPORT
   Write a plain-language report for a water-quality scientist who is not a programmer:
@@ -1084,6 +1154,25 @@ def run_agent(
     # (§7.7), so the requirement is enforced against evidence the run really obtained
     # rather than against the agent's claim to have looked.
     precip_audited: set[str] = set()
+
+    # What each measurement tool said about each timestamp, so `export_clean_data` can
+    # tell a genuinely close call from a one-sided one WITHOUT taking the agent's word
+    # for it. §7.11: difficulty is DERIVED, not declared.
+    evidence: dict[str, dict] = {}
+
+    def _record_evidence(result: dict) -> None:
+        tool = result.get("tool", "")
+        rows = result.get("points") or ([result] if result.get("at") else [])
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("at"):
+                continue
+            slot = evidence.setdefault(_norm_stamp(row["at"]), {})
+            if tool.startswith("describe_point"):
+                slot["reads_like"] = row.get("reads_like")
+                slot["noise_ratio"] = row.get("noise_ratio")
+                slot["robust_z"] = row.get("robust_z")
+            elif tool.startswith("precip_context"):
+                slot["rained"] = row.get("rained")
 
     def _record_precip_audit(result: dict) -> None:
         """Record every timestamp this precipitation call came back for.
@@ -1343,6 +1432,7 @@ def run_agent(
                                 tool_args = {
                                     **tool_args, "output_dir": output_dir, "stem": stem,
                                     "precip_audited": frozenset(precip_audited),
+                                    "evidence": dict(evidence),
                                 }
                             # wrappers mutate qc and take qc=
                             result = func(qc=current_qc, **tool_args)
@@ -1358,6 +1448,7 @@ def run_agent(
                         elif hasattr(context, tool_name):
                             # context tools observe and take source=
                             result = func(source=current_qc, **tool_args)
+                            _record_evidence(result)
                         elif hasattr(precipitation, tool_name):
                             # THIS BRANCH WAS MISSING UNTIL 2026-08-25, and its absence
                             # was silent in exactly the way that matters: `_get_tool_function`
@@ -1379,6 +1470,7 @@ def run_agent(
                                 **{"gauge": precip_gauge, **tool_args},
                             )
                             _record_precip_audit(result)
+                            _record_evidence(result)
                         else:
                             raise ValueError(f"Unknown tool: {tool_name}")
 

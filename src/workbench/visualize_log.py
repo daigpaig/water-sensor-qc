@@ -548,6 +548,44 @@ def build_payload(
             }
         )
 
+    # ---- the flat CARD timeline ------------------------------------------------
+    # The page is navigated one EVENT at a time, not one iteration at a time. An
+    # iteration bundles the model's reasoning with every tool call it then made, and
+    # drawing that as one card does two things badly: several detectors' flags land on
+    # the plot at once (unreadable on a 210k-row series), and the reasoning is filed
+    # under the step whose tools it PRECEDES rather than shown as the response to the
+    # results it was actually reading. Splitting them gives the sequence the run really
+    # had — tool, then reasoning about its output, then the next tool.
+    cards: list[dict] = []
+    seen: set[int] = set()
+    for step in steps:
+        if step["text"] or step["thinking"]:
+            cards.append({
+                "kind": "reasoning",
+                "step": step["i"],
+                "label": "reasoning",
+                "text": step["text"],
+                "thinking": step["thinking"],
+                "stop_reason": step["stop_reason"],
+                "usage": step["usage"],
+                # A reasoning card owns no flags. It shows everything flagged SO FAR,
+                # which is the state the agent was reasoning about.
+                "idx": [],
+                "ctx": [],
+                "prior": sorted(seen),
+            })
+        for call in step["calls"]:
+            cards.append({
+                "kind": "tool",
+                "step": step["i"],
+                "label": call["name"],
+                "call": call,
+                "idx": call["idx"],
+                "ctx": call["ctx"],
+                "prior": sorted(seen),
+            })
+            seen.update(call["idx"])
+
     truth: dict[str, list[int]] = {}
     if labels is not None and len(labels):
         for anomaly_type, group in labels.groupby("anomaly_type"):
@@ -569,6 +607,7 @@ def build_payload(
         "times": None if regular else [t.isoformat(sep=" ") for t in index],
         "values": values,
         "steps": steps,
+        "cards": cards,
         "truth": truth,
         "truth_colors": {k: v for k, v in ANOMALY_COLORS.items()},
         "verdicts": _verdict_layer(index, flag_entries) if flag_entries else {},
@@ -783,6 +822,12 @@ _TEMPLATE = r"""<!doctype html>
   .step .name.action { color: var(--action); }
   .step .name.context { color: var(--context); }
   .step .name.utility { color: var(--utility); }
+  /* A reasoning card is indented and quiet: the tools are the spine of the run and
+     the reasoning hangs off them, which is also the reading order (tool, then the
+     agent's response to its output). */
+  .step.reasoning { padding-left: 22px; background: transparent; border-color: transparent; }
+  .step.reasoning .name { color: #64748b; font-style: italic; }
+  .step.reasoning.sel { background: var(--bg); border-color: var(--muted); }
   .step .name.err { color: var(--error); }
   .step .cnt { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
 
@@ -947,31 +992,24 @@ _TEMPLATE = r"""<!doctype html>
   let showTruth = Object.keys(D.truth).length > 0;
   // Same reasoning as showTruth: the run's own conclusion is the thing you came
   // to look at, so it is on wherever a flag log was found.
-  let showVerdicts = Object.keys(D.verdicts).length > 0;
+  // OFF by default. The verdict layer is the run's final answer over every row, and
+  // drawn on top of the per-card flags it is the single biggest source of clutter —
+  // the page is for reading the run step by step, not its conclusion. `V` brings it
+  // back, and the decision-audit page is where verdicts are meant to be studied.
+  let showVerdicts = false;
   let plotted = false;
 
   // ---------------------------------------------------------------- flag sets
-  // A step can hold more than one tool call (the loop allows it), so a step's
-  // flags are the union over its calls.
-  const stepIdx = D.steps.map((s) => {
-    const out = [];
-    s.calls.forEach((c) => { for (const i of c.idx) out.push(i); });
-    return out;
-  });
-  const stepCtx = D.steps.map((s) => {
-    const out = [];
-    s.calls.forEach((c) => { for (const p of c.ctx) out.push(p); });
-    return out;
-  });
-  // Union of every earlier step, so "new this iteration" is visible at a glance.
-  const priorIdx = [];
-  {
-    const seen = new Set();
-    D.steps.forEach((_, k) => {
-      priorIdx.push(Array.from(seen));
-      for (const i of stepIdx[k]) seen.add(i);
-    });
-  }
+  // The unit of navigation is a CARD, not an iteration: one card per tool call and
+  // one per block of reasoning, in the order they happened. A tool card owns exactly
+  // the flags of its own call — which is what makes a busy run readable, since an
+  // iteration issuing three detectors used to draw all three at once. A reasoning
+  // card owns nothing and shows everything flagged so far, the state the agent was
+  // reasoning about.
+  const C = D.cards;
+  const stepIdx = C.map((c) => c.idx);
+  const stepCtx = C.map((c) => c.ctx);
+  const priorIdx = C.map((c) => c.prior);
 
   // Two visual channels, deliberately kept apart:
   //   WHAT IS TRUE  -> solid fill, one colour per §6 anomaly type (D.truth_colors)
@@ -1207,53 +1245,57 @@ _TEMPLATE = r"""<!doctype html>
   // that iteration, so the whole run is navigable from the plot as well.
   function drawTimeline() {
     // Height scales with the number of iterations, or the row labels collide.
+    // One row per TOOL card. Reasoning cards flag nothing, so giving them a row
+    // would be a blank lane between every pair of detectors.
+    const rows = C.map((c, k) => ({ c, k })).filter((r) => r.c.idx.length);
     $("timeline").style.height =
-      Math.max(110, 17 * D.steps.length + 46) + "px";
+      Math.max(110, 17 * Math.max(rows.length, 1) + 46) + "px";
     const traces = [];
-    D.steps.forEach((s, k) => {
-      const idx = stepIdx[k];
-      if (!idx.length) return;
+    rows.forEach((r, lane) => {
+      const idx = r.c.idx;
       traces.push({
         type: "scattergl", mode: "markers", showlegend: false,
-        x: idx.map((i) => at(i)), y: idx.map(() => k),
+        x: idx.map((i) => at(i)), y: idx.map(() => lane),
         marker: {
           size: 6, symbol: "line-ns-open", line: { width: 1.5 },
-          color: k === sel ? FLAG_NOW : "#cbd5e1",
+          color: r.k === sel ? FLAG_NOW : "#cbd5e1",
         },
-        name: "step " + s.i,
-        hovertemplate: "step " + s.i + "<br>%{x}<extra></extra>",
+        name: r.c.label,
+        hovertemplate: r.c.label + " (step " + r.c.step + ")<br>%{x}<extra></extra>",
       });
     });
+    const laneLabels = rows.map((r) => r.c.label);
     Plotly.react($("timeline"), traces, {
       margin: { l: 52, r: 12, t: 6, b: 34 },
       xaxis: { type: "date", gridcolor: "#f1f5f9" },
       yaxis: {
-        title: { text: "iteration" }, autorange: "reversed",
-        dtick: 1, gridcolor: "#f1f5f9",
+        title: { text: "" }, autorange: "reversed",
+        tickmode: "array",
+        tickvals: laneLabels.map((_, i) => i),
+        ticktext: laneLabels,
+        tickfont: { size: 9 },
+        gridcolor: "#f1f5f9",
       },
       plot_bgcolor: "#fff", paper_bgcolor: "#fff", hovermode: "closest",
     }, { responsive: true, displaylogo: false });
   }
 
   // ---------------------------------------------------------------- panels
-  function labelFor(s) {
-    if (!s.calls.length) return s.stop_reason === "tool_use" ? "(no tool call)" : "final answer";
-    return s.calls.map((c) => c.name).join(", ");
-  }
-
   function buildList() {
     const box = $("steps");
     box.innerHTML = "";
-    D.steps.forEach((s, k) => {
+    C.forEach((c, k) => {
       const row = document.createElement("div");
-      row.className = "step";
+      row.className = "step" + (c.kind === "reasoning" ? " reasoning" : "");
       row.dataset.k = String(k);
-      const err = s.calls.some((c) => c.is_error);
-      const kind = s.calls.length ? s.calls[0].kind : "utility";
-      const n = stepIdx[k].length;
+      const err = c.kind === "tool" && c.call.is_error;
+      const kind = c.kind === "reasoning" ? "reasoning"
+                 : (err ? "err" : c.call.kind);
+      const n = c.idx.length;
       row.innerHTML =
-        '<span class="n">' + s.i + '</span>' +
-        '<span class="name ' + (err ? "err" : kind) + '">' + labelFor(s) + '</span>' +
+        '<span class="n">' + (c.kind === "reasoning" ? "" : c.step) + '</span>' +
+        '<span class="name ' + kind + '">'
+        + (c.kind === "reasoning" ? "reasoning" : c.label) + '</span>' +
         '<span class="cnt">' + (n ? n.toLocaleString() : "") + '</span>';
       row.addEventListener("click", () => select(k));
       box.appendChild(row);
@@ -1299,34 +1341,43 @@ _TEMPLATE = r"""<!doctype html>
   }
 
   function renderPanels() {
-    const s = D.steps[sel];
-    $("thought").textContent = s.text || "";
-    // Hidden entirely when the run didn't request thinking, so an absent trace
-    // never looks like an empty one.
-    $("thinking-wrap").hidden = !s.thinking;
-    $("thinking").textContent = s.thinking || "";
-
+    const c = C[sel];
     const box = $("calls");
     box.innerHTML = "";
 
-    if (!s.calls.length) {
-      $("call-head").textContent = "No tool call";
+    if (c.kind === "reasoning") {
+      // The reasoning card IS the prose panel; nothing is shown in the tool slot.
+      $("thought").textContent = c.text || "";
+      $("thinking-wrap").hidden = !c.thinking;
+      $("thinking").textContent = c.thinking || "";
+      $("call-head").textContent = "What the agent was looking at";
       const p = document.createElement("p");
       p.className = "msg";
-      p.textContent = "stop reason: " + (s.stop_reason || "—");
+      p.textContent = c.prior.length
+        ? c.prior.length.toLocaleString() + " row(s) flagged so far, drawn in grey. "
+          + "This card owns no flags of its own — it is the agent reading the "
+          + "results above it."
+        : "Nothing flagged yet.";
       box.appendChild(p);
+      if (c.stop_reason && c.stop_reason !== "tool_use") {
+        const q = document.createElement("p");
+        q.className = "msg";
+        q.textContent = "stop reason: " + c.stop_reason;
+        box.appendChild(q);
+      }
       return;
     }
 
-    // A turn may emit several tool_use blocks, so every call is rendered.
-    $("call-head").textContent =
-      s.calls.length > 1 ? s.calls.length + " tool calls" : "Tool call";
-    const before = new Set(priorIdx[sel]);
-    s.calls.forEach((c) => box.appendChild(renderCall(c, before)));
+    // A tool card shows only its OWN call, which is the whole point of the split.
+    $("thought").textContent = "";
+    $("thinking-wrap").hidden = true;
+    $("thinking").textContent = "";
+    $("call-head").textContent = "Tool call · step " + c.step;
+    box.appendChild(renderCall(c.call, new Set(c.prior)));
   }
 
   function select(k) {
-    sel = Math.max(0, Math.min(D.steps.length - 1, k));
+    sel = Math.max(0, Math.min(C.length - 1, k));
     document.querySelectorAll(".step").forEach((el) => {
       el.classList.toggle("sel", Number(el.dataset.k) === sel);
     });
@@ -1388,7 +1439,7 @@ _TEMPLATE = r"""<!doctype html>
   // ---------------------------------------------------------------- init
   $("title").textContent = D.log;
   const bits = [D.series, D.model || "model n/a", D.prompt_version || "prompt n/a",
-                D.steps.length + " iterations"];
+                D.steps.length + " iterations", C.length + " cards"];
   $("sub").textContent = bits.join(" · ");
   const tok = D.steps.reduce((a, s) => {
     const u = s.usage || {};

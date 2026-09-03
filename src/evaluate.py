@@ -147,6 +147,13 @@ class ImputationScore:
     baseline_rmse: float
     baseline_mae: float
     n_imputed: int
+    # RMSE alone REWARDS NOT FILLING: it is computed only over rows the run actually
+    # filled, so declining the hard gaps improves it. Measured on 01467200_l1's injected
+    # gaps, filling the shortest event only (7% of rows) scores 0.698 while filling every
+    # one scores 1.659 — the "better" number is the one that repaired almost nothing.
+    # Coverage is reported beside it so that trade is visible instead of silent.
+    n_gap_rows: int
+    coverage: float
 
 
 # --------------------------------------------------------------------------- inputs
@@ -545,6 +552,8 @@ def score_imputation(
         baseline_rmse=float(mean_squared_error(y_true_v, base_pred_v)) ** 0.5,
         baseline_mae=float(mean_absolute_error(y_true_v, base_pred_v)),
         n_imputed=int(valid.sum()),
+        n_gap_rows=int(mask.sum()),
+        coverage=float(valid.sum() / mask.sum()) if mask.sum() else 0.0,
     )
 
 
@@ -574,7 +583,10 @@ def format_imputation(score: ImputationScore | None) -> str:
     lines = [
         "Imputation Error (vs True Value)",
         "-" * 45,
-        f"Rows imputed   : {score.n_imputed:>6,}",
+        f"Rows imputed   : {score.n_imputed:>6,} of {score.n_gap_rows:,} gap rows "
+        f"({score.coverage:.0%} coverage)",
+        "  RMSE is scored ONLY on the rows that were filled, so a run that fills less",
+        "  scores better. Read it together with coverage, never alone.",
         "",
         f"               {'Agent':>10} {'Linear Base':>14}",
         f"RMSE           : {score.rmse:>10.3f} {score.baseline_rmse:>14.3f}",

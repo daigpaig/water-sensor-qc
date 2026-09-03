@@ -47,6 +47,30 @@ PRECIP_STATIONS: dict[str, list[dict]] = {
         {"site": "01473169", "name": "Valley Creek at Valley Forge PA",
          "km": 31.1, "note": "full window, 15-min, 100% approved"},
     ],
+    # Roanoke is the strong case: several independent 5-min met stations inside
+    # 11 km, so a rain signal can be CORROBORATED across buckets rather than
+    # trusted from one. All three verified over 2023-07..2025-07 at >=99.5%
+    # complete, 100% approved (scratchpad/verify_precip_new_gauges.py).
+    "02054550": [
+        {"site": "371520080015100", "name": "MET STN Hidden Valley at Roanoke VA",
+         "km": 7.0, "note": "full window, 5-min, 99.8% complete, 100% approved"},
+        {"site": "371824080002600", "name": "MET STN along Rt 117 at Roanoke VA",
+         "km": 9.2, "note": "full window, 5-min, 99.5% complete, 100% approved"},
+        {"site": "371518079591700", "name": "MET STN Shrine Hill Park at Roanoke VA",
+         "km": 10.7, "note": "full window, 5-min, 99.9% complete, 100% approved"},
+    ],
+    # Fox R: the two nearest are 15-min tipping buckets that report EXTRA rows
+    # during a storm (measured 127% and 143% of their modal-step expectation),
+    # so their cadence is event-driven, not regular. 04085108 is further out but
+    # is a true 5-min series matching the turbidity step -- pulled for that.
+    "040851385": [
+        {"site": "04085078", "name": "Dutchman Creek at Hansen Rd Ashwaubenon WI",
+         "km": 7.9, "note": "closest; 15-min modal, event-driven, 100% approved"},
+        {"site": "04072150", "name": "Duck Creek near Howard WI",
+         "km": 9.5, "note": "15-min modal, event-driven, 100% approved"},
+        {"site": "04085108", "name": "East River at CTH ZZ nr Greenleaf WI",
+         "km": 18.6, "note": "full window, 5-min, 98.7% complete, 100% approved"},
+    ],
 }
 
 
@@ -72,6 +96,39 @@ def fetch(site: str, start: str, end: str) -> pd.DataFrame | None:
         "precip_in": pd.to_numeric(frame[col], errors="coerce").to_numpy(),
     })
     return out.dropna().sort_values("datetime").reset_index(drop=True)
+
+
+def _distance_note(entries: list[dict]) -> str:
+    """The §7.7 caveat, sized to THIS gauge's actual stations.
+
+    This note was a hardcoded sentence naming 31.1 km -- 01467200's separation,
+    written when 01467200 was the only gauge pulled -- and it was then stamped
+    into every other gauge's manifest verbatim. That is not a cosmetic error:
+    distance is precisely what calibrates how much weight "no rain recorded"
+    carries, so a note claiming 31.1 km on Roanoke (nearest bucket 7.0 km) tells
+    a reader to discount evidence that is in fact fairly strong, and the manifest
+    is the one place either the tool or the audit page can learn it from.
+    """
+    if not entries:
+        return "No precipitation stations were pulled for this gauge."
+    km = min(float(e["km"]) for e in entries)
+    n = len(entries)
+    corroboration = (
+        f" {n} stations were pulled, so a rain signal can be corroborated across "
+        f"buckets rather than trusted from one -- where they disagree, that "
+        f"disagreement is itself the evidence." if n > 1 else
+        " Only one station was pulled, so nothing here can be corroborated."
+    )
+    if km <= 10:
+        strength = (f"The nearest station is {km:.1f} km away, close enough that its "
+                    f"record is a reasonable proxy for rain over the catchment.")
+    else:
+        strength = (f"The nearest station is {km:.1f} km away, which is far: a summer "
+                    f"convective cell is often 5-15 km across and can rain on the "
+                    f"catchment without reaching this bucket.")
+    return (strength + " ABSENCE of rain is therefore WEAK evidence and presence is "
+            "strong -- the asymmetry holds at any distance, and widens with it." +
+            corroboration)
 
 
 def pull(gauge: str, root: Path = DEFAULT_ROOT,
@@ -109,9 +166,7 @@ def pull(gauge: str, root: Path = DEFAULT_ROOT,
 
     manifest = {"gauge": gauge, "window": [start, end], "param": PRECIP_PARAM,
                 "stations": entries,
-                "note": ("Nearest station with full coverage is 31.1 km away. A summer "
-                         "convective cell can rain on one and not the other, so ABSENCE "
-                         "of rain here is weak evidence; presence is strong.")}
+                "note": _distance_note(entries)}
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return manifest
 

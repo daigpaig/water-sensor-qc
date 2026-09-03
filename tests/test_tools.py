@@ -78,11 +78,11 @@ def test_flag_nan_returns_json():
     json.dumps({k: v for k, v in result.items() if k not in ["qc", "df"]})
 
 
-def test_impute_rolling_returns_json():
+def test_impute_linear_returns_json():
     qc = _toy_qc()
-    result = wrappers.impute_rolling(qc, field="value", window="2h", max_gap="1h")
+    result = wrappers.impute_linear(qc, field="value", max_gap="1h")
 
-    assert result["tool"] == "impute_rolling"
+    assert result["tool"] == "impute_linear"
     assert "n_imputed" in result
     assert "n_gaps_total" in result
     assert "gaps_summary" in result
@@ -409,10 +409,10 @@ def test_an_imputed_row_is_recorded_as_a_gap_the_agent_found():
     rows and record no claim about any of them.
     """
     qc = wrappers.flag_nan(_toy_qc(), field="value")["qc"]
-    qc = wrappers.impute_rolling(qc, field="value", window="6h", func="median")["qc"]
+    qc = wrappers.impute_linear(qc, field="value", max_gap="6h")["qc"]
 
     result = wrappers.export_clean_data(qc)      # no decisions at all
-    filled = [e for e in result["flags"] if "interpolateByRolling" in e["flagged_by"]]
+    filled = [e for e in result["flags"] if "impute_linear" in e["flagged_by"]]
 
     assert filled
     assert all(e["verdict"] == "anomaly" and e["anomaly_type"] == "gap" for e in filled)
@@ -616,7 +616,7 @@ def test_a_broad_keep_span_cannot_relabel_rows_the_imputer_filled(tmp_path):
     rows whose values had been rewritten, and gap F1 fell from 1.0 to 0.
     """
     qc = wrappers.flag_nan(_toy_qc(), field="value")["qc"]
-    qc = wrappers.impute_rolling(qc, field="value", window="6h", func="median")["qc"]
+    qc = wrappers.impute_linear(qc, field="value", max_gap="6h")["qc"]
     idx = qc.data.to_pandas().index
 
     result = wrappers.export_clean_data(
@@ -630,7 +630,7 @@ def test_a_broad_keep_span_cannot_relabel_rows_the_imputer_filled(tmp_path):
     )
 
     entries = json.loads((tmp_path / "toy_l1_flags.json").read_text())
-    filled = [e for e in entries if "interpolateByRolling" in e["flagged_by"]]
+    filled = [e for e in entries if "impute_linear" in e["flagged_by"]]
     assert filled, "the toy gap should have been filled"
     assert all(e["action"] == "impute" for e in filled)
     assert result["n_keep_rewritten_to_impute"] == len(filled)
@@ -640,10 +640,10 @@ def test_a_broad_keep_span_cannot_relabel_rows_the_imputer_filled(tmp_path):
 def test_an_explicit_delete_still_wins_over_the_impute_default(tmp_path):
     """Acting further on a filled value is a real decision; only 'keep' is false."""
     qc = wrappers.flag_nan(_toy_qc(), field="value")["qc"]
-    qc = wrappers.impute_rolling(qc, field="value", window="6h", func="median")["qc"]
+    qc = wrappers.impute_linear(qc, field="value", max_gap="6h")["qc"]
     filled_at = next(
         e["datetime"] for e in wrappers.export_clean_data(qc)["flags"]
-        if "interpolateByRolling" in e["flagged_by"]
+        if "impute_linear" in e["flagged_by"]
     )
 
     result = wrappers.export_clean_data(
@@ -858,7 +858,7 @@ def test_decision_audit_does_not_hide_an_overwritten_anomaly_as_a_success():
     assert set(UNHANDLED_ANOMALY) == {"missed", "overwritten-anomaly", "undetected"}
 
 
-def test_impute_rolling_does_not_overwrite_a_flagged_reading():
+def test_impute_linear_does_not_overwrite_a_flagged_reading():
     """The imputer must fill genuine gaps only, never a row a detector flagged.
 
     SaQC masks rows whose flag is >= `dfilter` before a function runs, so without
@@ -874,7 +874,7 @@ def test_impute_rolling_does_not_overwrite_a_flagged_reading():
 
     qc = saqc.SaQC(pd.DataFrame({"value": values}, index=idx))
     qc = wrappers.flag_range(qc, field="value", min=0, max=50)["qc"]
-    result = wrappers.impute_rolling(qc, field="value", window="3h", func="median")
+    result = wrappers.impute_linear(qc, field="value", max_gap="3h")
 
     got = result["qc"].data.to_pandas()["value"]
     assert got.iloc[20] == 80.0, "the flagged reading was overwritten by the imputer"
@@ -1085,8 +1085,13 @@ def test_deleted_values_are_actually_gone_from_the_cleaned_file():
                     "anomaly_type": "spike", "action": "delete",
                     "reason": "500 NTU single-sample excursion"}])
     row = out["df"].loc[pd.Timestamp(at), "value"]
-    assert pd.isna(row), "a deleted value must not survive into the cleaned file"
     assert out["n_values_deleted"] == 1
+    assert row != 500.0, "the deleted spike must not survive into the cleaned file"
+    # ...and a deleted value IS a gap, so a 1-sample hole is interpolated like any other
+    # (§: one rule, MAX_FILL_GAP). Run N left 218 permanent holes because deletions were
+    # applied after the imputer had already run.
+    assert out["n_rows_refilled_after_delete"] == 1
+    assert abs(float(row) - 5.0) < 0.01, f"expected the interpolated baseline, got {row}"
 
 
 def test_correcting_does_not_shadow_builtins_in_the_wrappers_module():
@@ -1115,3 +1120,316 @@ def test_correcting_does_not_shadow_builtins_in_the_wrappers_module():
         assert name not in vars(w), (
             f"processGeneric leaked `{name}` into the wrappers module globals, "
             "shadowing the builtin for every function in it")
+
+
+# --- one fill rule, applied everywhere (2026-08-25) ---------------------------
+
+def test_a_gap_is_filled_whole_or_not_at_all():
+    """The rolling median filled only where its window found context, so it repaired
+    the ENDS of a gap and left the middle — 23 of 27, 23 of 35 and 23 of 55 rows on
+    three of the four injected gap events on 01467200_l1. That biased the error metric
+    optimistically, because the rows it declined were the ones furthest from any real
+    reading."""
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    idx = pd.date_range("2024-01-01", periods=200, freq="5min")
+    v = pd.Series(np.linspace(10.0, 20.0, 200), index=idx)
+    v.iloc[100:110] = np.nan                       # 50 min — inside the 1h cap
+    out = wrappers.impute_linear(qc=saqc.SaQC(pd.DataFrame({"value": v})))
+    got = out["qc"].data.to_pandas()["value"]
+    assert int(got.iloc[100:110].isna().sum()) == 0, "the gap must be filled whole"
+    # and the fill follows the TREND, which is why it beats a median on a slope:
+    # a centred median would return the local level, not the value on the ramp
+    expected = np.linspace(10.0, 20.0, 200)[105]
+    assert abs(float(got.iloc[105]) - expected) < 0.05
+
+
+def test_a_gap_longer_than_the_cap_is_left_entirely_alone():
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    idx = pd.date_range("2024-01-01", periods=400, freq="5min")
+    v = pd.Series(np.full(400, 10.0), index=idx)
+    v.iloc[100:150] = np.nan                       # 4h10m — well over the 1h cap
+    out = wrappers.impute_linear(qc=saqc.SaQC(pd.DataFrame({"value": v})))
+    got = out["qc"].data.to_pandas()["value"]
+    assert int(got.iloc[100:150].isna().sum()) == 50, "no partial fill at the edges"
+    assert out["n_gaps_skipped_too_long"] == 1
+    assert out["n_imputed"] == 0
+
+
+def test_the_imputer_never_extrapolates_off_the_end_of_the_record():
+    """A NaN run with data on only one side has no two points to interpolate between."""
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    idx = pd.date_range("2024-01-01", periods=100, freq="5min")
+    v = pd.Series(np.full(100, 10.0), index=idx)
+    v.iloc[:6] = np.nan
+    v.iloc[-6:] = np.nan
+    out = wrappers.impute_linear(qc=saqc.SaQC(pd.DataFrame({"value": v})))
+    got = out["qc"].data.to_pandas()["value"]
+    assert int(got.iloc[:6].isna().sum()) == 6
+    assert int(got.iloc[-6:].isna().sum()) == 6
+
+
+def test_a_deleted_plateau_is_too_long_to_refill_and_stays_an_honest_hole():
+    """The same one-hour rule that refills a deleted spike leaves a deleted plateau
+    missing. That is the whole point of having one rule rather than a rule per type."""
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    idx = pd.date_range("2024-01-01", periods=400, freq="5min")
+    v = pd.Series(np.linspace(5.0, 9.0, 400), index=idx)
+    v.iloc[100:150] = 7.0                          # a stuck sensor, 4h10m
+    qc = saqc.SaQC(pd.DataFrame({"value": v})).flagConstants(
+        "value", thresh=0.01, window="1h", min_periods=2)
+    out = wrappers.export_clean_data(
+        qc=qc, precip_audited=None,
+        decisions=[{"start": str(idx[100]), "end": str(idx[149]), "difficulty": "clear",
+                    "verdict": "anomaly", "anomaly_type": "plateau", "action": "delete",
+                    "reason": "sensor stuck at 7.0 for over four hours"}])
+    vals = out["df"]["value"]
+    assert int(vals.iloc[100:150].isna().sum()) == 50, (
+        "a multi-hour deleted plateau must stay NaN, not be interpolated")
+    assert out["n_rows_refilled_after_delete"] == 0
+
+
+def test_one_junk_reading_at_a_gap_edge_does_not_smear_across_the_whole_gap():
+    """§6 notes artifacts cluster at gap EDGES. A line anchored on the two individual
+    readings either side is hostage to both: measured across all nine datasets, one
+    corrupted edge reading took point-anchored linear from RMSE 1.659 to 54.562, while
+    the median anchor moved 1.719 -> 1.720. That robustness is the entire reason the
+    anchors are medians rather than points."""
+    import numpy as np
+    import pandas as pd
+
+    from src.agent_tools.wrappers import _linear_fill
+
+    idx = pd.date_range("2024-01-01", periods=120, freq="5min")
+    true = pd.Series(np.linspace(10.0, 16.0, 120), index=idx)
+    obs = true.copy()
+    obs.iloc[60:66] = np.nan            # 30 min, inside the cap
+    obs.iloc[59] = 900.0                # telemetry junk immediately before the gap
+
+    filled, touched, _ = _linear_fill(obs, "1h")
+    assert len(touched) == 6
+    err = float(np.abs(filled.iloc[60:66] - true.iloc[60:66]).max())
+    assert err < 2.0, f"the junk edge reading leaked into the fill (max err {err:.1f})"
+
+
+def test_spike_scale_sizes_both_detectors_from_the_record_itself():
+    """§7.10. No summary statistic predicts flagUniLOF's thresh: measured across the nine
+    datasets it tracks the CONTAMINATION LEVEL (Spearman +0.78), which a run cannot know,
+    and only +0.57 with the best record statistic on three gauges. So the threshold is
+    read off this record's own |LOF| distribution and lands the wanted candidate count on
+    any gauge — 1.95 on one, 3.45 on another, both ~175 candidates."""
+    import warnings
+
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    from src.agent_tools import context as ctx
+
+    warnings.filterwarnings("ignore")
+    rng = np.random.default_rng(0)
+    idx = pd.date_range("2024-01-01", periods=6000, freq="5min")
+    v = pd.Series(10 + rng.normal(0, 0.4, 6000), index=idx)
+    for i in range(200, 6000, 400):
+        v.iloc[i] += 8.0
+    out = ctx.spike_scale(saqc.SaQC(pd.DataFrame({"value": v})),
+                          lof_budget=60, zscore_budget=40)
+    assert out["lof_n"] == ctx.SPIKE_LOF_N == 10
+    assert out["recommended_lof_thresh"] == ctx.SPIKE_LOF_THRESH
+    # the floor that stops a collapsed windowed MAD making thresh meaningless (§7.1)
+    assert out["zscore_min_residuals"] > 0
+    assert "Run BOTH" in out["message"]
+
+
+def test_the_lof_neighbourhood_default_is_not_the_stale_15_minute_one():
+    """n counts SAMPLES, so n=20 meant 5 hours on the retired 15-min bases and means 100
+    minutes now — a different question about the data. At equal candidate budget n=10 beat
+    n=20 on 8 of 9 datasets and tied on the ninth (median recall 0.688 vs 0.521)."""
+    import inspect
+
+    from src.agent_tools import context as ctx
+    from src.agent_tools import wrappers as w
+
+    assert inspect.signature(w.flag_spike_unilof).parameters["n"].default == ctx.SPIKE_LOF_N
+    assert ctx.SPIKE_LOF_N == 10
+
+
+# --- §7.11 difficulty is DERIVED, and a blanket cannot settle a contested point ------
+
+def _conflicted_fixture():
+    """Ten flagged spikes, one of which has shape and rainfall disagreeing.
+
+    Ten and not one: a span covering the only flagged row is 100% of the run's flags and
+    is recorded as a blanket by definition (BLANKET_SHARE), so a one-row fixture cannot
+    tell "judged on its own" from "swept up".
+    """
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    idx = pd.date_range("2024-01-01", periods=200, freq="5min")
+    v = pd.Series(np.full(200, 5.0), index=idx)
+    for i in range(20, 120, 10):
+        v.iloc[i] = 500.0
+    qc = saqc.SaQC(pd.DataFrame({"value": v})).flagRange("value", min=0, max=100)
+    at = idx[20].strftime("%Y-%m-%dT%H:%M:%S")
+    return qc, idx, at, {at: {"reads_like": "spike", "rained": True, "noise_ratio": 1.4}}
+
+
+def _conflicted_export(**over):
+    """A catch-all over everything, unless the caller narrows it."""
+    qc, idx, at, evidence = _conflicted_fixture()
+    decision = {"start": str(idx[0]), "end": str(idx[-1]), "difficulty": "clear",
+                "verdict": "normal", "action": "keep",
+                "reason": "catch-all for everything flagged in this stretch"}
+    decision.update(over)
+    return wrappers.export_clean_data(
+        qc=qc, precip_audited=None, decisions=[decision], evidence=evidence)
+
+
+def test_a_blanket_cannot_settle_a_point_whose_evidence_disagrees():
+    """Run P swept 21 of the 26 points whose shape and rainfall disagreed into a
+    whole-record catch-all marked 'clear'. One was an injected spike it had itself
+    measured at 8.8 robust sigmas. Conflicted points are decided wrong 69.4% of the
+    time against 16.6% elsewhere — they are the last rows a catch-all should claim."""
+    with pytest.raises(ValueError, match="swept up by a catch-all"):
+        _conflicted_export()
+
+
+def _export_with_own_span(**over):
+    """The conflicted point gets its own narrow span; everything else a catch-all."""
+    qc, idx, at, evidence = _conflicted_fixture()
+    own = {"start": at, "end": at, "difficulty": "clear", "verdict": "anomaly",
+           "anomaly_type": "spike", "action": "delete",
+           "reason": "single-sample excursion at 30 robust sigmas"}
+    own.update(over)
+    rest = {"start": str(idx[0]), "end": str(idx[-1]), "difficulty": "clear",
+            "verdict": "normal", "action": "keep", "reason": "the rest is real water"}
+    return wrappers.export_clean_data(
+        qc=qc, precip_audited=None, decisions=[own, rest], evidence=evidence)
+
+
+def test_a_contested_point_cannot_be_called_clear_cut():
+    """`difficulty` was self-declared and unchecked, so a span covering 1,977 rows
+    including a genuine spike was recorded 'clear'. §10.1's review queue is built from
+    exactly that field."""
+    with pytest.raises(ValueError, match="difficulty='clear' on points whose"):
+        _export_with_own_span()
+
+
+def test_a_contested_point_judged_on_its_own_is_accepted():
+    out = _export_with_own_span(
+        difficulty="judgement-call",
+        deliberation="Shape says artifact: one sample, 30 sigmas, instant recovery. "
+                     "Rain says maybe real, but only 0.19in and none within 3h. Shape wins.")
+    assert out["n_entries"] >= 1
+
+
+def test_the_conflict_rules_are_the_ones_measured():
+    assert wrappers.evidence_conflicts({"reads_like": "spike", "rained": True})
+    assert wrappers.evidence_conflicts({"reads_like": "spike", "noise_ratio": 3.0})
+    assert not wrappers.evidence_conflicts({"reads_like": "spike", "rained": False,
+                                            "noise_ratio": 0.9})
+    assert not wrappers.evidence_conflicts(None)
+
+
+def test_a_library_call_without_measurements_is_not_gated():
+    """`evidence=None` is what a test or library call gets — the check needs measurements
+    to mean anything, and failing without them would break every non-agent caller."""
+    import numpy as np
+    import pandas as pd
+    import saqc
+    idx = pd.date_range("2024-01-01", periods=60, freq="5min")
+    v = pd.Series(np.full(60, 5.0), index=idx); v.iloc[20] = 500.0
+    qc = saqc.SaQC(pd.DataFrame({"value": v})).flagRange("value", min=0, max=100)
+    out = wrappers.export_clean_data(qc=qc, precip_audited=None, evidence=None,
+        decisions=[{"start": str(idx[0]), "end": str(idx[-1]), "difficulty": "clear",
+                    "verdict": "normal", "action": "keep", "reason": "all normal water"}])
+    assert out["n_entries"] >= 1
+
+
+def test_a_missing_row_stays_a_gap_whatever_span_covers_it():
+    """§9 lets a plateau or level_shift span dropouts; §5 says every missing run IS a
+    gap. Run P's six gap 'errors' were all NaN rows retyped by a covering span."""
+    import numpy as np
+    import pandas as pd
+    import saqc
+    idx = pd.date_range("2024-01-01", periods=200, freq="5min")
+    v = pd.Series(np.linspace(5, 9, 200), index=idx)
+    v.iloc[60:100] = 7.0
+    v.iloc[70:73] = np.nan
+    qc = saqc.SaQC(pd.DataFrame({"value": v})).flagConstants(
+        "value", thresh=0.01, window="1h", min_periods=2)
+    qc = wrappers.flag_nan(qc, field="value")["qc"]
+    out = wrappers.export_clean_data(qc=qc, precip_audited=None, decisions=[
+        {"start": str(idx[60]), "end": str(idx[99]), "difficulty": "clear",
+         "verdict": "anomaly", "anomaly_type": "plateau", "action": "delete",
+         "reason": "sensor stuck at 7.0 for over three hours"}])
+    types = {e["datetime"]: e["anomaly_type"] for e in out["flags"]}
+    for i in (70, 71, 72):
+        k = idx[i].strftime("%Y-%m-%dT%H:%M:%S")
+        assert types[k] == "gap", f"{k} was retyped to {types[k]}"
+    assert out["n_missing_rows_retyped_to_gap"] == 3
+
+
+def test_the_candidate_count_tracks_contamination_rather_than_a_quota():
+    """The threshold is ABSOLUTE, so a record with few anomalies must yield few
+    candidates. The quota it replaced emitted ~175 on every record whatever it held:
+    measured over 18 datasets its count correlated -0.29 with the number of injected
+    spikes, against +0.72 for this rule, and on a gauge with 21 real spikes it produced
+    168 candidates and capped precision at 0.13 before any judgement was made."""
+    import warnings
+
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    from src.agent_tools import context as ctx
+
+    warnings.filterwarnings("ignore")
+    rng = np.random.default_rng(0)
+    idx = pd.date_range("2024-01-01", periods=6000, freq="5min")
+
+    def scale_for(every):
+        v = pd.Series(10 + rng.normal(0, 0.4, 6000), index=idx)
+        for i in range(200, 6000, every):
+            v.iloc[i] += 9.0
+        return ctx.spike_scale(saqc.SaQC(pd.DataFrame({"value": v})))
+
+    sparse, dense = scale_for(900), scale_for(120)
+    assert sparse["recommended_lof_thresh"] == dense["recommended_lof_thresh"], \
+        "the THRESHOLD is what should stay put between records"
+    assert dense["lof_candidates_at_thresh"] > sparse["lof_candidates_at_thresh"], \
+        "the COUNT is what should move with contamination"
+
+
+def test_the_budget_survives_only_as_a_ceiling_and_says_when_it_binds():
+    import warnings
+
+    import numpy as np
+    import pandas as pd
+    import saqc
+
+    from src.agent_tools import context as ctx
+
+    warnings.filterwarnings("ignore")
+    rng = np.random.default_rng(1)
+    idx = pd.date_range("2024-01-01", periods=4000, freq="5min")
+    v = pd.Series(10 + rng.normal(0, 0.4, 4000), index=idx)
+    for i in range(50, 4000, 6):
+        v.iloc[i] += 9.0
+    out = ctx.spike_scale(saqc.SaQC(pd.DataFrame({"value": v})), lof_budget=40)
+    assert out["lof_thresh_capped"] is True
+    assert out["lof_candidates_at_thresh"] <= 60
+    assert "ceiling" in out["message"]
