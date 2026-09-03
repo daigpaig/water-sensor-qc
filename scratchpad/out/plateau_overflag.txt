@@ -1,0 +1,12 @@
+/Users/daigomoriwake/Documents/ds_personal_projects/water-sensor-qc/scratchpad/probe_plateau_overflag.py:26: Pandas4Warning: 'd' is deprecated and will be removed in a future version. Please use 'D' instead of 'd'.
+  lo = truth_all.min() - pd.Timedelta("7d")
+/Users/daigomoriwake/Documents/ds_personal_projects/water-sensor-qc/scratchpad/probe_plateau_overflag.py:27: Pandas4Warning: 'd' is deprecated and will be removed in a future version. Please use 'D' instead of 'd'.
+  hi = truth_all.min() + pd.Timedelta("60d")
+record: 19,297 rows, robust_sigma 2.67 FNU, 113 labelled plateau rows
+
+  min_jump   flagged  % of record  true plateau found
+      None       118        0.6%           0 / 113
+       0.5       333        1.7%           0 / 113
+       1.0       176        0.9%           0 / 113
+       2.0       118        0.6%           0 / 113
+       5.0       118        0.6%           0 / 113

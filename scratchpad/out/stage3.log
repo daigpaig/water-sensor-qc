@@ -1,0 +1,123 @@
+Geopandas not installed. Geometries will be flattened into pandas DataFrames.
+[1/60] 01651770 HICKEY RUN AT NATIONAL ARBORETUM AT WASHINGTON, DC
+   approved_pct=100.0 | dt_min=2.0 | grid_complete_pct=99.1 | median_fnu=6.8 | base_spike_pct=0.624
+[2/60] 01651800 WATTS BRANCH AT WASHINGTON, DC
+   approved_pct=100.0 | dt_min=2.0 | grid_complete_pct=94.9 | median_fnu=6.8 | base_spike_pct=0.328
+[3/60] 01304650 SHELTER ISLAND SOUND AT SHELTER ISLAND NY
+   approved_pct=77.6 | dt_min=6.0 | grid_complete_pct=83.6 | median_fnu=2.8 | base_spike_pct=1.111
+[4/60] 444306122144600 DETROIT LAKE AT LOG BOOM BEHIND DETROIT DAM, OR
+   approved_pct=30.9 | dt_min=60.0 | grid_complete_pct=51.2 | median_fnu=0.8 | base_spike_pct=2.056
+[5/60] 01649190 PAINT BRANCH NEAR COLLEGE PARK, MD
+   approved_pct=50.6 | dt_min=5.0 | grid_complete_pct=47.4 | median_fnu=1.1 | base_spike_pct=1.222
+[6/60] 0164579522 THE GLADE NEAR HOWLAND DRIVE AT RESTON, VA
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=98.8 | median_fnu=2.4 | base_spike_pct=0.381
+[7/60] 01648010 Rock Creek at Joyce Rd Washington, DC
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=97.5 | median_fnu=3.8 | base_spike_pct=0.378
+[8/60] 02054550 ROANOKE RIVER AT RTS 639/760 AT SALEM, VA
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=96.0 | median_fnu=1.9 | base_spike_pct=0.307
+[9/60] 01467200 Delaware River at Penn's Landing, Philadelphia, PA
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=96.6 | median_fnu=6.5 | base_spike_pct=0.101
+[10/60] 14246900 COLUMBIA RIVER AT PORT WESTWARD, NEAR QUINCY, OR
+   approved_pct=29.3 | dt_min=5.0 | grid_complete_pct=99.9 | median_fnu=3.5 | base_spike_pct=0.031
+[11/60] 073625897 Lake Winona Raw Water Intake Pipe near Reform, AR
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=87.1 | median_fnu=1.5 | base_spike_pct=0.002
+[12/60] 072632996 Lk Maumelle Raw Water Intake nr Natural Steps,AR
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=98.4 | median_fnu=2.8 | base_spike_pct=0.034
+[13/60] 16247100 Manoa-Palolo Drainage Canal at Moiliili, Oahu, HI
+   approved_pct=0.0
+[14/60] 16249000 Waimanalo Str at Waimanalo, Oahu, HI
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=91.1 | median_fnu=6.0 | base_spike_pct=0.272
+[15/60] 16265000 Kawa Str at Kaneohe, Oahu, HI
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=82.7 | median_fnu=3.0 | base_spike_pct=0.367
+[16/60] 05406469 BREWERY CREEK-UPSTREAM SITE-AT CROSS PLAINS, WI
+   approved_pct=0.0
+[17/60] 03197937 ELK RIVER AB ELK TWOMILE CREEK AT CHARLESTON, WV
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=98.2 | median_fnu=5.4 | base_spike_pct=0.364
+[18/60] 03197950 ELK RIVER AT CHARLESTON, WV
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=96.6 | median_fnu=6.8 | base_spike_pct=0.386
+[19/60] 01651730 BEAVERDAM CREEK NEAR CHEVERLY, MD
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=94.3 | median_fnu=9.0 | base_spike_pct=0.839
+[20/60] 01649500 NORTHEAST BRANCH ANACOSTIA RIVER AT RIVERDALE, MD
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=96.1 | median_fnu=4.3 | base_spike_pct=0.749
+[21/60] 05406479 BLACK EARTH CK NR TREATMENT PLNT @ CROSS PLAINS,WI
+   approved_pct=0.0
+[22/60] 16274100 Kaneohe Str blw Kamehameha Hwy, Oahu, HI
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=84.8 | median_fnu=10.0 | base_spike_pct=0.311
+[23/60] 16238500 Waihi Stream at Honolulu, Oahu, HI
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=95.0 | median_fnu=3.3 | base_spike_pct=0.314
+[24/60] 16238000 Makiki Stream at King St. bridge, Oahu, HI
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=89.2 | median_fnu=2.0 | base_spike_pct=1.01
+[25/60] 16210500 Kaukonahua Str at Waialua, Oahu, HI
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=85.4 | median_fnu=11.0 | base_spike_pct=0.059
+[26/60] 12117500 CEDAR RIVER NEAR LANDSBURG, WA
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=62.6 | median_fnu=0.7 | base_spike_pct=1.355
+[27/60] 0204289131 STORM DRAIN AT DAISY DRIVE NEAR PORTSMOUTH, VA
+   approved_pct=46.8 | dt_min=5.0 | grid_complete_pct=70.1 | median_fnu=5.6 | base_spike_pct=1.493
+[28/60] 0204289402 STORM DRAIN AT CRANEYBROOK LANE AT EDGEFIELD, VA
+   approved_pct=53.8 | dt_min=5.0 | grid_complete_pct=92.4 | median_fnu=3.5 | base_spike_pct=1.636
+[29/60] 01581752 PLUMTREE RUN NEAR BEL AIR, MD
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=97.5 | median_fnu=0.5 | base_spike_pct=0.395
+[30/60] 05406457 BLACK EARTH CREEK NR BREWERY RD AT CROSS PLAINS,WI
+   approved_pct=0.0
+[31/60] 16213000 Waikele Str at Waipahu, Oahu, HI
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=92.8 | median_fnu=3.6 | base_spike_pct=0.24
+[32/60] 16244000 Pukele Stream near Honolulu, Oahu, HI
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=89.6 | median_fnu=1.0 | base_spike_pct=0.16
+[33/60] 14144700 COLUMBIA RIVER AT VANCOUVER, WA
+   approved_pct=68.0 | dt_min=5.0 | grid_complete_pct=96.8 | median_fnu=3.0 | base_spike_pct=0.148
+[34/60] 01651003 NORTHWEST BRANCH ANACOSTIA RIVER AT BRENTWOOD, MD
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=94.0 | median_fnu=3.6 | base_spike_pct=0.706
+[35/60] 0204289989 STORM DRAIN AT SHEPPARD AVENUE NEAR NORFOLK, VA
+   approved_pct=47.5 | dt_min=5.0 | grid_complete_pct=69.4 | median_fnu=4.7 | base_spike_pct=1.701
+[36/60] 0204279294 STORM DRAIN AT LAKEWOOD PK DR NR NEWPORT NEWS, VA
+   approved_pct=53.7 | dt_min=5.0 | grid_complete_pct=91.3 | median_fnu=0.1 | base_spike_pct=1.856
+[37/60] 0204279245 STORM DRAIN AT RIVERS RDG CIR NR NEWPORT NEWS, VA
+   approved_pct=50.2 | dt_min=5.0 | grid_complete_pct=74.7 | median_fnu=3.2 | base_spike_pct=1.581
+[38/60] 393259107194801 COLORADO R ABV ROARING FORK R AT GLENWOOD SPGS, CO
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=45.4 | median_fnu=6.3 | base_spike_pct=1.081
+[39/60] 01589290 SCOTTS LEVEL BRANCH AT ROCKDALE, MD
+   approved_pct=91.3 | dt_min=5.0 | grid_complete_pct=90.4 | median_fnu=2.8 | base_spike_pct=0.908
+[40/60] 01135100 POPE BROOK TRIBUTARY (W-9), NR NORTH DANVILLE, VT
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=60.4 | median_fnu=3.0 | base_spike_pct=1.006
+[41/60] 14243000 COWLITZ RIVER AT CASTLE ROCK, WA
+   approved_pct=20.7 | dt_min=5.0 | grid_complete_pct=64.7 | median_fnu=3.6 | base_spike_pct=0.641
+[42/60] 10349700 WHITES CK NR STEAMBOAT, NV
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=92.8 | median_fnu=3.8 | base_spike_pct=0.16
+[43/60] 16226200 N. Halawa Str nr Honolulu, Oahu, HI
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=12.4 | median_fnu=6.0 | base_spike_pct=2.248
+[44/60] 0164578734 SNAKEDEN BRANCH ABOVE LAKE AUDUBON AT RESTON, VA
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=92.4 | median_fnu=1.5 | base_spike_pct=1.172
+[45/60] 040851385 FOX RIVER AT OIL TANK DEPOT AT GREEN BAY, WI
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=95.4 | median_fnu=11.3 | base_spike_pct=0.411
+[46/60] 01362342 HOLLOW TREE BROOK AT LANESVILLE NY
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=14.0 | median_fnu=0.3 | base_spike_pct=1.097
+[47/60] 10348000 TRUCKEE RV AT RENO, NV
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=78.2 | median_fnu=5.1 | base_spike_pct=0.397
+[48/60] 01585075 FOSTER BRANCH NEAR JOPPATOWNE, MD
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=98.8 | median_fnu=11.6 | base_spike_pct=0.371
+[49/60] 01579550 SUSQUEHANNA RIVER NEAR DARLINGTON, MD
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=97.7 | median_fnu=6.4 | base_spike_pct=0.367
+[50/60] 0204309906 CONVEYANCE CHAN AT RAMSGATE LN NR GREAT BRIDGE, VA
+   approved_pct=50.4 | dt_min=5.0 | grid_complete_pct=75.1 | median_fnu=5.3 | base_spike_pct=1.03
+[51/60] 0204306533 STORM DRAIN AT LUDLOW DRIVE NEAR KEMPSVILLE, VA
+   approved_pct=49.9 | dt_min=5.0 | grid_complete_pct=78.1 | median_fnu=4.7 | base_spike_pct=0.82
+[52/60] 0204295063 STORM DRAIN AT LINDSLEY DR NEAR VIRGINIA BEACH, VA
+   approved_pct=53.7 | dt_min=5.0 | grid_complete_pct=91.2 | median_fnu=0.0 | base_spike_pct=1.176
+[53/60] 01650800 SLIGO CREEK NEAR TAKOMA PARK, MD
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=99.0 | median_fnu=1.5 | base_spike_pct=0.474
+[54/60] 0204288786 STORM DRAIN AT PROFESSIONAL PL NEAR CHESAPEAKE, VA
+   approved_pct=59.9 | dt_min=5.0 | grid_complete_pct=86.3 | median_fnu=22.5 | base_spike_pct=1.514
+[55/60] 01651827 Anacostia River nr Buzzard Point at Washington, DC
+   approved_pct=100.0 | dt_min=15.0 | grid_complete_pct=98.6 | median_fnu=6.0 | base_spike_pct=0.225
+[56/60] 01651760 ANACOSTIA RIVER AT KENILWORTH AT WASHINGTON, DC
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=96.5 | median_fnu=13.9 | base_spike_pct=0.102
+[57/60] 01594441 Patuxent R at Gov Bridge Natural Area nr Bowie MD
+   approved_pct=100.0 | dt_min=5.0 | grid_complete_pct=96.5 | median_fnu=10.6 | base_spike_pct=0.559
+[58/60] 03447687 French Broad R nr Fletcher, NC [INCUMBENT 15-min]
+   approved_pct=100.0 | dt_min=15.0 | grid_complete_pct=95.4 | median_fnu=8.3 | base_spike_pct=0.407
+[59/60] 02198840 Savannah R at I-95 nr Port Wentworth, GA [INCUMBENT 15-min]
+   approved_pct=100.0 | dt_min=15.0 | grid_complete_pct=98.6 | median_fnu=13.2 | base_spike_pct=0.12
+[60/60] 08041770 LNVA Canal at Beaumont, TX [INCUMBENT 15-min]
+   approved_pct=100.0 | dt_min=15.0 | grid_complete_pct=99.4 | median_fnu=28.4 | base_spike_pct=0.056
+
+-> scratchpad/out/screen_5min_quality.csv

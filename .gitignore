@@ -6,17 +6,34 @@
 venv/
 env/
 
-# Raw downloaded data (USGS/ECCC) and API logs are gitignored
-# (ignore contents but allow the .gitkeep below to be re-included)
-data/raw/*
+# Raw downloaded data (USGS/ECCC) and API logs are gitignored.
+# data/raw/ is partitioned by approval status: approved/ holds the clean bases
+# src.datasets.inject globs, provisional/ and expert_flagged/ are audit scratch.
+# (ignore contents but allow the .gitkeep files below to be re-included)
+data/raw/**
+# Provisional-vs-approved comparison pulls (regenerate: `python -m src.datasets.pull_comparison`)
+data/comparison/**
+# Nearby rainfall (regenerate: `python -m src.datasets.pull_precip <gauge>`) — §7.7
+data/precip/**
+# Legacy 15-min raw pulls, retired when the project moved to 5-min bases.
+# Same rule as data/raw/: the CSVs are regenerable from NWIS, the injected
+# datasets beside them are hand-generated ground truth and stay tracked.
+data/legacy_15min/raw/**
 logs/*
 
 # Keep the gitignored directories in the tree
 !data/raw/.gitkeep
+!data/raw/approved/
+!data/raw/approved/.gitkeep
+!data/comparison/README.md
 !logs/.gitkeep
 
-# Generated review artifacts (regenerate via `python -m src.tools.visualize`)
+# Generated review artifacts (regenerate via `python -m src.workbench.visualize`)
 figures/
+
+# Proposed candidates are regenerable from the series (`src.workbench.review detect`).
+# The reviewed *labels* are hand-made ground truth — those stay in the repo.
+data/review/*_candidates.csv
 
 # Python
 __pycache__/
@@ -30,3 +47,22 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# Agent run artefacts (cleaned CSV + report). Regenerable by re-running the
+# agent; the JSONL log they came from is gitignored above.
+data/agent_runs/
+
+# 5-min gauge screening scratch (scratchpad/screen_5min_*.py). The national
+# series-catalog dump (~230MB) and the per-site probe cache (~255MB) are
+# regenerable from NWIS; the small screening RESULT tables beside them are not
+# ignored, since they are the evidence for the §9 gauge choice.
+scratchpad/out/screen_5min_catalog.csv
+scratchpad/out/probe5/
+
+# Agent RUN artefacts parked in the scratchpad while comparing runs (runT/U/V).
+# Same rule as data/agent_runs/ above: regenerable by re-running the agent, and
+# the flag log + cleaned CSV are tens of MB. The small tuning RESULT tables
+# beside them (*.txt, the tune_*/screen_* CSVs) are evidence and stay tracked.
+scratchpad/out/run*_flags.json
+scratchpad/out/run*_clean.csv
+scratchpad/out/*.log

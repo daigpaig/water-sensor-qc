@@ -9,7 +9,7 @@ Also enforces the CSV column contracts used across Phase 1:
 
   - series  (raw / clean / injected): ``datetime``, ``value``  (+ optional extras)
   - labels  (injected ``*_labels.csv``): ``datetime``, ``is_anomaly``,
-    ``anomaly_type``, ``true_value``
+    ``anomaly_type``, ``true_value``, ``source``
 
 CLI
 ---
@@ -21,7 +21,7 @@ Usage from Python
 -----------------
     from src.inspect_data import load_series, summarise_series, validate_series_frame
 
-    df = load_series("data/raw/02336000_turbidity_63680.csv")
+    df = load_series("data/raw/approved/02054550_turbidity_63680.csv")
     summary = summarise_series(df)
 """
 from __future__ import annotations
@@ -33,7 +33,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
+
+# MAD -> standard-deviation-comparable scale, the same constant context.py uses.
+MAD_TO_SIGMA = 1.4826
 
 # ---------------------------------------------------------------------------
 # Column contracts (CLAUDE.md §5)
@@ -47,10 +51,15 @@ LABELS_REQUIRED_COLS: tuple[str, ...] = (
     "is_anomaly",
     "anomaly_type",
     "true_value",
+    "source",
 )
 ANOMALY_TYPES: frozenset[str] = frozenset(
-    {"spike", "plateau", "level_shift", "gap", "drift", ""}
+    {"spike", "plateau", "level_shift", "gap", ""}
 )
+# Where an anomaly came from. Natural gaps exist in the "clean" base already and
+# have no recorded true_value, so they count for detection but cannot be scored
+# for imputation error; injected anomalies can be scored for both (see inject.py).
+ANOMALY_SOURCES: frozenset[str] = frozenset({"natural", "injected", ""})
 
 
 class ContractError(ValueError):
@@ -70,6 +79,14 @@ class ColumnStats:
     std: float | None
     n_nan: int
     pct_nan: float
+    # Robust location and spread, alongside mean/std rather than instead of them.
+    # On a storm-driven series the two disagree by more than an order of magnitude
+    # -- 02054550 has std 28.1 FNU against a median of 1.9 and a robust sigma of
+    # 1.3 -- so a parameter scaled from `std` is scaled from a handful of storm
+    # peaks. An agent run sized flag_jumps.thresh that way and flagged 2,865 rows
+    # (§7.6). Anything set in data units should be read off these two.
+    median: float | None = None
+    robust_sigma: float | None = None
 
 
 @dataclass(frozen=True)
@@ -190,8 +207,9 @@ def validate_series_frame(df: pd.DataFrame, *, value_col: str = VALUE_COL) -> pd
 def validate_labels_frame(df: pd.DataFrame) -> pd.DataFrame:
     """Validate / normalise an injected labels frame (CLAUDE.md §5).
 
-    Required columns: ``datetime``, ``is_anomaly``, ``anomaly_type``, ``true_value``.
-    ``anomaly_type`` must be one of the five failure types, or empty.
+    Required columns: ``datetime``, ``is_anomaly``, ``anomaly_type``, ``true_value``,
+    ``source``. ``anomaly_type`` must be one of the five failure types, or empty;
+    ``source`` must be ``natural``/``injected``, or empty on non-anomalous rows.
     """
     if df.empty:
         raise ContractError("labels CSV has zero rows.")
@@ -212,6 +230,15 @@ def validate_labels_frame(df: pd.DataFrame) -> pd.DataFrame:
         )
     out["anomaly_type"] = types
     out["true_value"] = pd.to_numeric(out["true_value"], errors="coerce")
+
+    sources = out["source"].fillna("").astype(str).str.strip()
+    bad_src = sorted({s for s in sources.unique() if s not in ANOMALY_SOURCES})
+    if bad_src:
+        raise ContractError(
+            f"source has unknown value(s) {bad_src}; "
+            f"allowed={sorted(ANOMALY_SOURCES - {''})} or empty."
+        )
+    out["source"] = sources
 
     if not out[DATETIME_COL].is_monotonic_increasing:
         out = out.sort_values(DATETIME_COL)
@@ -326,6 +353,13 @@ def _column_stats(series: pd.Series) -> ColumnStats:
     valid = numeric.dropna()
     if valid.empty:
         return ColumnStats(None, None, None, None, n_nan, pct)
+    median = float(valid.median())
+    # MAD rescaled to be comparable with a standard deviation. Falls back to the
+    # std where the MAD is zero, which happens on a quantised series whose middle
+    # half sits on one value (§7.1) -- a zero here would divide-by-zero downstream.
+    mad = float((valid - median).abs().median()) * MAD_TO_SIGMA
+    if not (np.isfinite(mad) and mad > 0):
+        mad = float(valid.std(ddof=1)) if len(valid) > 1 else 0.0
     return ColumnStats(
         min=float(valid.min()),
         max=float(valid.max()),
@@ -333,6 +367,8 @@ def _column_stats(series: pd.Series) -> ColumnStats:
         std=float(valid.std(ddof=1)) if len(valid) > 1 else 0.0,
         n_nan=n_nan,
         pct_nan=pct,
+        median=median,
+        robust_sigma=mad,
     )
 
 
@@ -412,6 +448,7 @@ def format_summary(summary: SeriesSummary) -> str:
         lines.append(
             f"  {name}: min={stats.min} max={stats.max} "
             f"mean={stats.mean} std={stats.std} "
+            f"median={stats.median} robust_sigma={stats.robust_sigma} "
             f"nan={stats.n_nan} ({stats.pct_nan:.2f}%)"
         )
     return "\n".join(lines)

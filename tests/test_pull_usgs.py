@@ -9,9 +9,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.pull_usgs import (
+from src.datasets.pull_usgs import (
     PullConfig,
     _validate,
+    filter_approved,
     longest_unbroken_run_days,
 )
 
@@ -69,6 +70,26 @@ def test_unit_agnostic_microsecond_resolution() -> None:
     s = _series("2024-01-01", periods=5 * 96 + 1)
     s_us = pd.Series(s.to_numpy(), index=pd.DatetimeIndex(s.index).as_unit("us"))
     assert longest_unbroken_run_days(s_us, pd.Timedelta("3h")) == pytest.approx(5.0, abs=1e-6)
+
+
+def test_filter_approved_keeps_only_A_codes() -> None:
+    # Approved variants (A, "A e", "A, >") stay; provisional/blank/NaN go.
+    df = pd.DataFrame(
+        {
+            "datetime": pd.date_range("2024-01-01", periods=6, freq="15min"),
+            "value": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "qualifier": ["A", "P", "A e", "A, >", "", pd.NA],
+        }
+    )
+    out = filter_approved(df)
+    assert out["value"].tolist() == [1.0, 3.0, 4.0]        # A, "A e", "A, >"
+    assert list(out.index) == [0, 1, 2]                    # reindexed
+
+
+def test_filter_approved_without_qualifier_column_is_identity() -> None:
+    df = pd.DataFrame({"datetime": pd.date_range("2024-01-01", periods=3, freq="h"),
+                       "value": [1.0, 2.0, 3.0]})
+    pd.testing.assert_frame_equal(filter_approved(df), df)
 
 
 def test_validate_rejects_bad_max_gap() -> None:
