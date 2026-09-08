@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 GRID = (0.0, 0.02, 0.05, 0.10, 0.20, 0.40)
 
 rows = []
-for path in sorted(glob.glob("data/injected/*/l*/*_l?.csv")):
+for path in sorted(glob.glob("data/turbidity/injected/*/l*/*_l?.csv")):
     stem = path.rsplit("/", 1)[-1][:-4]
     gauge = stem.split("_")[0]
     v = pd.read_csv(path, parse_dates=["datetime"]).set_index("datetime")["value"]

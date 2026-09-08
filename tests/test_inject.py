@@ -487,11 +487,11 @@ def test_dataset_dir_rejects_an_unparseable_name(tmp_path) -> None:
 
 
 def test_injected_files_recoverability() -> None:
-    """Check that all generated files in data/injected/ are fully recoverable.
+    """Check that all generated files in data/turbidity/injected/ are fully recoverable.
 
     The contract demands that base_series = injected_value where not is_anomaly
     and true_value where is_anomaly. The base is the approved USGS series in
-    data/raw/approved, re-gridded exactly as injection consumed it (via
+    data/turbidity/approved, re-gridded exactly as injection consumed it (via
     ``load_base``).
     """
     import glob
@@ -516,7 +516,7 @@ def test_injected_files_recoverability() -> None:
         labels_path = inj_path.with_name(f"{inj_path.stem}_labels.csv")
         gauge_id = inj_path.stem.split("_")[0]
 
-        # Find matching approved base file in data/raw/approved.
+        # Find matching approved base file in data/turbidity/approved.
         base_files = glob.glob(str(base_dir / f"{gauge_id}_turbidity_*.csv"))
         assert len(base_files) == 1, f"Missing or multiple base files for {gauge_id}"
 

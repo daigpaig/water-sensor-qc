@@ -5,13 +5,13 @@ Approved USGS data has already had fouling/calibration-drift corrections applied
 (qualifier ``P``, not yet through record processing) still carries the
 uncorrected anomalies — fouling spikes, drift, dropouts. This grabs a recent
 window (mostly provisional, since approval lags ~1 year) for a few varied gauges,
-keeps the non-approved rows, and writes them to ``data/raw/provisional/`` (which
-is gitignored via ``data/raw/*`` and is a sibling of ``data/raw/approved/``, the
+keeps the non-approved rows, and writes them to ``data/turbidity/provisional/`` (which
+is gitignored via ``data/turbidity/*`` and is a sibling of ``data/turbidity/approved/``, the
 only directory the injection pipeline globs — so provisional data can never be
 mistaken for a clean base).
 
     python scratchpad/pull_provisional.py
-    python -m src.workbench.visualize data/raw/provisional/*.csv \\
+    python -m src.workbench.visualize data/turbidity/provisional/*.csv \\
         --out figures/provisional_overview.html --mark-spikes --no-open
 """
 from __future__ import annotations
@@ -35,7 +35,7 @@ SITES: dict[str, str] = {
     "02336000": "Chattahoochee R at Atlanta, GA (urban river)",
 }
 START, END = "2025-07-01", "2026-07-01"
-OUTDIR = Path("data/raw/provisional")
+OUTDIR = Path("data/turbidity/provisional")
 
 
 def keep_provisional(tidy: pd.DataFrame) -> pd.DataFrame:

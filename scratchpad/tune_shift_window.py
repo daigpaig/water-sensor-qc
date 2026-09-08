@@ -45,7 +45,7 @@ def main() -> None:
           f"{'row precision':>15}")
     per_thresh = {t: [0, 0, 0, 0, 0] for t in (0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)}
     for gauge, lvl in TUNE:
-        base = f"data/injected/{gauge}/{lvl}/{gauge}_{lvl}"
+        base = f"data/turbidity/injected/{gauge}/{lvl}/{gauge}_{lvl}"
         s = pd.read_csv(f"{base}.csv", parse_dates=["datetime"]).set_index("datetime")["value"]
         kind = pd.read_csv(f"{base}_labels.csv", parse_dates=["datetime"]
                            ).set_index("datetime")["anomaly_type"].fillna("")
@@ -79,7 +79,7 @@ SUM_TRUTH = 0
 if __name__ == "__main__":
     # total labelled level_shift rows across the tuning set, for row recall
     for g, l in TUNE:
-        k = pd.read_csv(f"data/injected/{g}/{l}/{g}_{l}_labels.csv", parse_dates=["datetime"]
+        k = pd.read_csv(f"data/turbidity/injected/{g}/{l}/{g}_{l}_labels.csv", parse_dates=["datetime"]
                         ).set_index("datetime")["anomaly_type"].fillna("")
         SUM_TRUTH += int((k == "level_shift").sum())
     main()

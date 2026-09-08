@@ -42,7 +42,7 @@ def rules(lof: pd.Series, n_rows: int) -> dict:
 
 
 rows = []
-for path in sorted(glob.glob("data/injected/*/l*/*_l?.csv")
+for path in sorted(glob.glob("data/turbidity/injected/*/l*/*_l?.csv")
                    + glob.glob("data/legacy_15min/injected/*/l*/*_l?.csv")):
     stem = path.rsplit("/", 1)[-1][:-4]
     cadence = "15min" if "legacy" in path else "5min"

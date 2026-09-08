@@ -68,18 +68,18 @@ pip install pandas numpy dataretrieval pytest
 ## Pull raw USGS data
 
 No Anthropic API key needed. Downloads **approved-only** turbidity (`63680`) for the default
-3 gauges into `data/raw/approved/` (gitignored). Approved USGS data has already had
+3 gauges into `data/turbidity/approved/` (gitignored). Approved USGS data has already had
 fouling/drift corrections applied (TM 1-D3), so it is clean apart from gaps and serves as
 the injection base directly (CLAUDE.md §9):
 
 ```bash
 python -m src.datasets.pull_usgs --dry-run       # show what would be downloaded
-python -m src.datasets.pull_usgs                 # approved-only CSVs -> data/raw/approved/
-python -m src.datasets.pull_usgs --keep-unapproved  # provisional too -> data/raw/provisional/
+python -m src.datasets.pull_usgs                 # approved-only CSVs -> data/turbidity/approved/
+python -m src.datasets.pull_usgs --keep-unapproved  # provisional too -> data/turbidity/provisional/
 ```
 
-`data/raw/` is partitioned by approval status, and the split matters: **only
-`data/raw/approved/` is globbed as an injection base**, so a provisional pull can never be
+`data/turbidity/` is partitioned by approval status, and the split matters: **only
+`data/turbidity/approved/` is globbed as an injection base**, so a provisional pull can never be
 mistaken for a clean base. `--keep-unapproved` redirects the default output directory
 accordingly; an explicit `--outdir` always wins.
 
@@ -96,17 +96,17 @@ min/max/mean/std).
 
 ```bash
 # Check the series contract (datetime + value; extras like qualifier are kept)
-PYTHONPATH=. python -m src.inspect_data validate data/raw/approved/02054550_turbidity_63680.csv
+PYTHONPATH=. python -m src.inspect_data validate data/turbidity/approved/02054550_turbidity_63680.csv
 
 # Print a human-readable summary
-PYTHONPATH=. python -m src.inspect_data summarise data/raw/approved/02054550_turbidity_63680.csv
+PYTHONPATH=. python -m src.inspect_data summarise data/turbidity/approved/02054550_turbidity_63680.csv
 
 # Same summary as JSON; --reindex turns missing timestamps into NaN rows
-PYTHONPATH=. python -m src.inspect_data summarise data/raw/approved/02054550_turbidity_63680.csv --json
-PYTHONPATH=. python -m src.inspect_data summarise data/raw/approved/02054550_turbidity_63680.csv --reindex
+PYTHONPATH=. python -m src.inspect_data summarise data/turbidity/approved/02054550_turbidity_63680.csv --json
+PYTHONPATH=. python -m src.inspect_data summarise data/turbidity/approved/02054550_turbidity_63680.csv --reindex
 
 # Validate an injected labels file (when those exist)
-PYTHONPATH=. python -m src.inspect_data validate-labels data/injected/<gauge>/l<level>/<name>_labels.csv
+PYTHONPATH=. python -m src.inspect_data validate-labels data/turbidity/injected/<gauge>/l<level>/<name>_labels.csv
 ```
 
 Run the unit tests:
@@ -144,7 +144,7 @@ The agent runs an autonomous ReAct loop on a dataset, deciding which tools to ca
 
 ```bash
 # Run the agent on a dataset (requires ANTHROPIC_API_KEY in .env)
-PYTHONPATH=. python -m src.agent data/injected/02054550/l1/02054550_l1.csv
+PYTHONPATH=. python -m src.agent data/turbidity/injected/02054550/l1/02054550_l1.csv
 
 # View the tests for the agent loop and token tracking
 PYTHONPATH=. pytest tests/test_agent.py -v
@@ -158,16 +158,16 @@ We evaluate the agent's performance by scoring its anomaly detection (F1) and ga
 
 ```bash
 # Score a specific agent run's log against the dataset
-PYTHONPATH=. python -m src.evaluate data/injected/02054550/l1/02054550_l1.csv \
+PYTHONPATH=. python -m src.evaluate data/turbidity/injected/02054550/l1/02054550_l1.csv \
     --log logs/run_20260801_131008.jsonl \
-    --decisions data/injected/02054550/l1/02054550_l1_flags.json \
-    --clean data/injected/02054550/l1/02054550_l1_clean.csv
+    --decisions data/turbidity/injected/02054550/l1/02054550_l1_flags.json \
+    --clean data/turbidity/injected/02054550/l1/02054550_l1_clean.csv
 
 # Run the fixed-pipeline "dumb" SaQC baseline for comparison
-PYTHONPATH=. python -m src.evaluate data/injected/02054550/l1/02054550_l1.csv --baseline
+PYTHONPATH=. python -m src.evaluate data/turbidity/injected/02054550/l1/02054550_l1.csv --baseline
 
 # Run an ablation study (disabling specific tools)
-PYTHONPATH=. python -m src.workbench.ablation data/injected/02054550/l1/02054550_l1.csv \
+PYTHONPATH=. python -m src.workbench.ablation data/turbidity/injected/02054550/l1/02054550_l1.csv \
     --disable flag_spike_unilof impute_rolling
 ```
 

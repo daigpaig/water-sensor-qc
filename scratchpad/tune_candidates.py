@@ -30,7 +30,7 @@ def report(tag: str, mask: np.ndarray, bridge: int) -> None:
 
 
 def main() -> None:
-    for path in sorted(glob.glob("data/raw/approved/*.csv")):
+    for path in sorted(glob.glob("data/turbidity/approved/*.csv")):
         df = reindex_to_grid(load_series(path))
         s = df.set_index(DATETIME_COL)["value"].astype(float)
         level, step = robust_scales(s)

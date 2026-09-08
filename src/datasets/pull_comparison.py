@@ -1,4 +1,4 @@
-"""Pull the same turbidity sensor in BOTH approval states, into ``data/comparison/``.
+"""Pull the same turbidity sensor in BOTH approval states, into ``data/turbidity/comparison/``.
 
 Why this is a *split*, not a *pair*
 -----------------------------------
@@ -38,9 +38,9 @@ completeness on *both* sides. The project's third injection base ``08041770``
 (LNVA Canal, TX) cannot be used here — its record ends 2025-11-19 with zero
 provisional rows.
 
-Output layout (regenerable; gitignored like ``data/raw/``)
+Output layout (regenerable; gitignored like ``data/turbidity/``)
 -----------------------------------------------------------
-``data/comparison/<site>/``
+``data/turbidity/comparison/<site>/``
   ``<site>_turbidity_63680_approved.csv``     datetime, value, qualifier
   ``<site>_turbidity_63680_provisional.csv``  datetime, value, qualifier
   ``<site>_comparison_manifest.json``         boundary, per-side stats, caveats
@@ -70,7 +70,7 @@ from src.datasets.pull_usgs import (
     tidy_frame,
 )
 
-DEFAULT_OUTDIR = Path("data/comparison")
+DEFAULT_OUTDIR = Path("data/turbidity/comparison")
 DEFAULT_START = "2023-07-01"
 # Open-ended: the provisional tail is whatever has not been approved yet, so the
 # end of the window must track "now" rather than a frozen date.

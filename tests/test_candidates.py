@@ -477,7 +477,7 @@ def test_detect_cli_writes_candidates_and_page(
 def test_detect_cli_does_not_write_beside_the_series(
     planted_csv: Path, tmp_path: Path, monkeypatch
 ):
-    """data/raw/approved/ is globbed by name; a stray CSV there breaks lookups."""
+    """data/turbidity/approved/ is globbed by name; a stray CSV there breaks lookups."""
     monkeypatch.chdir(tmp_path)
     before = set(planted_csv.parent.iterdir())
     main(["detect", str(planted_csv), "--out", str(tmp_path / "r.html"), "--no-open"])
@@ -533,7 +533,7 @@ RECALL_TYPES: tuple[str, ...] = (*REVIEW_TYPES, "gap")
 
 
 def _injected_datasets() -> list[Path]:
-    """The nine `data/injected/<gauge>/l<level>/<name>.csv` series, if generated."""
+    """The nine `data/turbidity/injected/<gauge>/l<level>/<name>.csv` series, if generated."""
     return sorted(DEFAULT_OUTDIR.glob("*/l[1-3]/*_l[1-3].csv"))
 
 

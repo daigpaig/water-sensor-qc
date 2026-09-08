@@ -3,10 +3,10 @@ import numpy as np
 import pandas as pd
 import saqc
 
-df = pd.read_csv("data/injected/01467200/l1/01467200_l1.csv", parse_dates=["datetime"])
+df = pd.read_csv("data/turbidity/injected/01467200/l1/01467200_l1.csv", parse_dates=["datetime"])
 s = df.set_index("datetime")["value"]
 qc = saqc.SaQC(pd.DataFrame({"value": s}))
-lab = pd.read_csv("data/injected/01467200/l1/01467200_l1_labels.csv", parse_dates=["datetime"])
+lab = pd.read_csv("data/turbidity/injected/01467200/l1/01467200_l1_labels.csv", parse_dates=["datetime"])
 shift = lab.loc[lab.anomaly_type == "level_shift", "datetime"]
 lo, hi = shift.min(), shift.max()
 

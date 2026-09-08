@@ -1007,7 +1007,7 @@ def test_correcting_a_level_shift_recovers_the_water_under_it():
 
     from src.agent_tools.wrappers import correct_level_shift
 
-    root = Path("data/injected/01467200/l1")
+    root = Path("data/turbidity/injected/01467200/l1")
     if not (root / "01467200_l1.csv").exists():
         pytest.skip("injected dataset not present")
     s_ = pd.read_csv(root / "01467200_l1.csv", parse_dates=["datetime"]

@@ -32,7 +32,7 @@ def thresh_for(qc, v, budget, **kw):
 
 
 rows = []
-for path in sorted(glob.glob("data/injected/*/l*/*_l?.csv")):
+for path in sorted(glob.glob("data/turbidity/injected/*/l*/*_l?.csv")):
     stem = path.rsplit("/", 1)[-1][:-4]
     v = pd.read_csv(path, parse_dates=["datetime"]).set_index("datetime")["value"]
     lab = pd.read_csv(path.replace(".csv", "_labels.csv"),

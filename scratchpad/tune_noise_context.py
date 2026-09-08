@@ -159,7 +159,7 @@ def separation(a: list[dict], b: list[dict], key: str) -> float:
 
 
 def run_one(gauge: str, level: str, half_hours: float) -> tuple[list, list, list]:
-    root = f"data/injected/{gauge}/{level}/{gauge}_{level}"
+    root = f"data/turbidity/injected/{gauge}/{level}/{gauge}_{level}"
     df = load_series(f"{root}.csv")
     labels = pd.read_csv(f"{root}_labels.csv", parse_dates=["datetime"])
     series = df.set_index("datetime")["value"].astype(float).sort_index()

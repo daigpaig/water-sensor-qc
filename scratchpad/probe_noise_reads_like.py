@@ -15,7 +15,7 @@ DATASETS = [("03447687","l1"),("03447687","l2"),("02198840","l2"),("08041770","l
 LIMIT = 250
 
 def run(gauge, level):
-    root = f"data/injected/{gauge}/{level}/{gauge}_{level}"
+    root = f"data/turbidity/injected/{gauge}/{level}/{gauge}_{level}"
     s = load_series(f"{root}.csv").set_index("datetime")["value"].astype(float).sort_index()
     lab = pd.read_csv(f"{root}_labels.csv", parse_dates=["datetime"]).set_index("datetime")
     qc = saqc.SaQC(pd.DataFrame({"value": s})).flagUniLOF("value", n=20, thresh=1.5)

@@ -10,10 +10,10 @@ Implemented in Phase 3 (see CLAUDE.md §12).
 CLI
 ---
     # run the agent on an injected dataset
-    python -m src.agent data/injected/02054550/l2/02054550_l2.csv
+    python -m src.agent data/turbidity/injected/02054550/l2/02054550_l2.csv
 
     # specify an output directory (default: beside the input file)
-    python -m src.agent data/injected/02054550/l2/02054550_l2.csv --output-dir results/
+    python -m src.agent data/turbidity/injected/02054550/l2/02054550_l2.csv --output-dir results/
 """
 
 import argparse

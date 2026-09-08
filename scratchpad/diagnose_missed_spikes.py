@@ -7,9 +7,9 @@ import saqc
 
 warnings.filterwarnings("ignore")
 
-inj = pd.read_csv("data/injected/01467200/l1/01467200_l1.csv",
+inj = pd.read_csv("data/turbidity/injected/01467200/l1/01467200_l1.csv",
                   parse_dates=["datetime"]).set_index("datetime")["value"]
-lab = pd.read_csv("data/injected/01467200/l1/01467200_l1_labels.csv",
+lab = pd.read_csv("data/turbidity/injected/01467200/l1/01467200_l1_labels.csv",
                   parse_dates=["datetime"]).set_index("datetime")
 truth = lab.index[lab.anomaly_type == "spike"]
 at = pd.Timestamp("2024-04-17 08:30:00")

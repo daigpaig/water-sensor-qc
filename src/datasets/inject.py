@@ -4,7 +4,7 @@ Injects the four failure types (spike, plateau, level_shift, gap) into a clean
 base series and records ground-truth labels. Everything is driven by a fixed
 seed, so a given (base, level, seed) always reproduces byte-identical output.
 
-The base series are the **approved** USGS turbidity files in ``data/raw/approved`` (see
+The base series are the **approved** USGS turbidity files in ``data/turbidity/approved`` (see
 ``src.datasets.pull_usgs``): approved records have been through USGS record processing —
 fouling/calibration-drift corrections applied (TM 1-D3) — so they are clean apart
 from gaps (CLAUDE.md §9). There is no separate "clean-segment" carving or by-eye
@@ -55,11 +55,11 @@ must delete a value we know, or its ``true_value`` would be unknown and its
 
 CLI
 ---
-    # Inject all three levels into every approved base in data/raw/approved (the default):
+    # Inject all three levels into every approved base in data/turbidity/approved (the default):
     python -m src.datasets.inject
 
     # One base, one level, custom seed:
-    python -m src.datasets.inject --input data/raw/approved/12340500_turbidity_63680.csv \\
+    python -m src.datasets.inject --input data/turbidity/approved/12340500_turbidity_63680.csv \\
         --levels 2 --seed 7
 
     # See what would be written, without writing it:
@@ -69,7 +69,7 @@ Usage from Python
 -----------------
     from src.datasets.inject import inject_series, load_base
 
-    base = load_base("data/raw/approved/12340500_turbidity_63680.csv")
+    base = load_base("data/turbidity/approved/12340500_turbidity_63680.csv")
     result = inject_series(base, level=2, seed=42, name="11501000_l2")
     result.data      # datetime/value frame with anomalies
     result.labels    # datetime/is_anomaly/anomaly_type/true_value/source
@@ -100,13 +100,13 @@ from src.inspect_data import (
 # Paths + contract vocabulary (CLAUDE.md §5)
 # ---------------------------------------------------------------------------
 # Approved USGS series are the clean bases. Only this subdirectory is globbed —
-# data/raw/provisional/ and friends are deliberately out of reach (CLAUDE.md §9).
-DEFAULT_BASE_DIR = Path("data/raw/approved")
-DEFAULT_OUTDIR = Path("data/injected")
+# data/turbidity/provisional/ and friends are deliberately out of reach (CLAUDE.md §9).
+DEFAULT_BASE_DIR = Path("data/turbidity/approved")
+DEFAULT_OUTDIR = Path("data/turbidity/injected")
 DEFAULT_SEED = 42
 
 #: Injected datasets are filed by gauge, then by level:
-#: ``data/injected/<gauge>/l<level>/<gauge>_l<level>{,_labels.csv,_manifest.json}``.
+#: ``data/turbidity/injected/<gauge>/l<level>/<gauge>_l<level>{,_labels.csv,_manifest.json}``.
 #: The §5 triple stays together in one directory, so every "labels sit beside the
 #: series" lookup (``param_sweep``, ``visualize_injected``) keeps working. Filenames
 #: keep the ``<gauge>_l<level>`` prefix so a file detached from its directory is
@@ -115,7 +115,7 @@ DATASET_NAME_RE = re.compile(r"^(?P<gauge>.+)_l(?P<level>[1-9]\d*)$")
 
 
 def dataset_dir(outdir: Path, name: str) -> Path:
-    """``data/injected`` + ``02054550_l2`` -> ``data/injected/02054550/l2``.
+    """``data/turbidity/injected`` + ``02054550_l2`` -> ``data/turbidity/injected/02054550/l2``.
 
     Raises ``ValueError`` on a name that is not ``<gauge>_l<level>`` rather than
     silently filing the dataset somewhere unfindable.
@@ -848,7 +848,7 @@ def inject_series(
 def write_result(result: InjectionResult, outdir: Path) -> dict[str, Path]:
     """Write the §5 triple: series, labels, manifest.
 
-    ``outdir`` is the *root* (``data/injected``); the triple lands together in
+    ``outdir`` is the *root* (``data/turbidity/injected``); the triple lands together in
     ``<root>/<gauge>/l<level>/`` (see :func:`dataset_dir`).
     """
     dest = dataset_dir(outdir, result.name)

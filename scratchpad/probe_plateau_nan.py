@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore")
 
 
 def main() -> None:
-    v = pd.read_csv("data/injected/01467200/l1/01467200_l1.csv",
+    v = pd.read_csv("data/turbidity/injected/01467200/l1/01467200_l1.csv",
                     parse_dates=["datetime"]).set_index("datetime")["value"]
     nan_mask = v.isna()
     print(f"record {len(v):,} rows, {int(nan_mask.sum()):,} NaN\n")

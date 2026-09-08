@@ -16,7 +16,7 @@ import pandas as pd
 
 from src.workbench.candidates import REVIEW_TYPES, DetectConfig, _runs, find_candidates
 
-ROOT = Path("data/injected")
+ROOT = Path("data/turbidity/injected")
 
 
 def masks(result):

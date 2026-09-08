@@ -1,4 +1,4 @@
-"""Pull instantaneous precipitation near a turbidity gauge -> data/precip/.
+"""Pull instantaneous precipitation near a turbidity gauge -> data/turbidity/precip/.
 
 WHY THIS EXISTS. The hardest call the agent makes is "storm peak or sensor
 artifact?" (§7.3), and for a class of points it cannot be settled from the
@@ -13,8 +13,8 @@ has to travel with it — see PRECIP_STATIONS below, and note that 31 km is far
 enough that a summer convective cell can rain on one and not the other.
 
 Output, per turbidity gauge:
-    data/precip/<gauge>/<station>.csv       datetime,precip_in
-    data/precip/<gauge>/manifest.json       stations, distances, coverage
+    data/turbidity/precip/<gauge>/<station>.csv       datetime,precip_in
+    data/turbidity/precip/<gauge>/manifest.json       stations, distances, coverage
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore")
 
 PRECIP_PARAM = "00045"          # precipitation, total, inches
 DEFAULT_START, DEFAULT_END = "2023-07-01", "2025-07-01"
-DEFAULT_ROOT = Path("data/precip")
+DEFAULT_ROOT = Path("data/turbidity/precip")
 
 # Verified against the real window by `scratchpad/verify_precip.py` — the site
 # catalog's begin/end describes the SITE, and several nearby gauges advertise a

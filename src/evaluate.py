@@ -60,7 +60,7 @@ table says so:
 CLI
 ---
     # score a run's log against the dataset it was run on
-    python -m src.evaluate data/injected/02054550/l1/02054550_l1.csv \
+    python -m src.evaluate data/turbidity/injected/02054550/l1/02054550_l1.csv \
         --log logs/run_20260801_131008.jsonl
 
     # score only the held-out last 20% (§10 splitting)

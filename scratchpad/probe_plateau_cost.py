@@ -25,7 +25,7 @@ from src.inspect_data import DATETIME_COL, load_series, reindex_to_grid
 
 # The three approved bases (CLAUDE.md §9). The original probe ran on a clean
 # segment of 11501000, a gauge since retired as mostly provisional.
-PATHS = sorted(glob.glob("data/raw/approved/*_turbidity_*.csv"))
+PATHS = sorted(glob.glob("data/turbidity/approved/*_turbidity_*.csv"))
 
 
 def probe(path: str) -> None:
@@ -55,7 +55,7 @@ def probe(path: str) -> None:
 
 def main() -> None:
     if not PATHS:
-        raise SystemExit("no approved bases found in data/raw/approved/")
+        raise SystemExit("no approved bases found in data/turbidity/approved/")
     for path in PATHS:
         probe(path)
 

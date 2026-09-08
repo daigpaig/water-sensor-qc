@@ -52,10 +52,10 @@ CLI
 
     # a specific log and series
     python -m src.workbench.visualize_log logs/run_20260731_133616.jsonl \
-        --series data/injected/02054550/l1/02054550_l1.csv
+        --series data/turbidity/injected/02054550/l1/02054550_l1.csv
 
 The log does not record which dataset was run, so the series is matched by row
-count and time range against ``data/injected`` when ``--series`` is omitted; pass
+count and time range against ``data/turbidity/injected`` when ``--series`` is omitted; pass
 it explicitly for anything outside that tree. Ground-truth labels are picked up
 automatically from ``<stem>_labels.csv`` beside the series (§5) when present.
 
@@ -75,7 +75,7 @@ import pandas as pd
 from src.workbench.visualize_injected import ANOMALY_COLORS
 
 DEFAULT_LOG_DIR = Path("logs")
-DEFAULT_INJECTED_DIR = Path("data/injected")
+DEFAULT_INJECTED_DIR = Path("data/turbidity/injected")
 DEFAULT_OUTDIR = Path("figures/logs")
 
 DATETIME_COL = "datetime"

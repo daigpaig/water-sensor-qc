@@ -69,7 +69,7 @@ deployment, Docker, CI beyond a basic test run).
 ├── CLAUDE.md              # this file
 ├── README.md
 ├── requirements.txt
-├── .gitignore            # must include .env, .venv/, data/raw/, logs/
+├── .gitignore            # must include .env, .venv/, data/turbidity/, logs/
 ├── .env.example          # ANTHROPIC_API_KEY=
 ├── data/
 │   ├── raw/              # downloaded USGS series, split by approval (gitignored)
@@ -89,9 +89,9 @@ deployment, Docker, CI beyond a basic test run).
 │   ├── evaluate.py       # metrics, fixed-pipeline baseline, ablation
 │   ├── agent.py          # ReAct loop + API logger
 │   ├── datasets/         # writes everything under data/
-│   │   ├── pull_usgs.py  # pull approved-only turbidity from NWIS -> data/raw/approved (§9)
-│   │   ├── pull_comparison.py # pull one series in BOTH approval states -> data/comparison (§9.3)
-│   │   ├── pull_precip.py # nearby rainfall -> data/precip/<gauge>/ (§7.7)
+│   │   ├── pull_usgs.py  # pull approved-only turbidity from NWIS -> data/turbidity/approved (§9)
+│   │   ├── pull_comparison.py # pull one series in BOTH approval states -> data/turbidity/comparison (§9.3)
+│   │   ├── pull_precip.py # nearby rainfall -> data/turbidity/precip/<gauge>/ (§7.7)
 │   │   └── inject.py     # synthetic anomaly injection (4 types, 3 levels, seeded)
 │   ├── agent_tools/      # AGENT-facing: the §7 inventory, handed to the Messages API
 │   │   ├── precipitation.py # rainfall near a point — the only OUTSIDE evidence (§7.7)
@@ -142,6 +142,9 @@ deployment, Docker, CI beyond a basic test run).
 │   ├── tune_jumps_scale.py    # why no static summary stat can size that thresh (§7.6)
 │   ├── tune_jumps_quantile.py # thresh as a quantile of flagJumps' OWN statistic (§7.6)
 │   └── tune_jumps_knee.py     # the recall-vs-candidate knee that set the default (§7.6)
+├── markdowns/            # human-readable working documents (tracked)
+│   ├── agent_changelog.md     # EVERY change to the agent, in plain English (§14) — MANDATORY
+│   └── spike_error_profiles.md # observed spike failure modes + proposed fixes
 └── logs/                 # JSONL API logs (gitignored)
 ```
 
@@ -176,13 +179,13 @@ piece belongs at the top level instead.
 ## 5. Data contracts (single source of truth — keep code consistent with this)
 
 **Where a dataset lives.** `<name>` is always `<gauge>_l<level>`, and the §5 triple below
-is filed together in `data/injected/<gauge>/l<level>/`. Keeping the three files in one
+is filed together in `data/turbidity/injected/<gauge>/l<level>/`. Keeping the three files in one
 directory is load-bearing: `param_sweep` and `visualize_injected` find the labels *beside*
 the series (`path.with_name(f"{stem}_labels.csv")`), so never split them across
 directories. `src.datasets.inject.dataset_dir(root, name)` is the single place that maps a name to
 its directory — derive paths from it rather than rebuilding the layout by hand.
 
-**Injected dataset CSV** (`data/injected/<gauge>/l<level>/<name>.csv`)
+**Injected dataset CSV** (`data/turbidity/injected/<gauge>/l<level>/<name>.csv`)
 
 - `datetime` (ISO 8601), `value` (float; may be NaN for gaps).
 
@@ -899,7 +902,7 @@ because the calls that look obvious from the series alone are the ones this can 
   with no `rained` key at all, and a test holds the line.
 - Rain leads turbidity by an amount that depends on the catchment, so rather than assume
   a lag the tool reports **0-1h, 1-3h and 3-12h** before the point and lets the agent judge.
-- Pull with `python -m src.datasets.pull_precip <gauge>` -> `data/precip/<gauge>/`.
+- Pull with `python -m src.datasets.pull_precip <gauge>` -> `data/turbidity/precip/<gauge>/`.
 
 **IT HAD NEVER RUN ONCE (fixed 2026-08-25).** `agent.py`'s dispatch chain checked
 `wrappers`, then `context`, then raised — there was no branch for the precipitation
@@ -1385,11 +1388,11 @@ The model id is a §2 golden rule and lives in one place, `agent.py::MODEL`. It 
   injected labels (§9.1). We therefore require the base to be **approved AND calm** — a
   baseline with almost no real spikes — rather than assuming approval alone makes it clean.
   `pull_usgs.py` keeps approved-only rows (drops `P`/blank, which become gaps) and writes to
-  **`data/raw/approved/`**; `inject.py` globs that directory and only that one. The split is
-  load-bearing, not cosmetic: `data/raw/provisional/` (and `expert_flagged/`) sit alongside it
+  **`data/turbidity/approved/`**; `inject.py` globs that directory and only that one. The split is
+  load-bearing, not cosmetic: `data/turbidity/provisional/` (and `expert_flagged/`) sit alongside it
   holding *unvetted* series, and the non-recursive glob is what keeps them out of the
   injection bases. `--keep-unapproved` therefore redirects `pull_usgs.py`'s default output to
-  `data/raw/provisional/`. There is no `data/clean/` folder and no
+  `data/turbidity/provisional/`. There is no `data/clean/` folder and no
   by-eye clean-segment selection. The §9.1 candidate/review tooling stays available for
   auditing a spikier or provisional base if one is ever used, but the default calm bases don't
   need it.
@@ -1497,8 +1500,8 @@ file says nothing. `src/workbench/candidates.py` + `src/workbench/review.py` exi
 that assumption:
 
 ```
-python -m src.workbench.review detect data/raw/provisional/<gauge>.csv   # propose + open page
-python -m src.workbench.review merge  data/raw/provisional/<gauge>.csv <decisions.csv>
+python -m src.workbench.review detect data/turbidity/provisional/<gauge>.csv   # propose + open page
+python -m src.workbench.review merge  data/turbidity/provisional/<gauge>.csv <decisions.csv>
 ```
 
 - **Proposal is tuned for recall, not precision.** Detectors run at deliberately sensitive
@@ -1630,7 +1633,7 @@ What was removed, and where it used to live:
 | the `drift` review category and `--drift-min-days` | `src/workbench/review.py` |
 | the `correct_drift` ToolSpec, `MAINT_FIELD`, `maintenance_variable`, the whole `correct` tool kind | `src/workbench/param_sweep.py` |
 | `"drift"` from `ANOMALY_TYPES` | `src/inspect_data.py` |
-| all nine `data/injected/*_maintenance.csv`; all nine datasets regenerated without drift | `data/injected/` |
+| all nine `data/turbidity/injected/*_maintenance.csv`; all nine datasets regenerated without drift | `data/turbidity/injected/` |
 
 The knowledge below is kept deliberately: it was expensive to establish, and it is the
 reason this decision was made rather than an argument for revisiting it cheaply.
@@ -1706,7 +1709,7 @@ realistic cadence; (3) write the `correctDrift` guard the probe findings above d
 criteria. Recover the deleted code from git history rather than rewriting it — branch
 `no_drift_detection`, the commit before the removal.
 
-### 9.3 Provisional vs approved (`data/comparison/`, 2026-07-29)
+### 9.3 Provisional vs approved (`data/turbidity/comparison/`, 2026-07-29)
 
 **It is a split, not a pair — do not go looking for the archived provisional values.**
 NWIS serves the *current* state of a record: when USGS approves a period, the provisional
@@ -1722,7 +1725,7 @@ processing applied per TM 1-D3 — fouling/drift corrections prorated between fi
 clearly-erroneous data deleted), newer rows are `P` (essentially as the sensor reported).
 Same site, same sensor, same 15-min grid, opposite sides of the processing step.
 `src/datasets/pull_comparison.py` splits one pull on that boundary and writes both sides plus a
-manifest to `data/comparison/<gauge>/`.
+manifest to `data/turbidity/comparison/<gauge>/`.
 
 - **Compare distributions, not counterparts.** The two sides are different calendar
   periods, so seasonality confounds a naive comparison. Each manifest carries a
@@ -1744,9 +1747,9 @@ manifest to `data/comparison/<gauge>/`.
 - **Modified approved codes stay on the approved side** (`A e` estimated, `A, >`
   over-range, `A, R` revised) — USGS approved those readings. `P`, blank and NaN are
   not-approved.
-- This is **reference material, not an injection base**. Nothing in `data/comparison/`
-  feeds `src.datasets.inject`, which globs `data/raw/approved/` and only that (§9). The CSVs are
-  gitignored and regenerable; `data/comparison/README.md` is committed.
+- This is **reference material, not an injection base**. Nothing in `data/turbidity/comparison/`
+  feeds `src.datasets.inject`, which globs `data/turbidity/approved/` and only that (§9). The CSVs are
+  gitignored and regenerable; `data/turbidity/comparison/README.md` is committed.
 
 ### 9.4 Precipitation (checked 2026-08-18; PULLED for all three gauges 2026-08-25)
 
@@ -1816,7 +1819,7 @@ contracts, and a §7 context tool that reads it — none of which exist, and the
 change what the agent is given rather than how it reasons. Note also that the "one variable
 per run" golden rule (§2) governs the *QC target*; rain would be read-only context, not a
 second variable to clean, but that reading should be confirmed before building on it.
-(Those three things now all exist — `pull_precip.py`, `data/precip/` in §5, and §7.7's
+(Those three things now all exist — `pull_precip.py`, `data/turbidity/precip/` in §5, and §7.7's
 `precip_context` — so read this paragraph as the record of a decision already taken.)
 
 ### 9.5 Seeing rain and turbidity together (`precip_overlay.py`, 2026-08-25)
@@ -1830,7 +1833,7 @@ markers (the `visualize_injected.py` palette, so the two pages read alike), and 
 that answers any timestamp you click or type.
 
     python -m src.workbench.precip_overlay 01467200 --level 1
-    python -m src.workbench.precip_overlay data/raw/approved/02054550_turbidity_63680.csv --gauge 02054550
+    python -m src.workbench.precip_overlay data/turbidity/approved/02054550_turbidity_63680.csv --gauge 02054550
 
 - **The panel reports EVERY station, not the plotted one.** §7.7's caveat is that a
   convective cell 5-15 km across can rain on one bucket and not its neighbour, so where
@@ -2044,3 +2047,109 @@ before continuing.
   `scratchpad/probe_saqc_behavior.py` (the §7.1 constraints) already exist — extend them
   rather than starting over, and re-run both if the pin ever moves.
 - Keep the diff per phase reviewable; commit at every gate.
+- **Any change that touches the agent gets a plain-English entry in
+  `markdowns/agent_changelog.md`, in the same commit — see §14 for what counts and
+  the exact format.**
+
+---
+
+## 14. Every change to the agent gets a plain-English entry — `markdowns/agent_changelog.md`
+
+**`markdowns/agent_changelog.md` is the human-readable record of every change ever made to
+the agent, written so the whole project can be talked through from that one file.** It is
+for a reader with no knowledge of this codebase — an interviewer, a collaborator, or the
+author six months later. CLAUDE.md is the *durable brief for building*; the changelog is
+the *durable narrative of what changed and what it bought*. Neither replaces the other,
+and neither may contradict the other.
+
+### 14.1 When an entry is MANDATORY
+
+Write an entry in the **same commit** as the change if it touches any of:
+
+- `SYSTEM_PROMPT` or `SYSTEM_PROMPT_VERSION` in `src/agent.py` — **always**, every bump;
+- the agent loop, model, thinking, caching, retries, call cap, or dispatch (`src/agent.py`);
+- anything in `src/agent_tools/` — a new tool, a removed tool, a changed schema, a changed
+  default, a changed limit (`MAX_*`, `DEFAULT_*`), a new enforcement in `export_clean_data`;
+- the §5 decision/flag-log contract, or the §5.1 verdict/action split;
+- a tuned constant the agent's behaviour depends on (`context.py` thresholds, detector
+  defaults, fill rules);
+- how the agent is **scored** (`src/evaluate.py`) — including a scoring *correction*, which
+  must be labelled as such (see 14.4);
+- a bug that changed what the agent actually did, whether or not any behaviour was intended
+  to change.
+
+**Not required for:** data pulls, injection changes, workbench/UI/plot work, tests, or
+scratchpad probes — *unless* they changed the agent's behaviour or its evidence. A probe
+that produced the measurement behind a prompt change is cited **inside** that change's entry,
+not given its own.
+
+**One entry per coherent change, not per file.** A prompt bump plus the tool change and the
+enforcement that make it work are one entry. Two unrelated changes in one commit are two
+entries.
+
+### 14.2 The format — copy this template exactly
+
+Entries are **newest first**, directly under the vocabulary table at the top of the file.
+
+```markdown
+## YYYY-MM-DD — <Short title: what changed, in the reader's language>
+
+**Prompt version:** v0.X  (or `—` if the prompt did not change) · **Area:** <prompt |
+detector settings | new tool | tool limits | decision contract | repair behaviour |
+scoring | robustness | cost | enforcement | bug>
+**Runs involved:** <run K, run P, …>   (omit the line if none)
+
+**Before:** what the system did, and why that was wrong. State the failure, not the code.
+
+**Changed:** what it does now. Plain sentences; no function names in the body unless the
+name IS the point.
+
+**Why it matters:** the consequence in terms of the water data or the run's answers.
+
+**Evidence:** the numbers. Before → after, sample sizes, the script or run they came from.
+If there is no measurement, write **"Not measured"** and say what would settle it.
+
+**Interview angle:** one or two sentences on the transferable lesson.
+```
+
+Optional extra bolded lines, used only when they carry weight: **Bug found:**,
+**Honest caveat recorded:**, **Design note kept deliberately:**, **Also changed — scoring:**,
+**Diagnostic worth remembering:**.
+
+### 14.3 How to write it — style rules
+
+- **Plain English, no jargon that is not in the file's own vocabulary table.** Say "the
+  detector points at suspicious rows", not "flagUniLOF raises candidates". If a term is
+  genuinely needed more than once, add it to the vocabulary table at the top rather than
+  explaining it in every entry.
+- **No code identifiers in prose** unless the identifier is the subject of the change
+  (a new tool's name, say). File paths belong in CLAUDE.md, not here.
+- **Numbers, always.** "Improved precision" is worthless; "precision 0.227 → 0.460 with
+  catch rate unchanged at 0.905" is the entry. Carry the sample size.
+- **Lead with the failure.** Every entry should make clear what was broken; a change with no
+  "before" is usually a change nobody can justify later.
+- **Keep the caveats.** Where CLAUDE.md records that a fix is partial, transfers poorly, or
+  rests on a small sample, that caveat goes in the entry too. An entry that reads as an
+  unbroken series of wins is not usable in an interview and is not true.
+- **Length:** 150–350 words for a substantive change; a one-line structural change may be
+  four lines. Do not pad.
+
+### 14.4 Three things that must never be blurred
+
+1. **A measurement correction is not an improvement.** If a score moved because the ruler
+   changed, say so in bold in the entry. The 2026-08-24 episode-scoring entry is the model:
+   macro-F1 moved 0.651 → 0.772 on an *identical run*.
+2. **A reversal is written as a reversal.** When a change overturns an earlier conclusion in
+   this file or in CLAUDE.md, the entry says what the old conclusion was and why it was wrong
+   (the 2026-08-11 rise-vs-fall entry). Never silently delete or rewrite a past entry —
+   entries are append-only and are corrected by a later entry that names them.
+3. **"The prompt says so" is not "the system does so."** Where a change makes an instruction
+   *enforceable in code*, say which, and say whether the instruction had actually been obeyed
+   before (the 2026-08-25 rainfall entry: mandated for twelve days, executed zero times).
+
+### 14.5 Keeping it consistent with CLAUDE.md
+
+CLAUDE.md remains the source of truth for **how to build**; the changelog is the source of
+truth for **what changed, when, and what it bought**. A change usually updates both — CLAUDE.md
+in the technical register, the changelog in the plain one — in the same commit. If they ever
+disagree on a fact, CLAUDE.md wins and the changelog gets a correcting entry (14.4 rule 2).

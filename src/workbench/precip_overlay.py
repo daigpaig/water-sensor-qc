@@ -45,7 +45,7 @@ CLI
     python -m src.workbench.precip_overlay 02054550 --level 3
 
     # Or point straight at any datetime/value CSV (labels optional, found beside it):
-    python -m src.workbench.precip_overlay data/raw/approved/01467200_turbidity_63680.csv \\
+    python -m src.workbench.precip_overlay data/turbidity/approved/01467200_turbidity_63680.csv \\
         --gauge 01467200 --out figures/precip/one.html --no-open
 """
 from __future__ import annotations
@@ -65,8 +65,8 @@ from src.datasets.pull_usgs import DEFAULT_MAX_GAP
 from src.workbench.visualize import insert_gap_breaks
 from src.workbench.visualize_injected import ANOMALY_COLORS
 
-DEFAULT_INJECTED_DIR = Path("data/injected")
-DEFAULT_PRECIP_ROOT = Path("data/precip")
+DEFAULT_INJECTED_DIR = Path("data/turbidity/injected")
+DEFAULT_PRECIP_ROOT = Path("data/turbidity/precip")
 DEFAULT_OUTDIR = Path("figures/precip")
 
 TURBIDITY_COLOR = "#2563eb"

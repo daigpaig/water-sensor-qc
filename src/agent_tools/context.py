@@ -420,6 +420,78 @@ def slope_context(
 # ---------------------------------------------------------------------------
 # 2. Excursion extent — how wide, how sharp
 # ---------------------------------------------------------------------------
+# Height at which the excursion's BASE is measured, as a fraction of its own
+# height. Half height (the `n_samples` width) sits well up the cone of a peaked
+# feature, so it measures the summit; 15% sits near the foot.
+BASE_HEIGHT_FRACTION = 0.15
+
+# A sample-to-sample step must exceed this multiple of the LOCAL step scale to
+# extend a monotone run. Strictness is load-bearing rather than a taste: §9
+# injects a spike as a RECTANGULAR displacement of 1-3 samples
+# (`inject.py:316`), so a flat step counted as "still rising" would extend the
+# run across an artifact's own top and hand it the very shape this measures on
+# real water. Measured on the 01467200_l1 run of 2026-09-02, treating flat as
+# continuing INVERTED the comparison — 55.4% of wrong deletions against 90.0% of
+# correct ones, i.e. the metric pointed at the true spikes.
+MONOTONE_STEP_FRACTION = 0.5
+
+# Samples inspected either side when following a monotone approach. 24 is two
+# hours at the 5-min cadence — past the 90 min where `noise_context` peaks and
+# the 45 min of `slope_context`, because the shape this looks for is the one
+# NEITHER of those can see (§7.3: nothing looked further back than 90 min).
+MONOTONE_MAX_SAMPLES = 24
+
+
+def _walk_past(series: pd.Series, pos: int, threshold: float, positive: bool,
+               max_samples: int) -> tuple[int, int]:
+    """Widest span around *pos* whose values all stay past *threshold*.
+
+    Shared by the half-height and base-height widths so the two are the same
+    measurement taken at two heights, and cannot drift apart.
+    """
+    def past(v: float) -> bool:
+        if not np.isfinite(v):
+            return False
+        return v >= threshold if positive else v <= threshold
+
+    lo = hi = pos
+    while lo - 1 >= 0 and pos - (lo - 1) <= max_samples and past(series.iloc[lo - 1]):
+        lo -= 1
+    while hi + 1 < len(series) and (hi + 1) - pos <= max_samples and past(series.iloc[hi + 1]):
+        hi += 1
+    return lo, hi
+
+
+def _monotone_runs(series: pd.Series, pos: int, positive: bool, tol: float,
+                   max_samples: int = MONOTONE_MAX_SAMPLES) -> tuple[int, int]:
+    """Consecutive samples climbing into *pos*, and falling away from it.
+
+    Signs follow the excursion's direction, so a downward excursion's "approach"
+    is a run of falling samples. A step must EXCEED *tol* to extend the run; see
+    :data:`MONOTONE_STEP_FRACTION` for why flat must not count.
+    """
+    lo = max(0, pos - max_samples)
+    hi = min(len(series) - 1, pos + max_samples)
+    before = series.iloc[lo:pos + 1].to_numpy()
+    after = series.iloc[pos:hi + 1].to_numpy()
+    sign = 1.0 if positive else -1.0
+
+    n_before = 0
+    for i in range(len(before) - 1, 0, -1):
+        step = sign * (before[i] - before[i - 1])
+        if not np.isfinite(step) or step <= tol:
+            break
+        n_before += 1
+
+    n_after = 0
+    for i in range(len(after) - 1):
+        step = sign * (after[i + 1] - after[i])
+        if not np.isfinite(step) or step >= -tol:
+            break
+        n_after += 1
+    return n_before, n_after
+
+
 def excursion_context(
     source,
     at,
@@ -427,7 +499,7 @@ def excursion_context(
     baseline_window: str = "12h",
     max_samples: int = 400,
 ) -> dict:
-    """Width and sharpness of the excursion containing *at*.
+    """Width, sharpness and approach shape of the excursion containing *at*.
 
     The baseline is the median of ``baseline_window`` either side (a median is
     unmoved by a short excursion). Width is measured at *half height*: walk
@@ -437,6 +509,40 @@ def excursion_context(
     a fraction of the whole excursion — the same lever that separates a
     recalibration step from a storm limb in §9.1. Near 1.0 means the excursion
     happened in one sample (artifact-like); 0.1 means it built over many.
+
+    THE HALF-HEIGHT WIDTH DESCRIBES THE SUMMIT, NOT THE FEATURE. For a peaked
+    profile half height sits well up the cone, so a mountain that is steep at the
+    top and broad at the base returns ``n_samples`` of 1-2 — the artifact
+    signature — while its base spans ten samples or more. Measured on the
+    01467200_l1 run of 2026-09-02 (65 spike deletions that the labels call real
+    water, 30 that were genuinely injected), that is not a corner case but the
+    dominant shape of the run's false positives:
+
+        metric (median)                wrongly deleted   correctly deleted
+        n_samples (half height)               1                  2
+        n_monotone_before/after               1                  1
+        half-height width <= 1 sample      58/65               8/30
+
+    So the width the agent reads is, on this run, slightly ANTI-correlated with
+    the truth. Four fields answer the question it cannot:
+
+    ``base_width_samples`` / ``apex_ratio``
+        Width at :data:`BASE_HEIGHT_FRACTION` of the excursion instead of half,
+        and the ratio of the two. Near 1 is a rectangle-ish artifact that is as
+        wide at its foot as at its summit; small is a cone.
+    ``n_monotone_before`` / ``n_monotone_after``
+        Consecutive samples climbing into the point and falling away from it. An
+        instrument artifact is a departure *from* the trajectory — the samples
+        either side of it are ordinary, so both runs are ~1. Real water that is
+        genuinely rising arrives over several samples.
+
+    MEASURED, and read the cost as carefully as the benefit: a monotone run of
+    >= 3 on either side covers **30.8%** of that run's wrong deletions against
+    **10.0%** of its correct ones (`scratchpad/audit_recovery_reference.py`), and
+    15 of the 58 wrongly-deleted points whose half-height width is 1 sample carry
+    one. A 3x separation reaching under a third of the false positives: one piece
+    of evidence, never a decider. §7.3's ``ramp_context`` is the same idea over
+    hours rather than minutes and is weaker still (23.1% at 4.8%).
     """
     series = as_series(source, field)
     ts = resolve_timestamp(series, at)
@@ -462,22 +568,18 @@ def excursion_context(
             excursion_sigmas=None, direction=None, n_samples=0,
             duration_minutes=None, start=None, end=None,
             max_single_step=None, peak_sharpness=None, isolated=None,
+            base_width_samples=None, base_start=None, base_end=None,
+            apex_ratio=None, n_monotone_before=None, n_monotone_after=None,
+            approach_is_gradual=None,
         )
 
     excursion = value - baseline
-    half = baseline + 0.5 * excursion
     positive = excursion >= 0
 
-    def _past_half(v: float) -> bool:
-        if not np.isfinite(v):
-            return False
-        return v >= half if positive else v <= half
-
-    lo = hi = pos
-    while lo - 1 >= 0 and pos - (lo - 1) <= max_samples and _past_half(series.iloc[lo - 1]):
-        lo -= 1
-    while hi + 1 < len(series) and (hi + 1) - pos <= max_samples and _past_half(series.iloc[hi + 1]):
-        hi += 1
+    lo, hi = _walk_past(series, pos, baseline + 0.5 * excursion, positive, max_samples)
+    base_lo, base_hi = _walk_past(
+        series, pos, baseline + BASE_HEIGHT_FRACTION * excursion, positive, max_samples
+    )
 
     span = series.iloc[lo : hi + 1]
     n_samples = len(span)
@@ -494,12 +596,30 @@ def excursion_context(
     step_sigma = _step_sigma(series)
     isolated = n_samples <= 2
 
+    base_width = base_hi - base_lo + 1
+    apex_ratio = n_samples / base_width if base_width else None
+
+    # The monotone tolerance is scaled to the point's OWN neighbourhood, floored
+    # by the record scale. §7.4: a record-wide denominator is what made the same
+    # move read 18.7 sigmas on a real spike and 16.7 on a false positive.
+    n_local = max(2, MONOTONE_MAX_SAMPLES)
+    diffs = series.iloc[max(0, pos - n_local): pos + n_local + 1].diff().to_numpy()
+    tol = MONOTONE_STEP_FRACTION * _local_sigma(diffs, step_sigma)
+    n_monotone_before, n_monotone_after = _monotone_runs(series, pos, positive, tol)
+    gradual = max(n_monotone_before, n_monotone_after) >= 3
+
     msg = (
         f"Excursion of {round(excursion, 3)} units above baseline {round(baseline, 3)} "
-        f"spans {n_samples} sample(s) ({duration}) at half height; "
-        f"peak sharpness {'n/a' if sharpness is None else round(sharpness, 2)}. "
+        f"spans {n_samples} sample(s) ({duration}) at half height, {base_width} at its "
+        f"base; peak sharpness {'n/a' if sharpness is None else round(sharpness, 2)}; "
+        f"approached over {n_monotone_before} rising and left over "
+        f"{n_monotone_after} falling sample(s). "
         + ("One or two samples wide => spike-like."
            if isolated else "Multi-sample width => event-like, not a point artifact.")
+        + (" But the half-height width describes the SUMMIT: this one is approached "
+           "and left gradually, which is real water rising, not a departure from the "
+           "trajectory."
+           if gradual and isolated else "")
     )
 
     return _result(
@@ -516,6 +636,13 @@ def excursion_context(
         max_single_step=_f(max_step),
         peak_sharpness=_f(sharpness),
         isolated=bool(isolated),
+        base_width_samples=base_width,
+        base_start=_iso(series.index[base_lo]),
+        base_end=_iso(series.index[base_hi]),
+        apex_ratio=_f(apex_ratio),
+        n_monotone_before=n_monotone_before,
+        n_monotone_after=n_monotone_after,
+        approach_is_gradual=bool(gradual),
     )
 
 
@@ -2337,6 +2464,13 @@ def describe_points(
             "robust_z": full["neighbourhood"].get("robust_z"),
             "width_samples": exc_part.get("n_samples"),
             "peak_sharpness": exc_part.get("peak_sharpness"),
+            # `width_samples` is measured at HALF height, so it describes the
+            # summit: 58 of the 65 points the 2026-09-02 run wrongly deleted read
+            # 1 sample wide, and 15 of those were approached over three or more
+            # rising samples. The approach is the half the width cannot show, so
+            # it has to ride in the triage row — it is invisible in a tally.
+            "n_monotone_before": exc_part.get("n_monotone_before"),
+            "n_monotone_after": exc_part.get("n_monotone_after"),
             "fall_rise_ratio": slope_part.get("fall_rise_ratio"),
             "samples_to_recover": rec_part.get("n_samples_to_recover"),
             "recovered": rec_part.get("recovered"),

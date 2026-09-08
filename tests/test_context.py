@@ -706,3 +706,59 @@ def test_a_caller_supplied_subset_cannot_hide_a_shift_the_detector_found():
     starts = [pd.Timestamp(w["start"]) for w in out["windows"]]
     assert any(abs((s - idx[800]).total_seconds()) <= 3600 for s in starts), (
         f"the shift at {idx[800]} was lost to the caller's subset: {starts}")
+
+
+# ---------------------------------------------------------------------------
+# Approach shape: what the half-height width cannot see (§5)
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def rectangular_spike_series() -> pd.Series:
+    """Three samples displaced as a block — exactly how §9 injects a spike.
+
+    `inject.py:316` writes `out[start:stop] += magnitude`, so the artifact has a
+    FLAT top. That flatness is what makes the strict-step rule load-bearing.
+    """
+    s = _calm()
+    s.iloc[200:203] += 30.0
+    return s
+
+
+def test_monotone_run_ignores_a_gradual_climb_that_is_not_there(rectangular_spike_series):
+    """A rectangular artifact is a departure FROM the trajectory, not a climb."""
+    r = ctx.excursion_context(rectangular_spike_series, rectangular_spike_series.index[201])
+    assert r["approach_is_gradual"] is False
+    assert r["n_monotone_before"] < 3
+    assert r["n_monotone_after"] < 3
+
+
+def test_a_flat_top_must_not_extend_the_monotone_run(rectangular_spike_series):
+    """The trap that inverted the measurement when it was first built.
+
+    Counting a flat step as "still rising" let an injected spike's own flat top
+    extend its run, and the metric then fired on 90.0% of correct deletions
+    against 55.4% of wrong ones — pointing at the true spikes. Measured on the
+    01467200_l1 run of 2026-09-02; see `scratchpad/audit_recovery_reference.py`.
+    """
+    series = rectangular_spike_series
+    # Inside the artifact's flat top, every step is ~0 and must break the run.
+    r = ctx.excursion_context(series, series.index[202])
+    assert r["n_monotone_before"] == 0, "a flat step extended the run"
+
+
+def test_monotone_run_sees_a_gradual_rise_the_half_width_hides(storm_series):
+    r = ctx.excursion_context(storm_series, storm_series.index[165])
+    assert r["n_monotone_before"] >= 3
+    assert r["approach_is_gradual"] is True
+
+
+def test_base_is_wider_than_the_summit_on_a_cone(storm_series):
+    r = ctx.excursion_context(storm_series, storm_series.index[170])
+    assert r["base_width_samples"] >= r["n_samples"]
+    assert r["apex_ratio"] <= 1.0
+
+
+def test_describe_points_carries_the_approach_columns(storm_series):
+    r = ctx.describe_points(storm_series, [storm_series.index[165]])
+    row = r["points"][0]
+    assert "n_monotone_before" in row and "n_monotone_after" in row
+    json.dumps(r)

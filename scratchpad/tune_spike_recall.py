@@ -20,7 +20,7 @@ import pandas as pd
 from src.inspect_data import DATETIME_COL, VALUE_COL, load_series, reindex_to_grid
 from src.workbench.candidates import DetectConfig, _run_saqc, _runs, robust_scales
 
-ROOT = Path("data/injected")
+ROOT = Path("data/turbidity/injected")
 
 
 def datasets(levels: tuple[str, ...] = ("l1", "l2", "l3")) -> list[Path]:

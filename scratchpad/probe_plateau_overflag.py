@@ -17,9 +17,9 @@ import saqc
 
 def main() -> None:
 
-    v = pd.read_csv("data/injected/01467200/l1/01467200_l1.csv",
+    v = pd.read_csv("data/turbidity/injected/01467200/l1/01467200_l1.csv",
                     parse_dates=["datetime"]).set_index("datetime")["value"]
-    lab = pd.read_csv("data/injected/01467200/l1/01467200_l1_labels.csv",
+    lab = pd.read_csv("data/turbidity/injected/01467200/l1/01467200_l1_labels.csv",
                       parse_dates=["datetime"]).set_index("datetime")
     truth_all = lab.index[lab.anomaly_type == "plateau"]
     # a 30k-row slice around the labelled plateaus: flagPlateau is ~minutes on 210k rows

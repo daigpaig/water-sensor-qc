@@ -1,39 +1,57 @@
-"""Pull continuous, USGS-**approved** turbidity time series from NWIS.
+"""Pull continuous USGS water-quality time series from NWIS, by variable.
 
 Downloads instantaneous-value ("iv", sub-hourly — the project bases are 5-min)
-turbidity for one or
-more stream gauges via the ``dataretrieval`` package and writes one tidy CSV per
-site to ``data/raw/approved/`` (gitignored per CLAUDE.md §4).
+series for one or more stream gauges via the ``dataretrieval`` package and
+writes one tidy CSV per site under that variable's directory.
 
-``data/raw/`` is split by approval status, and the split is load-bearing:
-``data/raw/approved/`` holds the clean bases that ``src.datasets.inject`` globs, so a
-provisional pull must never land there. Passing ``--keep-unapproved`` therefore
-switches the default output directory to ``data/raw/provisional/``; an explicit
-``--outdir`` always wins.
+``data/`` is partitioned by **variable** first and **approval status** second::
 
-**Approved data is our clean base (CLAUDE.md §9).** By default we keep only rows
-whose USGS qualifier is *approved* (code starts with ``A``) and drop provisional
-(``P``), blank, or NaN-qualified rows. Approved records have already been through
-USGS record processing — fouling and calibration-drift corrections applied and
-prorated between field visits (TM 1-D3) — so an approved series is clean apart
-from gaps. That is what lets us inject synthetic anomalies straight into these
-files (``src.datasets.inject`` reads ``data/raw/approved`` directly): there is no separate
-"clean-segment" carving or by-eye auditing step any more. Dropped rows simply
-become missing rows, i.e. gaps, once the series is re-gridded downstream.
+    data/turbidity/{approved,provisional}/
+    data/specific_conductance/{approved,provisional}/
 
-Turbidity parameter code
-------------------------
-``63680`` — *Turbidity, water, unfiltered, monochrome near infra-red LED light,
-780-900 nm, detection angle 90 +-2.5 degrees, formazin nephelometric units
-(FNU).* This is the standard **continuous optical-sensor** turbidity code. We
+Both splits are load-bearing. ``<variable>/approved/`` holds the clean bases
+that ``src.datasets.inject`` globs, so a provisional pull must never land
+there — ``_validate`` refuses the combination outright rather than trusting the
+caller to pass the right ``--outdir``.
+
+Variables (see :class:`Variable` and :data:`VARIABLES`)
+------------------------------------------------------
+``turbidity`` — param ``63680``, *Turbidity, water, unfiltered, monochrome near
+infra-red LED light, 780-900 nm, detection angle 90 +-2.5 degrees, formazin
+nephelometric units (FNU).* The standard **continuous optical-sensor** code; we
 deliberately avoid ``00076`` (NTU), which is more often discrete / lab data.
 
+``specific_conductance`` — param ``00095``, *Specific conductance, water,
+unfiltered, microsiemens per centimetre at 25 degC.* Again the continuous code;
+``90095`` is the same measurement from a lab and so is discrete.
+
+Approval modes
+--------------
+**Approved data is our clean base (CLAUDE.md §9).** By default we keep only rows
+whose USGS qualifier is *approved* (code starts with ``A``). Approved records
+have been through USGS record processing — fouling and calibration-drift
+corrections applied and prorated between field visits (TM 1-D3) — so an approved
+series is clean apart from gaps. That is what lets us inject synthetic anomalies
+straight into these files. Dropped rows simply become missing rows, i.e. gaps,
+once the series is re-gridded downstream.
+
+``--approval provisional`` keeps exactly the **complement** — the rows USGS has
+not yet vetted. This is a real filter and not the absence of one: a pull over a
+recent window still carries approved rows at its head, and letting them through
+would put vetted data in ``provisional/`` and misrepresent what the file is.
+Because USGS approves a record from the past forward, provisional rows only
+exist near the END of a series, so a variable carries a separate, more recent
+provisional window (:attr:`Variable.provisional_start`).
+
+``--approval all`` keeps every row with its qualifier intact.
+
 Output CSV schema (one file per site,
-``data/raw/approved/<site>_turbidity_63680.csv``)
-------------------------------------------------------------------------------
+``data/<variable>/<approval>/<site>_<variable>_<param>.csv``)
+-------------------------------------------------------------------------------
 - ``datetime``  : ISO-8601, **UTC, timezone-naive** (converted from the site's
   local reporting zone so multiple gauges share one clock).
-- ``value``     : turbidity in FNU (float; NaN where the sensor reported a NaN).
+- ``value``     : the measurement in the variable's unit (float; NaN where the
+  sensor reported a NaN).
 - ``qualifier`` : USGS approval/qualifier code for the reading, e.g. ``A``
   (approved), ``P`` (provisional), ``A e`` (approved estimated).
 
@@ -46,8 +64,13 @@ CLI
     # See what would be pulled, but download nothing:
     python -m src.datasets.pull_usgs --dry-run
 
-    # Pull the default 3-gauge, 2-year, 5-minute set:
+    # Pull the default 3-gauge, 2-year, 5-minute turbidity set:
     python -m src.datasets.pull_usgs
+
+    # Specific conductance: 3 approved bases, then the 5 provisional gauges
+    # over their recent tail (both site lists live in VARIABLES):
+    python -m src.datasets.pull_usgs --variable specific_conductance
+    python -m src.datasets.pull_usgs --variable specific_conductance --approval provisional
 
     # Custom sites / window:
     python -m src.datasets.pull_usgs --sites 06818000 11501000 --start 2022-07-01 --end 2024-07-01
@@ -109,15 +132,123 @@ TURBIDITY_PARAM = "63680"
 DEFAULT_SITES: tuple[str, ...] = ("02054550", "01467200", "040851385")
 DEFAULT_START = "2023-07-01"
 DEFAULT_END = "2025-07-01"
-# Approval status partitions data/raw: approved/ is what src.datasets.inject globs as its
-# clean bases, provisional/ is scratch for auditing (CLAUDE.md §9, §9.1).
-DEFAULT_OUTDIR = Path("data/raw/approved")
-DEFAULT_UNAPPROVED_OUTDIR = Path("data/raw/provisional")
+# Approval status partitions each variable's directory: approved/ is what
+# src.datasets.inject globs as its clean bases, provisional/ is scratch for
+# auditing (CLAUDE.md §9, §9.1).
+DEFAULT_OUTDIR = Path("data/turbidity/approved")
+DEFAULT_UNAPPROVED_OUTDIR = Path("data/turbidity/provisional")
 
 # USGS qualifier codes starting with this prefix are "approved" (e.g. ``A``,
 # ``A e``, ``A, >``); ``P`` (provisional), blank, and NaN are not. Approved rows
 # are our clean base (CLAUDE.md §9); everything else is dropped by default.
 APPROVED_PREFIX = "A"
+
+#: How a pull treats the qualifier column. ``approved`` keeps only rows USGS has
+#: signed off (the injection bases); ``provisional`` keeps only rows it has NOT
+#: (the unvetted tail — the opposite filter, not the absence of one); ``all``
+#: keeps every row with the qualifier intact, which is what
+#: ``pull_comparison`` needs to see the boundary inside one file.
+APPROVAL_MODES = ("approved", "provisional", "all")
+
+
+# ---------------------------------------------------------------------------
+# Variables. `data/` is partitioned by VARIABLE first and approval second, so a
+# variable owns its parameter code, its unit, its directory root, and the gauges
+# screened for it. Adding one means adding an entry here and nothing else.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Variable:
+    """One measured quantity, its NWIS parameter code, and where it lands.
+
+    ``name`` is both the directory under ``data/`` and the middle field of every
+    filename, so ``turbidity``/``63680`` reproduces the existing
+    ``<site>_turbidity_63680.csv`` exactly — the rename is a no-op for files
+    already on disk.
+
+    A variable carries TWO windows because the two halves of ``data/<var>/``
+    answer different questions. ``start``/``end`` is the approved window: a
+    fixed two-year span, identical across gauges, so the bases are comparable.
+    ``provisional_start``/``provisional_end`` is the unapproved tail, which is
+    necessarily RECENT — USGS approves a record from the past forward, so
+    provisional rows only exist near the end of a series and a pull over the
+    approved window would come back empty (CLAUDE.md §9.6).
+    """
+
+    name: str
+    param_cd: str
+    unit: str
+    #: Directory root under ``data/``; ``approved/`` and ``provisional/`` hang off it.
+    root: Path
+    #: Gauges screened as clean injection bases (approved window).
+    approved_sites: tuple[str, ...] = ()
+    #: Gauges pulled for their UNAPPROVED tail (provisional window).
+    provisional_sites: tuple[str, ...] = ()
+    start: str = DEFAULT_START
+    end: str = DEFAULT_END
+    provisional_start: str = ""
+    provisional_end: str = ""
+
+    @property
+    def approved_dir(self) -> Path:
+        return self.root / "approved"
+
+    @property
+    def provisional_dir(self) -> Path:
+        return self.root / "provisional"
+
+    def outdir_for(self, approval: str) -> Path:
+        """Where a pull in this approval mode belongs.
+
+        ``all`` keeps both states in one file, which is not an injection base by
+        any reading, so it lands in ``provisional/`` rather than beside the
+        clean bases — the split is load-bearing (CLAUDE.md §9).
+        """
+        return self.approved_dir if approval == "approved" else self.provisional_dir
+
+    def filename(self, site: str, param_cd: str | None = None) -> str:
+        """``<site>_<variable>_<param>.csv`` — the param code records what was pulled."""
+        return f"{site}_{self.name}_{param_cd or self.param_cd}.csv"
+
+
+TURBIDITY = Variable(
+    name="turbidity",
+    param_cd=TURBIDITY_PARAM,
+    unit="FNU",
+    root=Path("data/turbidity"),
+    approved_sites=DEFAULT_SITES,
+)
+
+# Specific conductance, water, unfiltered, microsiemens per centimetre at 25 degC.
+# 00095 is the standard CONTINUOUS sensor code; 90095 is the same measurement
+# reported by a lab, so it is discrete and deliberately not used here.
+#
+# Site lists are filled in by `scratchpad/screen_5min_conductance.py`, which
+# repeats the §9 screen for this parameter: a national catalog sweep, then a
+# MEASURED cadence check (the catalog's `count_nu` is days of record for a
+# unit-value series, not a sample count, so cadence cannot be read from it), then
+# approval/completeness per candidate. Empty until that has actually run — a
+# guessed site list would pull the wrong river and look perfectly well-formed.
+CONDUCTANCE_PARAM = "00095"
+CONDUCTANCE_APPROVED_SITES: tuple[str, ...] = ()
+CONDUCTANCE_PROVISIONAL_SITES: tuple[str, ...] = ()
+# The provisional tail. USGS approves from the past forward, so unapproved rows
+# live at the END of a record; a 12-month window is wide enough to be worth
+# plotting and recent enough that most of it is genuinely still provisional.
+CONDUCTANCE_PROVISIONAL_START = "2025-09-01"
+CONDUCTANCE_PROVISIONAL_END = "2026-09-01"
+
+SPECIFIC_CONDUCTANCE = Variable(
+    name="specific_conductance",
+    param_cd=CONDUCTANCE_PARAM,
+    unit="uS/cm",
+    root=Path("data/specific_conductance"),
+    approved_sites=CONDUCTANCE_APPROVED_SITES,
+    provisional_sites=CONDUCTANCE_PROVISIONAL_SITES,
+    provisional_start=CONDUCTANCE_PROVISIONAL_START,
+    provisional_end=CONDUCTANCE_PROVISIONAL_END,
+)
+
+VARIABLES: dict[str, Variable] = {v.name: v for v in (TURBIDITY, SPECIFIC_CONDUCTANCE)}
 
 # "Unbroken-stretch" reporting defaults. A stretch stays "unbroken" as long as no
 # internal gap exceeds `max_gap`, so a few scattered single-sample dropouts don't break
@@ -129,7 +260,7 @@ DEFAULT_MIN_UNBROKEN_DAYS = 90.0
 
 @dataclass(frozen=True)
 class PullConfig:
-    """Configuration for a turbidity pull run."""
+    """Configuration for one pull run of one variable."""
 
     sites: tuple[str, ...] = DEFAULT_SITES
     start: str = DEFAULT_START
@@ -138,12 +269,19 @@ class PullConfig:
     outdir: Path = DEFAULT_OUTDIR
     max_retries: int = 3
     retry_wait_s: float = 5.0
-    # Keep only USGS-approved rows (qualifier starts with ``A``); drop the rest.
-    approved_only: bool = True
+    #: Which side of the approval boundary to keep; see :data:`APPROVAL_MODES`.
+    approval: str = "approved"
     # Unbroken-stretch report (see `longest_unbroken_run_days`).
     max_gap: str = DEFAULT_MAX_GAP
     min_unbroken_days: float = DEFAULT_MIN_UNBROKEN_DAYS
     drop_unqualified: bool = False
+    #: Names the output file and supplies the unit for printed summaries.
+    variable: Variable = TURBIDITY
+
+    @property
+    def approved_only(self) -> bool:
+        """Back-compat read-only view of :attr:`approval`."""
+        return self.approval == "approved"
 
 
 @dataclass
@@ -154,7 +292,7 @@ class SiteResult:
     station_nm: str
     n_obs: int
     n_raw: int
-    n_dropped_unapproved: int
+    n_dropped_by_approval: int
     median_dt_min: float
     span_days: float
     completeness_pct: float
@@ -172,7 +310,7 @@ class SiteResult:
 # ---------------------------------------------------------------------------
 # Pure helpers (unit-tested without network access).
 # ---------------------------------------------------------------------------
-def select_turbidity_column(df: pd.DataFrame, param_cd: str = TURBIDITY_PARAM) -> str:
+def select_value_column(df: pd.DataFrame, param_cd: str = TURBIDITY_PARAM) -> str:
     """Return the name of the value column for ``param_cd`` in an NWIS frame.
 
     NWIS frames carry a value column (e.g. ``"63680"``) and a paired qualifier
@@ -180,7 +318,7 @@ def select_turbidity_column(df: pd.DataFrame, param_cd: str = TURBIDITY_PARAM) -
     (``"63680"`` plus ``"63680.1"`` / suffixed names); we take the first value
     column and leave a note for the caller to inspect if that happens.
 
-    Raises ``ValueError`` if no turbidity value column is present.
+    Raises ``ValueError`` if no value column for ``param_cd`` is present.
     """
     value_cols = [
         c for c in df.columns
@@ -188,13 +326,18 @@ def select_turbidity_column(df: pd.DataFrame, param_cd: str = TURBIDITY_PARAM) -
     ]
     if not value_cols:
         raise ValueError(
-            f"No turbidity ({param_cd}) value column found; columns={list(df.columns)}"
+            f"No value column for parameter {param_cd} found; "
+            f"columns={list(df.columns)}"
         )
     # Prefer the exact param code, else the first suffixed variant.
     for c in value_cols:
         if str(c) == param_cd:
             return c
     return value_cols[0]
+
+
+#: Kept so callers written against the turbidity-only API keep working.
+select_turbidity_column = select_value_column
 
 
 def filter_approved(
@@ -213,10 +356,33 @@ def filter_approved(
 
     If the frame has no qualifier column it is returned unchanged.
     """
-    if qualifier_col not in df.columns:
+    return filter_by_approval(df, "approved", qualifier_col=qualifier_col)
+
+
+def filter_by_approval(
+    df: pd.DataFrame, approval: str, *, qualifier_col: str = "qualifier"
+) -> pd.DataFrame:
+    """Keep the rows on one side of the USGS approval boundary.
+
+    ``approved`` keeps qualifiers starting ``A``; ``provisional`` keeps exactly
+    the complement — ``P``, blank and NaN — which is a real filter and not the
+    absence of one. That distinction is the whole point of the provisional set:
+    a series pulled from a recent window still carries approved rows at its
+    head, and letting them through would put vetted data in
+    ``<variable>/provisional/`` and quietly misrepresent what the file is.
+    ``all`` keeps every row with its qualifier intact.
+
+    A frame with no qualifier column is returned unchanged, because we cannot
+    tell the two sides apart and dropping everything would be worse than
+    passing it on for the caller to notice.
+    """
+    if approval not in APPROVAL_MODES:
+        raise ValueError(f"approval must be one of {APPROVAL_MODES}, got {approval!r}")
+    if approval == "all" or qualifier_col not in df.columns:
         return df
     q = df[qualifier_col].astype("string")
-    keep = q.str.startswith(APPROVED_PREFIX).fillna(False)
+    is_approved = q.str.startswith(APPROVED_PREFIX).fillna(False)
+    keep = is_approved if approval == "approved" else ~is_approved
     return df.loc[keep.to_numpy()].reset_index(drop=True)
 
 
@@ -275,7 +441,7 @@ def tidy_frame(df: pd.DataFrame, param_cd: str = TURBIDITY_PARAM) -> pd.DataFram
     - Index converted to UTC then made timezone-naive.
     - Qualifier column (``<param>_cd``) carried through if present.
     """
-    val_col = select_turbidity_column(df, param_cd)
+    val_col = select_value_column(df, param_cd)
     idx = pd.DatetimeIndex(df.index)
     if idx.tz is not None:
         idx = idx.tz_convert("UTC").tz_localize(None)
@@ -338,18 +504,28 @@ def pull_site(site: str, cfg: PullConfig, write: bool = True) -> SiteResult:
         site, cfg.param_cd, cfg.start, cfg.end, cfg.max_retries, cfg.retry_wait_s
     )
     if raw is None or raw.empty:
-        raise RuntimeError(f"No turbidity data returned for {site} in {cfg.start}..{cfg.end}")
+        raise RuntimeError(
+            f"No {cfg.variable.name} data returned for {site} "
+            f"in {cfg.start}..{cfg.end}"
+        )
 
     tidy = tidy_frame(raw, cfg.param_cd)
     n_raw = len(tidy)
-    if cfg.approved_only:
-        tidy = filter_approved(tidy)
+    tidy = filter_by_approval(tidy, cfg.approval)
     n_dropped = n_raw - len(tidy)
     if tidy.empty:
+        # Which side came back empty says something different in each direction,
+        # so the hint has to differ too: no approved rows means the window is too
+        # recent, no provisional rows means it is too old.
+        hint = (
+            "Try an earlier window or --approval all."
+            if cfg.approval == "approved"
+            else "USGS approves a record from the past forward, so try a MORE "
+                 "RECENT window — this one may be fully approved already."
+        )
         raise RuntimeError(
-            f"No approved turbidity rows for {site} in {cfg.start}..{cfg.end} "
-            f"(dropped all {n_raw} rows as non-approved). Try an earlier window "
-            f"or pass --keep-unapproved."
+            f"No {cfg.approval} {cfg.variable.name} rows for {site} in "
+            f"{cfg.start}..{cfg.end} (dropped all {n_raw} rows). {hint}"
         )
 
     idx = pd.DatetimeIndex(tidy["datetime"])
@@ -365,7 +541,7 @@ def pull_site(site: str, cfg: PullConfig, write: bool = True) -> SiteResult:
     out_path: Path | None = None
     if write and not (cfg.drop_unqualified and not meets):
         cfg.outdir.mkdir(parents=True, exist_ok=True)
-        out_path = cfg.outdir / f"{site}_turbidity_{cfg.param_cd}.csv"
+        out_path = cfg.outdir / cfg.variable.filename(site, cfg.param_cd)
         tidy.to_csv(out_path, index=False)
 
     return SiteResult(
@@ -373,7 +549,7 @@ def pull_site(site: str, cfg: PullConfig, write: bool = True) -> SiteResult:
         station_nm=_station_name(site),
         n_obs=len(tidy),
         n_raw=n_raw,
-        n_dropped_unapproved=n_dropped,
+        n_dropped_by_approval=n_dropped,
         median_dt_min=median_dt,
         span_days=span_days,
         completeness_pct=completeness,
@@ -398,13 +574,15 @@ def pull_all(cfg: PullConfig, write: bool = True) -> list[SiteResult]:
         print(
             f"  {res.n_obs:,} obs | {res.median_dt_min:.0f}-min | "
             f"{res.completeness_pct:.1f}% complete | "
-            f"range {res.value_min:.1f}-{res.value_max:.1f} FNU"
+            f"range {res.value_min:.1f}-{res.value_max:.1f} {cfg.variable.unit}"
         )
-        if cfg.approved_only:
-            approved_pct = 100.0 * res.n_obs / res.n_raw if res.n_raw else float("nan")
+        if cfg.approval != "all":
+            kept_pct = 100.0 * res.n_obs / res.n_raw if res.n_raw else float("nan")
+            other = "non-approved (provisional/blank)" if cfg.approval == "approved" \
+                else "already-approved"
             print(
-                f"  approved: kept {res.n_obs:,}/{res.n_raw:,} rows ({approved_pct:.1f}%), "
-                f"dropped {res.n_dropped_unapproved:,} non-approved (provisional/blank)"
+                f"  {cfg.approval}: kept {res.n_obs:,}/{res.n_raw:,} rows "
+                f"({kept_pct:.1f}%), dropped {res.n_dropped_by_approval:,} {other}"
             )
         gate = "PASS" if res.meets_unbroken else "FAIL"
         if res.out_path is not None:
@@ -449,18 +627,47 @@ def _validate(cfg: PullConfig) -> None:
         raise ValueError(f"max_gap must be positive (got {cfg.max_gap!r}).")
     if cfg.min_unbroken_days < 0:
         raise ValueError(f"min_unbroken_days must be >= 0 (got {cfg.min_unbroken_days}).")
+    if cfg.approval not in APPROVAL_MODES:
+        raise ValueError(f"approval must be one of {APPROVAL_MODES}, got {cfg.approval!r}.")
+    # An approved pull into provisional/ (or the reverse) would silently
+    # mislabel what the file is, and inject.py globs on directory alone (§9).
+    if cfg.approval == "approved" and cfg.outdir.name == "provisional":
+        raise ValueError(
+            f"approval='approved' writing into {cfg.outdir} — approved bases belong "
+            f"in approved/. Pass --outdir explicitly if this is deliberate."
+        )
+    if cfg.approval != "approved" and cfg.outdir.name == "approved":
+        raise ValueError(
+            f"approval={cfg.approval!r} writing into {cfg.outdir} — only approved rows "
+            f"may land in approved/, which src.datasets.inject globs as clean bases (§9)."
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Pull USGS NWIS continuous turbidity.")
-    parser.add_argument("--sites", nargs="+", default=list(DEFAULT_SITES),
-                        help="USGS site numbers (default: recommended 3-gauge set).")
-    parser.add_argument("--start", default=DEFAULT_START, help="ISO start date.")
-    parser.add_argument("--end", default=DEFAULT_END, help="ISO end date.")
-    parser.add_argument("--param", default=TURBIDITY_PARAM, help="NWIS parameter code.")
+    parser = argparse.ArgumentParser(
+        description="Pull USGS NWIS continuous water-quality series "
+                    "(turbidity or specific conductance)."
+    )
+    parser.add_argument("--variable", choices=sorted(VARIABLES), default=TURBIDITY.name,
+                        help="Which measured quantity to pull. Sets the parameter code, "
+                             "the default site list, the default window and the output "
+                             f"directory (default: {TURBIDITY.name}).")
+    parser.add_argument("--sites", nargs="+", default=None,
+                        help="USGS site numbers (default: the variable's screened set "
+                             "for the chosen approval mode).")
+    parser.add_argument("--start", default=None, help="ISO start date.")
+    parser.add_argument("--end", default=None, help="ISO end date.")
+    parser.add_argument("--param", default=None, help="NWIS parameter code.")
     parser.add_argument("--outdir", type=Path, default=None,
-                        help=f"Directory for output CSVs (default: {DEFAULT_OUTDIR}, or "
-                             f"{DEFAULT_UNAPPROVED_OUTDIR} with --keep-unapproved).")
+                        help="Directory for output CSVs (default: the variable's "
+                             "approved/ or provisional/ subdirectory).")
+    parser.add_argument("--approval", choices=APPROVAL_MODES, default="approved",
+                        help="Which side of the USGS approval boundary to keep. "
+                             "'approved' (default) is the clean injection base; "
+                             "'provisional' keeps ONLY unapproved rows; 'all' keeps "
+                             "both with the qualifier intact. Anything but 'approved' "
+                             "lands in provisional/, so unvetted data can never reach "
+                             "the directory src.datasets.inject globs.")
     parser.add_argument("--max-gap", default=DEFAULT_MAX_GAP,
                         help=f"Largest gap that does NOT break an 'unbroken' stretch "
                              f"(pandas offset, e.g. '3h', '90min'; default: {DEFAULT_MAX_GAP}).")
@@ -470,41 +677,61 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--drop-unqualified", action="store_true",
                         help="Do not write CSVs for sites that fail the unbroken-stretch filter.")
     parser.add_argument("--keep-unapproved", action="store_true",
-                        help="Keep provisional/blank-qualified rows (default: approved-only, "
-                             f"qualifier starting 'A'). Redirects the default outdir to "
-                             f"{DEFAULT_UNAPPROVED_OUTDIR} so unapproved data never lands "
-                             f"in {DEFAULT_OUTDIR}, which src.datasets.inject treats as clean bases.")
+                        help="Deprecated alias for --approval all.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print what would be pulled and exit without downloading.")
     args = parser.parse_args(argv)
 
-    # An explicit --outdir always wins; otherwise approval status picks the dir.
-    outdir = args.outdir
-    if outdir is None:
-        outdir = DEFAULT_UNAPPROVED_OUTDIR if args.keep_unapproved else DEFAULT_OUTDIR
+    variable = VARIABLES[args.variable]
+    approval = "all" if args.keep_unapproved else args.approval
 
+    # Each of these falls back to the variable's own screened defaults, so
+    # `--variable specific_conductance --approval provisional` needs no other
+    # flags: it pulls the screened provisional gauges over the recent tail.
+    provisional = approval != "approved"
+    sites = tuple(args.sites) if args.sites else (
+        variable.provisional_sites if provisional else variable.approved_sites
+    )
+    if not sites:
+        raise SystemExit(
+            f"No default sites recorded for {variable.name} / {approval}. Run the "
+            f"screening script for this variable and record the result in "
+            f"pull_usgs.VARIABLES, or pass --sites explicitly. A guessed site "
+            f"list pulls the wrong river and the output still looks well-formed."
+        )
+    default_start = variable.provisional_start if provisional else variable.start
+    default_end = variable.provisional_end if provisional else variable.end
     cfg = PullConfig(
-        sites=tuple(args.sites), start=args.start, end=args.end,
-        param_cd=args.param, outdir=outdir,
-        approved_only=not args.keep_unapproved,
-        max_gap=args.max_gap, min_unbroken_days=args.min_unbroken_days,
+        sites=sites,
+        start=args.start or default_start or DEFAULT_START,
+        end=args.end or default_end or DEFAULT_END,
+        param_cd=args.param or variable.param_cd,
+        # An explicit --outdir always wins; otherwise approval status picks the dir.
+        outdir=args.outdir or variable.outdir_for(approval),
+        approval=approval,
+        max_gap=args.max_gap,
+        min_unbroken_days=args.min_unbroken_days,
         drop_unqualified=args.drop_unqualified,
+        variable=variable,
     )
     _validate(cfg)
 
     if args.dry_run:
         print("DRY RUN — nothing will be downloaded.")
-        print(f"  param : {cfg.param_cd} (turbidity, FNU)")
+        print(f"  variable: {variable.name} ({cfg.param_cd}, {variable.unit})")
         print(f"  window: {cfg.start} -> {cfg.end}")
         print(f"  outdir: {cfg.outdir}")
-        print(f"  approved-only: {cfg.approved_only} "
-              + (f"(keep only qualifiers starting '{APPROVED_PREFIX}')"
-                 if cfg.approved_only else "(keep provisional/blank rows too)"))
+        print(f"  approval: {cfg.approval} " + {
+            "approved": f"(keep only qualifiers starting '{APPROVED_PREFIX}')",
+            "provisional": f"(keep only qualifiers NOT starting '{APPROVED_PREFIX}')",
+            "all": "(keep every row, qualifier intact)",
+        }[cfg.approval])
         print(f"  report: longest unbroken stretch at gaps <= {cfg.max_gap} "
               f"(>= {cfg.min_unbroken_days:.0f} d flagged PASS)"
               f"{' (drop unqualified)' if cfg.drop_unqualified else ''}")
-        for s in cfg.sites:
-            print(f"  site  : {s} -> {cfg.outdir / f'{s}_turbidity_{cfg.param_cd}.csv'}")
+        for site in cfg.sites:
+            print(f"  site  : {site} -> "
+                  f"{cfg.outdir / variable.filename(site, cfg.param_cd)}")
         return 0
 
     pull_all(cfg, write=True)

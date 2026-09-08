@@ -34,10 +34,10 @@ normal-water cases, R to reset the zoom.
 CLI
 ---
     python -m src.workbench.spike_audit \\
-        data/injected/02054550/l1/02054550_l1.csv \\
+        data/turbidity/injected/02054550/l1/02054550_l1.csv \\
         --flags data/agent_runs/03447687_l1_flags.json \\
         --log logs/run_20260810_174153.jsonl \\
-        --raw data/raw/approved/02054550_turbidity_63680.csv
+        --raw data/turbidity/approved/02054550_turbidity_63680.csv
 
 `--raw` is optional but is the single most useful flag on this page: without it a
 deleted-natural case cannot be told from a mislabelled base spike.

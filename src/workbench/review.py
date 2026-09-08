@@ -22,7 +22,7 @@ labels only what was endorsed. A decision may narrow a proposal, never extend it
 CLI
 ---
     # propose candidates and open the review page
-    python -m src.workbench.review detect data/raw/provisional/06818000_turbidity_63680_provisional.csv
+    python -m src.workbench.review detect data/turbidity/provisional/06818000_turbidity_63680_provisional.csv
 
     # be pickier / more paranoid
     python -m src.workbench.review detect <csv> --jumps-sigmas 32 --max-per-type 25
@@ -64,7 +64,7 @@ from src.workbench.candidates import (
 
 DEFAULT_PAGE_DIR = Path("figures")
 #: Review artefacts live here, not beside the series: the raw subdirectories are
-#: globbed by name elsewhere in the project (`data/raw/approved/*.csv` feeds
+#: globbed by name elsewhere in the project (`data/turbidity/approved/*.csv` feeds
 #: `src.datasets.inject`), and a stray `*_candidates.csv` there breaks those lookups.
 DEFAULT_DATA_DIR = Path("data/review")
 

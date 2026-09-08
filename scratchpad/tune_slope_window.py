@@ -17,8 +17,8 @@ import pandas as pd
 
 from src.agent_tools import context
 
-RAW = "data/raw/approved/03447687_turbidity_63680.csv"
-SERIES = "data/injected/03447687/l1/03447687_l1.csv"
+RAW = "data/turbidity/approved/03447687_turbidity_63680.csv"
+SERIES = "data/turbidity/injected/03447687/l1/03447687_l1.csv"
 FLAGS = "data/agent_runs/03447687_l1_flags.json"
 SPIKE_FUNCS = ("flagUniLOF", "flagZScore", "flagRange")
 

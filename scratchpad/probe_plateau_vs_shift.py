@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore")
 def main() -> None:
     print(f"{'dataset':<16}{'flagged':>9}{'of level_shift':>16}{'of plateau':>13}"
           f"{'of spike':>10}{'of gap':>9}")
-    for path in sorted(glob.glob("data/injected/*/l*/*_l?.csv")):
+    for path in sorted(glob.glob("data/turbidity/injected/*/l*/*_l?.csv")):
         stem = path.rsplit("/", 1)[-1][:-4]
         v = pd.read_csv(path, parse_dates=["datetime"]).set_index("datetime")["value"]
         lab = pd.read_csv(path.replace(".csv", "_labels.csv"),

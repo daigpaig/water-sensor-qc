@@ -7,25 +7,35 @@ venv/
 env/
 
 # Raw downloaded data (USGS/ECCC) and API logs are gitignored.
-# data/raw/ is partitioned by approval status: approved/ holds the clean bases
-# src.datasets.inject globs, provisional/ and expert_flagged/ are audit scratch.
-# (ignore contents but allow the .gitkeep files below to be re-included)
-data/raw/**
+# data/ is partitioned by VARIABLE first (data/turbidity/, data/specific_conductance/)
+# and by approval status second: approved/ holds the clean bases src.datasets.inject
+# globs, provisional/ is audit scratch. Everything a pull can regenerate from NWIS is
+# ignored; the injected datasets beside them are hand-generated ground truth and stay
+# tracked. (Ignore contents but allow the .gitkeep/README files below back in.)
+data/turbidity/approved/**
+data/turbidity/provisional/**
 # Provisional-vs-approved comparison pulls (regenerate: `python -m src.datasets.pull_comparison`)
-data/comparison/**
+data/turbidity/comparison/**
 # Nearby rainfall (regenerate: `python -m src.datasets.pull_precip <gauge>`) — §7.7
-data/precip/**
+data/turbidity/precip/**
+# Specific conductance (regenerate: `python -m src.datasets.pull_usgs --variable
+# specific_conductance` and `... --provisional-set`) — §9.6. No injected datasets
+# exist for it yet; when they do they belong beside these, tracked, like turbidity's.
+data/specific_conductance/**
 # Legacy 15-min raw pulls, retired when the project moved to 5-min bases.
-# Same rule as data/raw/: the CSVs are regenerable from NWIS, the injected
-# datasets beside them are hand-generated ground truth and stay tracked.
 data/legacy_15min/raw/**
 logs/*
 
 # Keep the gitignored directories in the tree
-!data/raw/.gitkeep
-!data/raw/approved/
-!data/raw/approved/.gitkeep
-!data/comparison/README.md
+!data/turbidity/.gitkeep
+!data/turbidity/approved/
+!data/turbidity/approved/.gitkeep
+!data/turbidity/comparison/README.md
+!data/specific_conductance/
+!data/specific_conductance/approved/
+!data/specific_conductance/approved/.gitkeep
+!data/specific_conductance/provisional/
+!data/specific_conductance/provisional/.gitkeep
 !logs/.gitkeep
 
 # Generated review artifacts (regenerate via `python -m src.workbench.visualize`)
@@ -66,3 +76,8 @@ scratchpad/out/probe5/
 scratchpad/out/run*_flags.json
 scratchpad/out/run*_clean.csv
 scratchpad/out/*.log
+
+# Working notes dropped in for discussion — not project artefacts.
+markdowns/*
+# ...except the agent change log, which is a project artefact (CLAUDE.md §14).
+!markdowns/agent_changelog.md

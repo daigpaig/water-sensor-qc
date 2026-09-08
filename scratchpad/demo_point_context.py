@@ -3,7 +3,7 @@
 Run from the repo root (the module imports `src.*`):
 
     python -m scratchpad.demo_point_context
-    python -m scratchpad.demo_point_context --dataset data/injected/02198840/l3/02198840_l3.csv
+    python -m scratchpad.demo_point_context --dataset data/turbidity/injected/02198840/l3/02198840_l3.csv
 
 Part 1 prints the full context for one point of each labelled kind — an injected
 spike, a *genuine* high-turbidity peak the labels say is NOT an anomaly, a
@@ -30,7 +30,7 @@ import pandas as pd
 from src.agent_tools import context as ctx
 from src.inspect_data import DATETIME_COL, load_series, reindex_to_grid, validate_labels_csv
 
-DEFAULT_DATASET = Path("data/injected/03447687/l2/03447687_l2.csv")
+DEFAULT_DATASET = Path("data/turbidity/injected/03447687/l2/03447687_l2.csv")
 
 
 def load(dataset: Path) -> tuple[pd.Series, pd.DataFrame]:

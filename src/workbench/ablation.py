@@ -4,7 +4,7 @@ Runs the agent multiple times on the same dataset, disabling one or more tools
 at a time, to see how detection and imputation scores are affected.
 
 Usage:
-    python -m src.workbench.ablation data/injected/02054550/l1/02054550_l1.csv \
+    python -m src.workbench.ablation data/turbidity/injected/02054550/l1/02054550_l1.csv \
         --disable flag_spike_unilof flag_constants
 """
 import argparse

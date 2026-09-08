@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore")
 from src.workbench.candidates import REVIEW_TYPES, find_candidates  # noqa: E402
 
 RECALL_TYPES: tuple[str, ...] = (*REVIEW_TYPES, "gap")
-NEW = Path("data/injected")
+NEW = Path("data/turbidity/injected")
 LEGACY = Path("data/legacy_15min/injected")
 
 

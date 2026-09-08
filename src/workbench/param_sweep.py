@@ -19,11 +19,11 @@ Usage
     python -m src.workbench.param_sweep --list
 
     # sweep one parameter (uses the built-in default grid)
-    python -m src.workbench.param_sweep --dataset data/injected/02054550/l2/02054550_l2.csv \\
+    python -m src.workbench.param_sweep --dataset data/turbidity/injected/02054550/l2/02054550_l2.csv \\
         --tool flag_spike_unilof --param thresh
 
     # your own grid, zoomed to a window
-    python -m src.workbench.param_sweep --dataset data/injected/02054550/l2/02054550_l2.csv \\
+    python -m src.workbench.param_sweep --dataset data/turbidity/injected/02054550/l2/02054550_l2.csv \\
         --tool flag_constants --param thresh --values 0,0.001,0.01,0.1 \\
         --start 2024-07-01 --end 2024-08-01
 """
@@ -868,7 +868,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--list", action="store_true", help="list tools and sweepable params")
-    p.add_argument("--dataset", type=Path, help="data/injected/<gauge>/l<level>/<name>.csv")
+    p.add_argument("--dataset", type=Path, help="data/turbidity/injected/<gauge>/l<level>/<name>.csv")
     p.add_argument("--tool", choices=sorted(TOOLS))
     p.add_argument("--param")
     p.add_argument("--values", help="comma-separated grid (default: built-in)")

@@ -56,10 +56,10 @@ Self-contained HTML, plotly.js inlined, no server — like the other workbench p
 CLI
 ---
     python -m src.workbench.decision_audit \\
-        data/injected/02054550/l1/02054550_l1.csv \\
+        data/turbidity/injected/02054550/l1/02054550_l1.csv \\
         --flags data/agent_runs/03447687_l1_flags.json \\
         --log logs/run_20260811_114419.jsonl \\
-        --raw data/raw/approved/02054550_turbidity_63680.csv
+        --raw data/turbidity/approved/02054550_turbidity_63680.csv
 
 Pages land in `figures/decision_audit/`.
 """

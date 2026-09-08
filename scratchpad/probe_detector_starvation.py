@@ -17,9 +17,9 @@ import saqc
 
 warnings.filterwarnings("ignore")
 
-v = pd.read_csv("data/injected/01467200/l1/01467200_l1.csv",
+v = pd.read_csv("data/turbidity/injected/01467200/l1/01467200_l1.csv",
                 parse_dates=["datetime"]).set_index("datetime")["value"]
-lab = pd.read_csv("data/injected/01467200/l1/01467200_l1_labels.csv",
+lab = pd.read_csv("data/turbidity/injected/01467200/l1/01467200_l1_labels.csv",
                   parse_dates=["datetime"]).set_index("datetime")
 shift = lab.index[lab.anomaly_type == "level_shift"]
 mad = 1.4826 * float(v.diff().abs().median())

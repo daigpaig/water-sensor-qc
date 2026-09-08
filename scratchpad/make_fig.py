@@ -41,7 +41,7 @@ import matplotlib.pyplot as plt
 
 SITE = "03447687"  # French Broad R nr Fletcher, NC; moderate, median ~8 FNU
 def _dir(lvl):
-    return f"data/injected/{SITE}/l{lvl}"
+    return f"data/turbidity/injected/{SITE}/l{lvl}"
 
 def load(lvl):
     d = pd.read_csv(f"{_dir(lvl)}/{SITE}_l{lvl}.csv", parse_dates=["datetime"])

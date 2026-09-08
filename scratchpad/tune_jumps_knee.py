@@ -30,7 +30,7 @@ def label_spans(lab, kind):
 
 
 rows = []
-for csv in sorted((ROOT / "data/injected").glob("*/l*/*.csv")):
+for csv in sorted((ROOT / "data/turbidity/injected").glob("*/l*/*.csv")):
     if csv.name.endswith("_labels.csv"):
         continue
     df = pd.read_csv(csv, parse_dates=["datetime"]).set_index("datetime").sort_index()

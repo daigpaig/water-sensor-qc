@@ -1,7 +1,7 @@
 """Plot injected datasets with their ground-truth anomalies coloured by type.
 
 Companion to ``visualize.py`` (which reviews raw/approved series). For each
-injected dataset — ``data/injected/<gauge>/l<level>/<gauge>_l<level>.csv`` plus its row-aligned
+injected dataset — ``data/turbidity/injected/<gauge>/l<level>/<gauge>_l<level>.csv`` plus its row-aligned
 ``*_labels.csv`` (§5) — this stacks the uninjected base on top and one panel per
 level below it: the base panel shows the clean (uninjected) series, and each level
 panel shows that level's injected series with every labelled anomaly as a coloured
@@ -16,7 +16,7 @@ and simply render as breaks in the line (same gap-break logic as ``visualize``).
 
 CLI
 ---
-    # Every gauge found in data/injected (default) -> figures/injected_<gauge>.html:
+    # Every gauge found in data/turbidity/injected (default) -> figures/injected_<gauge>.html:
     python -m src.workbench.visualize_injected
 
     # One gauge, don't open a browser:
@@ -47,7 +47,7 @@ ANOMALY_COLORS: dict[str, str] = {
 }
 BASE_COLOR = "#2563eb"
 CLEAN_COLOR = "#94a3b8"  # faint grey: the uninjected base drawn behind the injected line
-DEFAULT_INJECTED_DIR = Path("data/injected")
+DEFAULT_INJECTED_DIR = Path("data/turbidity/injected")
 DEFAULT_OUTDIR = Path("figures")
 LEVELS: tuple[int, ...] = (1, 2, 3)
 
@@ -227,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Plot injected datasets with anomalies coloured by type."
     )
     parser.add_argument(
-        "--gauge", help="Gauge id to plot (default: every gauge in data/injected)."
+        "--gauge", help="Gauge id to plot (default: every gauge in data/turbidity/injected)."
     )
     parser.add_argument(
         "--injected-dir", type=Path, default=DEFAULT_INJECTED_DIR,

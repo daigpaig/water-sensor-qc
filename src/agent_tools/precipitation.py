@@ -19,7 +19,7 @@ worth:
    windows before the point (0-1h, 1-3h, 3-12h) and lets the agent judge which lag
    the record supports.
 
-Data comes from `src.datasets.pull_precip` (data/precip/<gauge>/). If it has not been
+Data comes from `src.datasets.pull_precip` (data/turbidity/precip/<gauge>/). If it has not been
 pulled, every call says so plainly rather than silently reporting "no rain" — which
 would be the most dangerous possible failure here, since it reads as evidence FOR
 deleting the point.
@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-DEFAULT_ROOT = Path("data/precip")
+DEFAULT_ROOT = Path("data/turbidity/precip")
 
 # Fallback only. The runner injects the gauge from the dataset stem (§5:
 # `<gauge>_l<level>`), because a hard-coded default here answers with the WRONG

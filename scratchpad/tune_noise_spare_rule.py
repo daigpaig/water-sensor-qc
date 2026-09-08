@@ -28,7 +28,7 @@ TUNE = [("02054550", "l1"), ("02054550", "l2"), ("040851385", "l1"), ("040851385
 
 def candidates(gauge: str, level: str) -> tuple[list[dict], list[dict]]:
     """(true-positive rows, false-positive rows) as describe_points measurement rows."""
-    base = f"data/injected/{gauge}/{level}/{gauge}_{level}"
+    base = f"data/turbidity/injected/{gauge}/{level}/{gauge}_{level}"
     frame = pd.read_csv(f"{base}.csv", parse_dates=["datetime"]).sort_values("datetime")
     series = frame.set_index("datetime")["value"]
     labels = pd.read_csv(f"{base}_labels.csv", parse_dates=["datetime"]).set_index("datetime")
